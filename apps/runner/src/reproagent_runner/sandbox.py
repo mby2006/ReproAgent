@@ -19,6 +19,7 @@ from uuid import UUID
 
 import docker
 from docker.errors import APIError, ImageNotFound
+from docker.types import LogConfig
 from reproagent_schemas import (
     ErrorCategory,
     MetricsReport,
@@ -28,6 +29,7 @@ from reproagent_schemas import (
     RunStatus,
     compute_code_hash,
 )
+from requests.exceptions import ConnectionError as RequestsConnectionError
 from requests.exceptions import ReadTimeout
 
 from .config import RunnerSettings
@@ -67,7 +69,9 @@ def _host_config(
         "tmpfs": {"/tmp": f"size={settings.tmpfs_size_mb}m,mode=1777"},
         # bound daemon-side json-file logs so a stdout flood cannot fill the host
         # disk (mem_limit does not cover the Docker logging driver)
-        "log_opts": {"max-size": "1m", "max-file": "1"},
+        "log_config": LogConfig(
+            type=LogConfig.types.JSON, config={"max-size": "1m", "max-file": "1"}
+        ),
         "binds": [
             f"{code_dir}:/work/code:ro",
             f"{output_dir}:/output:rw",
@@ -230,7 +234,9 @@ class Sandbox:
                     break
                 try:
                     wait_result = container.wait(timeout=2)
-                except ReadTimeout:
+                except (ReadTimeout, RequestsConnectionError):
+                    # /wait is streamed chunked by the daemon, so a read timeout
+                    # can surface as ConnectionError instead of ReadTimeout.
                     continue
                 except Exception:
                     status = RunStatus.CANCELLED if cancel_event.is_set() else RunStatus.TIMEOUT

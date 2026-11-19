@@ -14,6 +14,7 @@ from reproagent_runner.main import create_app
 from reproagent_runner.registry import RunRegistry
 from reproagent_runner.sandbox import Sandbox, _host_config
 from reproagent_schemas import CodeFile, ErrorCategory, ResourceBudget, RunRequest, RunStatus
+from requests.exceptions import ConnectionError as RequestsConnectionError
 
 METRICS = {
     "schema_version": "1.0",
@@ -84,6 +85,11 @@ class FakeContainer:
     def wait(self, timeout=None):
         if self._behavior.get("raise_on_wait"):
             raise RuntimeError("simulated hard timeout")
+        if self._behavior.get("chunked_timeout_once") and not self._behavior.get("_timed_out"):
+            self._behavior["_timed_out"] = True
+            raise RequestsConnectionError(
+                "UnixHTTPConnectionPool(host='localhost', port=None): Read timed out."
+            )
         gate = self._behavior.get("wait_gate")
         if gate is not None:
             gate.wait(timeout=10)
@@ -161,6 +167,7 @@ class TestSandboxLockdown:
         assert config["pids_limit"] == request.resource_budget.pids_limit
         assert config["mem_limit"] == f"{request.resource_budget.memory_mb}m"
         assert config["nano_cpus"] == int(request.resource_budget.cpu_count * 1e9)
+        assert config["log_config"].config == {"max-size": "1m", "max-file": "1"}
         assert any(b.endswith(":/work/code:ro") for b in config["binds"])
         assert any(b.endswith(":/output:rw") for b in config["binds"])
 
@@ -190,6 +197,14 @@ class TestSandboxLockdown:
         assert result.status is RunStatus.TIMEOUT
         assert client.containers.last.killed is True
         assert client.containers.last.removed is True
+
+    def test_chunked_wait_timeout_is_retried_not_killed(self, settings, tmp_path):
+        # daemon streams /wait chunked: read timeout arrives as ConnectionError
+        client = FakeDockerClient(chunked_timeout_once=True, write_metrics=True)
+        run_dir = tmp_path / str(uuid4())
+        result = Sandbox(client, settings).execute(make_request(), run_dir, asyncio.Event())
+        assert result.status is RunStatus.SUCCEEDED
+        assert client.containers.last.killed is False
 
     def test_nonzero_exit_is_failed(self, settings, tmp_path):
         client = FakeDockerClient(exit_code=1, write_metrics=False, stderr=b"Traceback: boom")

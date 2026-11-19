@@ -14,6 +14,7 @@ from reproagent_schemas import (
     EvidenceStatus,
     ParamSource,
     PlanParam,
+    RiskTier,
 )
 
 from .scaling import SUPPORTED_OPTIMIZERS
@@ -86,12 +87,17 @@ def param_from_evidence(
     fallback_rationale: str,
     cast,
     assumptions: list[Assumption],
+    risk_tier: RiskTier = RiskTier.CRITICAL,
+    auto_acceptable: bool = False,
 ) -> PlanParam:
     """Map a card evidence field to an executable plan param with provenance."""
     quote = field.evidence_quote
     page = field.source_page
 
-    if field.status is EvidenceStatus.PAPER_EXPLICIT and field.value is not None:
+    if (
+        field.status in (EvidenceStatus.PAPER_EXPLICIT, EvidenceStatus.PAPER_DESCRIBED)
+        and field.value is not None
+    ):
         value = cast(field.value)
         if value is not None:
             return PlanParam(
@@ -116,6 +122,8 @@ def param_from_evidence(
                     rationale=rationale,
                     requires_confirmation=not confirmed,
                     human_confirmed=confirmed,
+                    risk_tier=risk_tier,
+                    auto_acceptable=auto_acceptable,
                     card_status=EvidenceStatus.INFERRED,
                     evidence_quote=quote,
                     source_page=page,
@@ -141,6 +149,8 @@ def param_from_evidence(
             rationale=fallback_rationale,
             requires_confirmation=True,
             human_confirmed=False,
+            risk_tier=risk_tier,
+            auto_acceptable=auto_acceptable,
             card_status=field.status,
         )
     )

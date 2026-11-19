@@ -201,9 +201,9 @@ def _check_plan_gate(admin, workflow: dict) -> None:
             status.HTTP_409_CONFLICT, "Approve the experiment plan before continuing"
         )
     plan = ExperimentPlan.model_validate(latest[0]["config_json"])
-    if plan.unconfirmed_required():
+    if plan.unconfirmed_critical():
         raise HTTPException(
-            status.HTTP_409_CONFLICT, "Confirm all required plan parameters before continuing"
+            status.HTTP_409_CONFLICT, "Confirm all critical plan assumptions before continuing"
         )
 
 

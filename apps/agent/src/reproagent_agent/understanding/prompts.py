@@ -33,11 +33,16 @@ Field shapes:
 Every evidence field object has exactly these keys:
   value, status, evidence_quote, confidence, human_confirmed
 Rules for evidence fields:
-- status is one of "paper_explicit", "inferred", "missing".
+- status is one of "paper_explicit", "paper_described", "inferred", "missing".
 - paper_explicit: the paper states it directly. value is set and evidence_quote MUST
   be a VERBATIM contiguous excerpt copied from the paper text below (identical wording;
   keep it under 60 words). Never paraphrase a quote.
-- inferred: you deduce it from context but the paper does not state it directly.
+- paper_described: the paper describes this practice in prose (typically a preprocessing
+  step such as centering, size normalization or background extension) rather than as a
+  verbatim numeric parameter. value is set; evidence_quote MUST be a VERBATIM excerpt of
+  the describing sentence. Use this instead of "inferred" whenever the paper actually
+  describes the practice, so it is not flagged as an unsupported guess.
+- inferred: you deduce it from context but the paper does not state or describe it directly.
   value is set; evidence_quote may be null or a supporting verbatim excerpt.
 - missing: the paper does not provide it. value MUST be null and evidence_quote null.
 - confidence is a number in [0, 1]. human_confirmed MUST be false.

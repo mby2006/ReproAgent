@@ -54,6 +54,20 @@ class AssumptionKind(StrEnum):
     NONSTANDARD_CHOICE = "nonstandard_choice"
 
 
+class RiskTier(StrEnum):
+    """How much a wrong assumption hurts the reproduction.
+
+    critical: changes the experiment's essence (optimizer/lr/loss/architecture/
+    target metric/dataset identity) -- always needs an explicit decision.
+    routine: small effect with a safe default -- batch-accept / auto-accept allowed.
+    info: informational only (MVP scaling notes) -- never blocks approval.
+    """
+
+    CRITICAL = "critical"
+    ROUTINE = "routine"
+    INFO = "info"
+
+
 class PlanParam[T](SchemaModel):
     """A concrete, executable parameter value with auditable provenance."""
 
@@ -87,6 +101,8 @@ class Assumption(SchemaModel):
     rationale: str = Field(min_length=1)
     requires_confirmation: bool = True
     human_confirmed: bool = False
+    risk_tier: RiskTier = RiskTier.CRITICAL
+    auto_acceptable: bool = False
     card_status: EvidenceStatus | None = None
     evidence_quote: str | None = None
     source_page: int | None = Field(default=None, ge=1)
@@ -189,6 +205,17 @@ class ExperimentPlan(_PlanModel):
 
     def unconfirmed_required(self) -> list[Assumption]:
         return [a for a in self.assumptions if a.requires_confirmation and not a.human_confirmed]
+
+    def unconfirmed_critical(self) -> list[Assumption]:
+        """Only critical-tier assumptions block approval; routine items may be
+        batch-accepted or left to safe defaults without gating the run."""
+        return [
+            a
+            for a in self.assumptions
+            if a.requires_confirmation
+            and not a.human_confirmed
+            and a.risk_tier is RiskTier.CRITICAL
+        ]
 
 
 class PlanRequest(SchemaModel):

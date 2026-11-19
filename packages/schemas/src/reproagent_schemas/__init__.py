@@ -58,6 +58,7 @@ from .plan import (
     PreprocessingConfig,
     PreprocessingStep,
     ResourceEstimates,
+    RiskTier,
     RuntimeBudget,
     TrainingConfig,
 )
@@ -192,6 +193,7 @@ __all__ = [
     "RepairResponse",
     "ResourceBudget",
     "ResourceEstimates",
+    "RiskTier",
     "RunAccepted",
     "RunAudit",
     "RunLogs",

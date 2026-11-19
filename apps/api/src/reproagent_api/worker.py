@@ -184,6 +184,60 @@ async def run_experiment_task(ctx: dict, run_id: str) -> None:
         await wctx.runner.aclose()
 
 
+def _recovery_execution_state(admin, workflow: dict, budget_config: BudgetConfig):
+    """Rebuild execution-phase state for a thread that already reached END.
+
+    A persisted failure (unlike a node that raised) leaves no pending node, so
+    retry re-enters the graph at generate_code with a fresh run row instead of
+    silently no-op'ing on the finished checkpoint.
+    """
+    experiment_id = workflow.get("experiment_id")
+    if not experiment_id:
+        return None
+    experiment = (
+        admin.table("experiments").select("*").eq("id", experiment_id).single().execute().data
+    )
+    plan_rows = (
+        admin.table("experiment_plans")
+        .select("id,version,config_json,approved_at")
+        .eq("experiment_id", experiment_id)
+        .not_.is_("approved_at", "null")
+        .order("version", desc=True)
+        .limit(1)
+        .execute()
+        .data
+    )
+    if not plan_rows or not experiment.get("spec_id"):
+        return None
+    plan_row = plan_rows[0]
+    spec = (
+        admin.table("reproduction_specs")
+        .select("id,version,spec_json")
+        .eq("id", experiment["spec_id"])
+        .single()
+        .execute()
+        .data
+    )
+    admin.table("experiments").update({"status": "running"}).eq("id", experiment_id).execute()
+    state = initial_state(workflow, budget_config)
+    state.update(
+        card=ReproductionCard.model_validate(spec["spec_json"]),
+        plan=ExperimentPlan.model_validate(plan_row["config_json"]),
+        experiment_id=experiment_id,
+        run_id=None,
+        plan_id=plan_row["id"],
+        plan_version=plan_row["version"],
+        spec_version_id=spec["id"],
+        spec_version=spec["version"],
+        status=WorkflowStatus.EXECUTING.value,
+        error=None,
+        execution_result=None,
+        classification=None,
+        budget_exhausted=False,
+    )
+    return state
+
+
 async def recover_workflow_task(ctx: dict, workflow_id: str) -> None:
     settings: ApiSettings = ctx["settings"]
     admin = make_service_client(settings)
@@ -196,8 +250,14 @@ async def recover_workflow_task(ctx: dict, workflow_id: str) -> None:
     graph = build_workflow_graph(wctx, checkpointer)
     snapshot = await graph.aget_state({"configurable": {"thread_id": workflow["thread_id"]}})
     try:
-        if snapshot.values:
+        if snapshot.values and snapshot.next:
             await continue_workflow(wctx, checkpointer, workflow["thread_id"], fallback)
+        elif snapshot.values:
+            state = _recovery_execution_state(admin, workflow, wctx.budget_config)
+            if state is not None:
+                await drive_from_execution(wctx, checkpointer, state)
+            else:
+                await start_workflow(wctx, checkpointer, fallback)
         else:
             await start_workflow(wctx, checkpointer, fallback)
     finally:

@@ -7,14 +7,14 @@ import PlanClient from "./PlanClient";
 function ParamBridge() {
   const params = useParams<{ id: string }>();
   if (!params?.id) {
-    return <div className="p-6 text-zinc-500">加载中…</div>;
+    return <div className="p-6 font-mono text-sm text-fg-3">加载中…</div>;
   }
   return <PlanClient experimentId={params.id} />;
 }
 
 export default function ExperimentPage() {
   return (
-    <Suspense fallback={<div className="p-6 text-zinc-500">加载中…</div>}>
+    <Suspense fallback={<div className="p-6 font-mono text-sm text-fg-3">加载中…</div>}>
       <ParamBridge />
     </Suspense>
   );

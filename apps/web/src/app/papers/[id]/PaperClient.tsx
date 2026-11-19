@@ -4,11 +4,21 @@ import Link from "next/link";
 import { useSearchParams } from "next/navigation";
 import { Suspense, useCallback, useEffect, useRef, useState } from "react";
 import AuthGate from "@/components/AuthGate";
+import Shell from "@/components/Shell";
 import WorkflowInsights from "@/components/WorkflowInsights";
 import WorkflowStepper from "@/components/WorkflowStepper";
+import {
+  IconArrowLeft,
+  IconArrowRight,
+  IconCheck,
+  IconPdf,
+  IconQuote,
+  IconRefresh,
+} from "@/components/icons";
 import { apiFetch, confirmCard, getPaperWorkflow, resumeWorkflow, retryWorkflow } from "@/lib/api";
 import { useWorkflow } from "@/lib/useWorkflow";
 import type { CardVersion, CardVersionMeta, EvidenceField, PaperSummary } from "@/lib/types";
+import { evidenceMeta, TONE_BADGE, WF_BUSY } from "@/lib/ui";
 
 interface Selection {
   label: string;
@@ -17,21 +27,8 @@ interface Selection {
 }
 
 function StatusBadge({ field }: { field: EvidenceField }) {
-  if (field.status === "missing") {
-    return <span className="rounded bg-zinc-700 px-1.5 py-0.5 text-xs text-zinc-300">缺失</span>;
-  }
-  if (field.status === "inferred") {
-    return field.human_confirmed ? (
-      <span className="rounded bg-sky-700 px-1.5 py-0.5 text-xs text-sky-100">推断·已确认</span>
-    ) : (
-      <span className="rounded bg-amber-600 px-1.5 py-0.5 text-xs text-amber-50">⚠ 推断</span>
-    );
-  }
-  return field.human_confirmed ? (
-    <span className="rounded bg-emerald-700 px-1.5 py-0.5 text-xs text-emerald-100">原文·已确认</span>
-  ) : (
-    <span className="rounded bg-emerald-800 px-1.5 py-0.5 text-xs text-emerald-200">原文</span>
-  );
+  const meta = evidenceMeta(field);
+  return <span className={`chip ${TONE_BADGE[meta.tone]}`}>{meta.label}</span>;
 }
 
 function FieldRow({
@@ -46,21 +43,16 @@ function FieldRow({
   onClick: () => void;
 }) {
   return (
-    <button
-      onClick={onClick}
-      className={`flex w-full items-center justify-between gap-2 rounded-lg border px-3 py-2 text-left text-sm ${
-        active ? "border-emerald-500 bg-zinc-800" : "border-zinc-800 bg-zinc-900 hover:border-zinc-600"
-      }`}
-    >
+    <button onClick={onClick} className={`field-row ${active ? "field-row-active" : ""}`}>
       <span className="min-w-0">
-        <span className="block text-xs text-zinc-400">{label}</span>
-        <span className="block truncate">
+        <span className="block text-[11px] text-fg-3">{label}</span>
+        <span className="block truncate font-mono text-[13px] text-fg">
           {field.status === "missing" ? "—" : String(field.value)}
         </span>
       </span>
       <span className="flex shrink-0 items-center gap-1.5">
         {field.source_page !== null && (
-          <span className="text-xs text-zinc-500">p.{field.source_page}</span>
+          <span className="font-mono text-[10.5px] text-fg-3">p.{field.source_page}</span>
         )}
         <StatusBadge field={field} />
       </span>
@@ -289,25 +281,25 @@ function PaperInner({ paperId }: { paperId: string }) {
     });
   }
 
-  const busy =
-    wfStatus != null &&
-    !["awaiting_spec_review", "awaiting_plan_approval", "completed", "failed"].includes(wfStatus);
+  const busy = wfStatus != null && WF_BUSY.includes(wfStatus);
   const shownError = error ?? wfError;
 
   return (
-    <main className="mx-auto w-full max-w-7xl flex-1 space-y-4 p-6">
-      <header className="flex flex-wrap items-center gap-3">
-        <Link href="/papers" className="text-sm text-zinc-400 hover:text-zinc-200">
-          ← 返回
+    <main className="mx-auto w-full max-w-7xl space-y-4 px-5 py-6">
+      <header className="rise flex flex-wrap items-center gap-3">
+        <Link href="/papers" className="btn btn-ghost btn-sm px-2!" title="返回论文库">
+          <IconArrowLeft className="h-4 w-4" />
         </Link>
-        <h1 className="min-w-0 flex-1 truncate text-xl font-semibold">
-          {paper?.title ?? "论文"}
-        </h1>
+        <div className="min-w-0 flex-1">
+          <p className="label mb-0.5">Paper · Reproduction Card</p>
+          <h1 className="display truncate text-xl font-bold">{paper?.title ?? "论文"}</h1>
+        </div>
         {versions.length > 0 && (
           <select
             value={version ?? cardVersion?.version ?? ""}
             onChange={(e) => switchVersion(Number(e.target.value))}
-            className="rounded border border-zinc-700 bg-zinc-900 px-2 py-1 text-sm"
+            className="select w-44!"
+            aria-label="Card 版本"
           >
             {versions.map((v) => (
               <option key={v.id} value={v.version}>
@@ -316,37 +308,30 @@ function PaperInner({ paperId }: { paperId: string }) {
             ))}
           </select>
         )}
-        <button
-          onClick={reparse}
-          disabled={busy}
-          className="rounded border border-zinc-700 px-3 py-1 text-sm hover:border-zinc-500 disabled:opacity-50"
-        >
-          重新解析
+        <button onClick={reparse} disabled={busy} className="btn btn-ghost btn-sm">
+          <IconRefresh className="h-3.5 w-3.5" /> 重新解析
         </button>
         {wfStatus === "awaiting_spec_review" &&
           (cardVersion?.origin === "user_edit" ? (
-            <button
-              onClick={continueWorkflow}
-              disabled={continuing}
-              className="rounded bg-sky-600 px-3 py-1 text-sm hover:bg-sky-500 disabled:opacity-50"
-            >
+            <button onClick={continueWorkflow} disabled={continuing} className="btn btn-info btn-sm">
               {continuing ? "提交中…" : "继续执行"}
             </button>
           ) : (
             <button
               onClick={confirmAndContinue}
               disabled={confirming || !card}
-              className="rounded bg-emerald-600 px-3 py-1 text-sm hover:bg-emerald-500 disabled:opacity-50"
+              className="btn btn-primary btn-sm"
             >
+              <IconCheck className="h-3.5 w-3.5" />
               {confirming ? "提交中…" : "确认 Card 并继续"}
             </button>
           ))}
         {workflow?.experiment_id && (
           <Link
             href={`/experiments/${workflow.experiment_id}?workflow=${workflow.id}`}
-            className="rounded bg-emerald-600 px-3 py-1 text-sm hover:bg-emerald-500"
+            className="btn btn-primary btn-sm"
           >
-            查看实验计划 →
+            查看实验计划 <IconArrowRight className="h-3.5 w-3.5" />
           </Link>
         )}
       </header>
@@ -361,40 +346,46 @@ function PaperInner({ paperId }: { paperId: string }) {
         />
       )}
       {workflow && <WorkflowInsights workflow={workflow} />}
+
       {busy && (
-        <p className="rounded-lg border border-amber-700 bg-amber-950 px-4 py-2 text-sm text-amber-300">
+        <p className="rise flex items-center gap-2 rounded-lg border border-info/40 bg-info/10 px-4 py-2 text-sm text-info">
+          <span className="pulse-dot h-1.5 w-1.5 rounded-full bg-info" />
           工作流进行中…（{wfStatus}）
         </p>
       )}
       {wfStatus === "awaiting_spec_review" && (
-        <p className="rounded-lg border border-sky-700 bg-sky-950 px-4 py-2 text-sm text-sky-300">
+        <p className="rise rounded-lg border border-warn/40 bg-warn/10 px-4 py-2 text-sm text-warn">
           请核对 Reproduction Card：推断值与缺失信息可在右侧确认或修改，然后点击「确认 Card 并继续」生成实验计划。
         </p>
       )}
       {wfStatus === "awaiting_plan_approval" && (
-        <p className="rounded-lg border border-sky-700 bg-sky-950 px-4 py-2 text-sm text-sky-300">
+        <p className="rise rounded-lg border border-warn/40 bg-warn/10 px-4 py-2 text-sm text-warn">
           实验计划已生成，请前往实验页批准并执行。
         </p>
       )}
       {wfStatus === "completed" && (
-        <p className="rounded-lg border border-emerald-700 bg-emerald-950 px-4 py-2 text-sm text-emerald-300">
+        <p className="rise rounded-lg border border-ok/40 bg-ok/10 px-4 py-2 text-sm text-ok">
           复现工作流已完成，可在实验页查看训练指标与 Reproduction Report。
         </p>
       )}
       {shownError && (
-        <p className="rounded-lg border border-red-800 bg-red-950 px-4 py-2 text-sm text-red-300">
+        <p className="rise rounded-lg border border-bad/40 bg-bad/10 px-4 py-2 text-sm text-bad">
           {shownError}
         </p>
       )}
 
-      <div className="grid gap-4 lg:grid-cols-2">
-        <section className="space-y-4">
+      <div className="grid gap-5 lg:grid-cols-2">
+        <section className="rise rise-1 space-y-5">
+          <p className="label flex items-center gap-2">
+            <IconQuote className="h-3.5 w-3.5 text-brand" /> Extracted Values · 提取值
+          </p>
           {rows.map((group) => (
             <div key={group.title} className="space-y-1.5">
-              <h2 className="text-xs font-semibold uppercase tracking-wide text-zinc-500">
+              <h2 className="label flex items-center gap-2 text-fg-2!">
                 {group.title}
+                <span className="chip py-0!">{group.items.length}</span>
               </h2>
-              {group.items.length === 0 && <p className="text-sm text-zinc-600">（无）</p>}
+              {group.items.length === 0 && <p className="text-sm text-fg-3">（无）</p>}
               {group.items.map((item) => (
                 <FieldRow
                   key={item.label}
@@ -407,11 +398,9 @@ function PaperInner({ paperId }: { paperId: string }) {
             </div>
           ))}
           {card && card.missing_information.length > 0 && (
-            <div className="space-y-1.5">
-              <h2 className="text-xs font-semibold uppercase tracking-wide text-zinc-500">
-                缺失信息 Missing Information
-              </h2>
-              <ul className="list-inside list-disc text-sm text-zinc-400">
+            <div className="card space-y-2 border-warn/30 bg-warn/5 p-4">
+              <h2 className="label text-warn!">缺失信息 Missing Information</h2>
+              <ul className="list-inside list-disc space-y-1 text-[13px] text-fg-2">
                 {card.missing_information.map((m) => (
                   <li key={m}>{m}</li>
                 ))}
@@ -419,33 +408,38 @@ function PaperInner({ paperId }: { paperId: string }) {
             </div>
           )}
           {!card && !busy && (
-            <p className="text-sm text-zinc-500">暂无 Reproduction Card，点击“重新解析”开始。</p>
+            <p className="rounded-xl border border-dashed border-line p-6 text-center text-sm text-fg-3">
+              暂无 Reproduction Card，点击“重新解析”开始。
+            </p>
           )}
         </section>
 
-        <section className="space-y-3">
+        <section className="rise rise-2 space-y-4">
           {selected ? (
-            <div className="space-y-3 rounded-xl border border-zinc-800 bg-zinc-900 p-4">
-              <div className="flex items-center justify-between">
-                <h3 className="font-medium">{selected.label}</h3>
+            <div className="card space-y-3 p-4">
+              <div className="flex items-center justify-between gap-2">
+                <h3 className="display min-w-0 truncate text-sm font-semibold">{selected.label}</h3>
                 <StatusBadge field={selected.field} />
               </div>
               {selected.field.evidence_quote ? (
-                <blockquote className="rounded border-l-2 border-emerald-600 bg-zinc-950 px-3 py-2 text-sm italic text-zinc-300">
-                  “{selected.field.evidence_quote}”
-                </blockquote>
+                <blockquote className="quote">“{selected.field.evidence_quote}”</blockquote>
               ) : (
-                <p className="text-sm text-zinc-500">
+                <p className="text-sm text-fg-3">
                   {selected.field.status === "missing"
                     ? "论文中未找到该信息。"
                     : "无原文引文（推断值，请人工确认）。"}
                 </p>
               )}
-              <p className="text-xs text-zinc-500">
-                {selected.field.source_page !== null && `页码：p.${selected.field.source_page} · `}
-                {selected.field.source_section && `章节：${selected.field.source_section} · `}
-                置信度：{(selected.field.confidence * 100).toFixed(0)}%
-              </p>
+              <div className="space-y-1.5">
+                <p className="font-mono text-[10.5px] text-fg-3">
+                  {selected.field.source_page !== null && `p.${selected.field.source_page} · `}
+                  {selected.field.source_section && `${selected.field.source_section} · `}
+                  confidence {(selected.field.confidence * 100).toFixed(0)}%
+                </p>
+                <div className="meter">
+                  <span style={{ width: `${Math.round(selected.field.confidence * 100)}%` }} />
+                </div>
+              </div>
               {selected.path && (
                 <div className="flex gap-2">
                   <input
@@ -453,30 +447,44 @@ function PaperInner({ paperId }: { paperId: string }) {
                     ref={editInput}
                     defaultValue={selected.field.value === null ? "" : String(selected.field.value)}
                     placeholder="留空表示标记为缺失"
-                    className="min-w-0 flex-1 rounded border border-zinc-700 bg-zinc-950 px-3 py-1.5 text-sm"
+                    className="input min-w-0 flex-1"
                   />
-                  <button
-                    onClick={saveEdit}
-                    disabled={saving}
-                    className="shrink-0 rounded bg-emerald-600 px-3 py-1.5 text-sm hover:bg-emerald-500 disabled:opacity-50"
-                  >
+                  <button onClick={saveEdit} disabled={saving} className="btn btn-primary btn-sm shrink-0">
                     {saving ? "保存中…" : "保存为新版本"}
                   </button>
                 </div>
               )}
             </div>
           ) : (
-            <p className="rounded-xl border border-dashed border-zinc-800 p-4 text-sm text-zinc-500">
+            <p className="rounded-xl border border-dashed border-line p-4 text-sm text-fg-3">
               点击左侧字段查看原文证据；推断值可在此确认或修改。
             </p>
           )}
-          {pdfUrl && (
-            <iframe
-              key={selected?.field.source_page ?? 0}
-              src={`${pdfUrl}#page=${selected?.field.source_page ?? 1}`}
-              title="论文 PDF"
-              className="h-[600px] w-full rounded-xl border border-zinc-800 bg-white"
-            />
+
+          {pdfUrl ? (
+            <div className="terminal">
+              <div className="terminal-bar">
+                <span className="terminal-dot bg-bad/70" />
+                <span className="terminal-dot bg-warn/70" />
+                <span className="terminal-dot bg-ok/70" />
+                <span className="label ml-2 flex items-center gap-1.5 text-[9.5px]!">
+                  <IconPdf className="h-3 w-3" /> Document Preview
+                </span>
+                <span className="chip ml-auto py-0!">
+                  p.{selected?.field.source_page ?? 1}
+                </span>
+              </div>
+              <iframe
+                key={selected?.field.source_page ?? 0}
+                src={`${pdfUrl}#page=${selected?.field.source_page ?? 1}`}
+                title="论文 PDF"
+                className="h-[600px] w-full bg-white"
+              />
+            </div>
+          ) : (
+            <p className="rounded-xl border border-dashed border-line p-4 text-sm text-fg-3">
+              PDF 预览不可用（未上传文件或签名链接过期）。
+            </p>
           )}
         </section>
       </div>
@@ -487,9 +495,11 @@ function PaperInner({ paperId }: { paperId: string }) {
 export default function PaperClient({ paperId }: { paperId: string }) {
   return (
     <AuthGate>
-      <Suspense fallback={<div className="p-6 text-zinc-500">加载中…</div>}>
-        <PaperInner paperId={paperId} />
-      </Suspense>
+      <Shell>
+        <Suspense fallback={<div className="p-6 text-fg-3">加载中…</div>}>
+          <PaperInner paperId={paperId} />
+        </Suspense>
+      </Shell>
     </AuthGate>
   );
 }

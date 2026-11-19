@@ -127,6 +127,31 @@ class TestGroundCard:
         grounded = ground_card(card, document)
         assert grounded["method"]["status"] == "inferred"
 
+    def test_paper_described_kept_when_grounded(self, document):
+        card = {
+            "data_preprocessing": {
+                "centering": field(
+                    "centered", quote="Layer C3 has 16 feature maps.", status="paper_described"
+                )
+            }
+        }
+        grounded = ground_card(card, document)
+        f = grounded["data_preprocessing"]["centering"]
+        assert f["status"] == "paper_described"
+        assert f["source_page"] == 5
+        assert f["evidence_quote"] == "Layer C3 has 16 feature maps."
+
+    def test_paper_described_ungrounded_demoted_to_inferred(self, document):
+        card = {
+            "data_preprocessing": {
+                "centering": field("centered", quote="unfindable prose", status="paper_described")
+            }
+        }
+        grounded = ground_card(card, document)
+        f = grounded["data_preprocessing"]["centering"]
+        assert f["status"] == "inferred"
+        assert f["source_page"] is None
+
     def test_dict_and_list_fields_grounded(self, document):
         card = {
             "hyperparameters": {

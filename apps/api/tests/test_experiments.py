@@ -82,6 +82,25 @@ PLAN_DEFAULTS = {
 EXPERIMENT_DEFAULTS = {"spec_id": None, "status": "pending"}
 
 
+def routine_card() -> ReproductionCard:
+    """Card whose only pending assumption is routine (missing weight_decay)."""
+    data = make_card().model_dump(mode="json")
+    data["optimizer"] = {
+        "value": "SGD",
+        "status": "paper_explicit",
+        "evidence_quote": "SGD optimizer",
+        "source_page": 8,
+    }
+    data["loss_function"] = {
+        "value": "cross-entropy",
+        "status": "paper_explicit",
+        "evidence_quote": "cross-entropy loss",
+        "source_page": 8,
+    }
+    data["hyperparameters"]["weight_decay"] = {"status": "missing"}
+    return ReproductionCard.model_validate(data)
+
+
 def _path(row, key):
     cur = row
     for part in key.split("."):
@@ -305,6 +324,54 @@ def test_approve_blocked_by_unconfirmed_then_passes(env):
     assert approved.json()["approved_at"] is not None
     detail = client.get(f"/v1/experiments/{experiment_id}", headers=AUTH).json()
     assert detail["status"] == "approved"
+
+
+def test_routine_assumption_does_not_block_approval(env):
+    client, admin = env
+    admin.tables["reproduction_specs"][0]["spec_json"] = routine_card().model_dump(mode="json")
+    detail = create(client).json()
+    experiment_id = detail["id"]
+    plan = detail["plan"]["plan"]
+    pending = [
+        a for a in plan["assumptions"] if a["requires_confirmation"] and not a["human_confirmed"]
+    ]
+    assert any(a["risk_tier"] == "routine" for a in pending)
+    assert not any(a["risk_tier"] == "critical" for a in pending)
+    resp = client.post(f"/v1/experiments/{experiment_id}/plans/1/approve", headers=AUTH)
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["approved_at"] is not None
+
+
+def test_batch_confirm_routine_via_edit(env):
+    client, admin = env
+    admin.tables["reproduction_specs"][0]["spec_json"] = routine_card().model_dump(mode="json")
+    detail = create(client).json()
+    experiment_id = detail["id"]
+    plan = detail["plan"]["plan"]
+    routine = [
+        a
+        for a in plan["assumptions"]
+        if a["risk_tier"] == "routine" and a["requires_confirmation"] and not a["human_confirmed"]
+    ]
+    assert routine
+    changes = [
+        {"field_path": a["field_path"], "value": a["value"], "human_confirmed": True}
+        for a in routine
+    ]
+    resp = client.post(
+        f"/v1/experiments/{experiment_id}/plans",
+        json={"base_version": 1, "changes": changes, "change_reason": "批量采纳常规假设"},
+        headers=AUTH,
+    )
+    assert resp.status_code == 201, resp.text
+    v2 = resp.json()
+    assert v2["version"] == 2
+    confirmed = {
+        a["field_path"]
+        for a in v2["plan"]["assumptions"]
+        if a["human_confirmed"] and not a["requires_confirmation"]
+    }
+    assert {a["field_path"] for a in routine} <= confirmed
 
 
 def test_edit_unknown_field_422(env):

@@ -21,6 +21,7 @@ from reproagent_schemas import (
     PlanVersion,
     PreprocessingConfig,
     ResourceEstimates,
+    RiskTier,
     RuntimeBudget,
     TrainingConfig,
 )
@@ -150,6 +151,51 @@ class TestExperimentPlan:
         unconfirmed = plan.unconfirmed_required()
         assert len(unconfirmed) == 1
         assert unconfirmed[0].field_path == "training_config.loss_function"
+
+
+class TestRiskTier:
+    def test_default_tier_is_critical(self):
+        a = Assumption(
+            field_path="training_config.loss_function",
+            kind=AssumptionKind.MISSING_PROPOSAL,
+            value="cross_entropy",
+            rationale="missing",
+        )
+        assert a.risk_tier is RiskTier.CRITICAL
+        assert a.auto_acceptable is False
+
+    def test_unconfirmed_critical_ignores_routine_and_info(self):
+        plan = make_plan(
+            assumptions=[
+                Assumption(
+                    field_path="training_config.loss_function",
+                    kind=AssumptionKind.MISSING_PROPOSAL,
+                    value="cross_entropy",
+                    rationale="missing",
+                    risk_tier=RiskTier.CRITICAL,
+                ),
+                Assumption(
+                    field_path="training_config.weight_decay",
+                    kind=AssumptionKind.MISSING_PROPOSAL,
+                    value=0.0,
+                    rationale="wd",
+                    risk_tier=RiskTier.ROUTINE,
+                    auto_acceptable=True,
+                ),
+                Assumption(
+                    field_path="dataset_config",
+                    kind=AssumptionKind.MVP_SCALING,
+                    value="mnist",
+                    rationale="scale",
+                    requires_confirmation=False,
+                    risk_tier=RiskTier.INFO,
+                ),
+            ]
+        )
+        assert len(plan.unconfirmed_required()) == 2
+        crit = plan.unconfirmed_critical()
+        assert len(crit) == 1
+        assert crit[0].field_path == "training_config.loss_function"
 
 
 class TestPlanContracts:

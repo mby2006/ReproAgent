@@ -360,7 +360,7 @@ async def approve_plan(
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Plan version not found")
     row = rows[0]
     plan = ExperimentPlan.model_validate(row["config_json"])
-    unconfirmed = plan.unconfirmed_required()
+    unconfirmed = plan.unconfirmed_critical()
     if unconfirmed:
         paths = ", ".join(a.field_path for a in unconfirmed)
         raise HTTPException(status.HTTP_409_CONFLICT, f"存在未确认的关键假设，请先确认：{paths}")

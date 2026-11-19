@@ -3,6 +3,7 @@
 import { useRouter } from "next/navigation";
 import { useEffect, useState } from "react";
 import { supabase } from "@/lib/supabase";
+import { LogoMark } from "./icons";
 
 export default function AuthGate({ children }: { children: React.ReactNode }) {
   const router = useRouter();
@@ -20,7 +21,13 @@ export default function AuthGate({ children }: { children: React.ReactNode }) {
   }, [router]);
 
   if (!ready) {
-    return <div className="flex flex-1 items-center justify-center text-zinc-500">加载中…</div>;
+    return (
+      <div className="flex min-h-dvh flex-col items-center justify-center gap-4 bg-ink-950">
+        <div className="ambient" />
+        <LogoMark className="pulse-dot h-12 w-12" />
+        <p className="label animate-blink">Initializing session…</p>
+      </div>
+    );
   }
   return <>{children}</>;
 }

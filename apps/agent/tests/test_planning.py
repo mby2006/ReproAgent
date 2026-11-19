@@ -8,6 +8,7 @@ from reproagent_schemas import (
     EvidenceStatus,
     ParamSource,
     ReproductionCard,
+    RiskTier,
 )
 
 
@@ -127,6 +128,77 @@ class TestProvenance:
         plan = build_plan(make_card(optimizer=explicit("Adam")))
         assert plan.training_config.optimizer.value == "adam"
         assert plan.training_config.optimizer.source is ParamSource.PAPER_EXPLICIT
+
+
+class TestAssistedReviewPhase1:
+    def test_prose_preprocessing_not_flagged(self):
+        card = make_card(
+            data_preprocessing={
+                "centering": EvidenceField(
+                    value="centered by bounding box",
+                    status=EvidenceStatus.PAPER_DESCRIBED,
+                    evidence_quote="images are centered",
+                    source_page=4,
+                ),
+                "size_normalization": EvidenceField(
+                    value="size normalized to 20x20",
+                    status=EvidenceStatus.INFERRED,
+                    confidence=0.7,
+                    evidence_quote="size normalization",
+                    source_page=4,
+                ),
+            }
+        )
+        plan = build_plan(card)
+        assert all(s.source is ParamSource.PAPER_EXPLICIT for s in plan.preprocessing_config.steps)
+        assert not any(
+            a.field_path.startswith("preprocessing_config.") for a in plan.assumptions
+        )
+
+    def test_true_inferred_preprocessing_is_routine(self):
+        card = make_card(
+            data_preprocessing={
+                "background_extension": EvidenceField(
+                    value="background extended",
+                    status=EvidenceStatus.INFERRED,
+                    confidence=0.5,
+                ),
+            }
+        )
+        plan = build_plan(card)
+        a = next(
+            a
+            for a in plan.assumptions
+            if a.field_path == "preprocessing_config.background_extension"
+        )
+        assert a.risk_tier is RiskTier.ROUTINE
+        assert a.auto_acceptable is True
+        assert a.requires_confirmation is True
+        assert a not in plan.unconfirmed_critical()
+        assert a in plan.unconfirmed_required()
+
+    def test_weight_decay_missing_is_routine(self):
+        card = make_card(
+            hyperparameters={
+                "learning_rate": explicit("0.001"),
+                "weight_decay": EvidenceField(status=EvidenceStatus.MISSING),
+            }
+        )
+        plan = build_plan(card)
+        wd = next(
+            a for a in plan.assumptions if a.field_path == "training_config.weight_decay"
+        )
+        assert wd.risk_tier is RiskTier.ROUTINE
+        assert wd.auto_acceptable is True
+        assert wd not in plan.unconfirmed_critical()
+
+    def test_missing_loss_is_critical(self):
+        plan = build_plan(make_card(loss_function=EvidenceField(status=EvidenceStatus.MISSING)))
+        loss = next(
+            a for a in plan.assumptions if a.field_path == "training_config.loss_function"
+        )
+        assert loss.risk_tier is RiskTier.CRITICAL
+        assert loss in plan.unconfirmed_critical()
 
 
 class TestScaling:

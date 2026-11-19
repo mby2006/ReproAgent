@@ -3,6 +3,7 @@
 import { useEffect, useState } from "react";
 import { getWorkflowTraces } from "@/lib/api";
 import type { NodeTrace, WorkflowDetail } from "@/lib/types";
+import { IconChevronDown } from "./icons";
 
 function num(budget: Record<string, unknown>, key: string): number {
   const v = budget[key];
@@ -18,14 +19,14 @@ function BudgetBar({ budget }: { budget: Record<string, unknown> }) {
     { label: "重新规划", value: String(num(budget, "replan_count")) },
   ];
   return (
-    <div className="flex flex-wrap gap-2">
+    <div className="grid grid-cols-2 gap-px overflow-hidden rounded-xl border border-line bg-line sm:grid-cols-5">
       {items.map((item) => (
-        <span
-          key={item.label}
-          className="rounded-lg border border-zinc-800 bg-zinc-900 px-3 py-1 text-xs text-zinc-400"
-        >
-          {item.label} <span className="font-semibold text-zinc-200">{item.value}</span>
-        </span>
+        <div key={item.label} className="bg-ink-900/90 px-3 py-2">
+          <p className="label text-[9px]!">{item.label}</p>
+          <p className="display mt-0.5 truncate text-lg font-semibold text-fg" title={item.value}>
+            {item.value}
+          </p>
+        </div>
       ))}
     </div>
   );
@@ -37,37 +38,37 @@ function TraceRow({ trace }: { trace: NodeTrace }) {
       ? trace.token_usage.total_tokens.toLocaleString()
       : null;
   return (
-    <details className="group rounded-lg border border-zinc-800 bg-zinc-900">
-      <summary className="flex cursor-pointer flex-wrap items-center gap-x-3 gap-y-1 px-3 py-2 text-sm">
-        <span className="font-mono text-zinc-200">{trace.node_name}</span>
+    <details className="group card overflow-hidden">
+      <summary className="flex cursor-pointer list-none flex-wrap items-center gap-x-3 gap-y-1 px-3 py-2 text-sm [&::-webkit-details-marker]:hidden">
+        <IconChevronDown className="h-3.5 w-3.5 text-fg-3 transition group-open:rotate-180" />
+        <span className={`h-1.5 w-1.5 rounded-full ${trace.error ? "bg-bad" : "bg-ok"}`} />
+        <span className="font-mono text-[12px] text-fg">{trace.node_name}</span>
         {trace.duration_ms !== null && (
-          <span className="text-xs text-zinc-500">{trace.duration_ms}ms</span>
+          <span className="font-mono text-[10.5px] text-fg-3">{trace.duration_ms}ms</span>
         )}
-        {trace.model_name && <span className="text-xs text-zinc-500">{trace.model_name}</span>}
-        {tokens && <span className="text-xs text-zinc-500">{tokens} tokens</span>}
+        {trace.model_name && (
+          <span className="truncate font-mono text-[10.5px] text-fg-3">{trace.model_name}</span>
+        )}
+        {tokens && <span className="font-mono text-[10.5px] text-fg-3">{tokens} tok</span>}
         {trace.retry_count > 0 && (
-          <span className="rounded bg-amber-900 px-1.5 text-xs text-amber-200">
-            retry {trace.retry_count}
-          </span>
+          <span className="chip badge-warn py-0!">retry {trace.retry_count}</span>
         )}
-        {trace.error ? (
-          <span className="rounded bg-red-900 px-1.5 text-xs text-red-200">错误</span>
-        ) : (
-          <span className="rounded bg-emerald-900 px-1.5 text-xs text-emerald-200">OK</span>
-        )}
+        <span className={`chip ml-auto py-0! ${trace.error ? "badge-bad" : "badge-ok"}`}>
+          {trace.error ? "ERR" : "OK"}
+        </span>
       </summary>
-      <div className="space-y-2 border-t border-zinc-800 px-3 py-2">
-        {trace.error && <p className="text-xs text-red-300">{trace.error}</p>}
+      <div className="space-y-2 border-t border-line-soft px-3 py-2">
+        {trace.error && <p className="text-xs text-bad">{trace.error}</p>}
         <div className="grid gap-2 lg:grid-cols-2">
           <div>
-            <p className="mb-1 text-xs text-zinc-500">input（已脱敏）</p>
-            <pre className="max-h-48 overflow-auto rounded bg-zinc-950 p-2 text-xs text-zinc-400">
+            <p className="label mb-1 text-[9px]!">input（已脱敏）</p>
+            <pre className="max-h-48 overflow-auto rounded-lg bg-ink-950 p-2 font-mono text-[10.5px] leading-relaxed text-fg-2">
               {JSON.stringify(trace.input_json, null, 2)}
             </pre>
           </div>
           <div>
-            <p className="mb-1 text-xs text-zinc-500">output（已脱敏）</p>
-            <pre className="max-h-48 overflow-auto rounded bg-zinc-950 p-2 text-xs text-zinc-400">
+            <p className="label mb-1 text-[9px]!">output（已脱敏）</p>
+            <pre className="max-h-48 overflow-auto rounded-lg bg-ink-950 p-2 font-mono text-[10.5px] leading-relaxed text-fg-2">
               {JSON.stringify(trace.output_json, null, 2)}
             </pre>
           </div>
@@ -96,16 +97,19 @@ export default function WorkflowInsights({ workflow }: { workflow: WorkflowDetai
   }, [workflow.id, workflow.updated_at]);
 
   return (
-    <section className="space-y-2">
+    <section className="rise space-y-2">
       <BudgetBar budget={workflow.budget_json} />
-      <details className="rounded-xl border border-zinc-800 bg-zinc-900/60">
-        <summary className="cursor-pointer px-4 py-2 text-sm text-zinc-300">
-          节点 Trace（{traces.length}）
+      <details className="card group overflow-hidden">
+        <summary className="flex cursor-pointer list-none items-center gap-2 px-4 py-2 text-sm text-fg-2 [&::-webkit-details-marker]:hidden">
+          <IconChevronDown className="h-3.5 w-3.5 text-fg-3 transition group-open:rotate-180" />
+          <span className="label text-fg-2!">Node Trace</span>
+          <span className="chip py-0!">{traces.length}</span>
+          <span className="ml-auto font-mono text-[10px] text-fg-3">逐节点输入 / 输出 / 用量</span>
         </summary>
-        <div className="space-y-1.5 border-t border-zinc-800 p-3">
-          {error && <p className="text-sm text-red-300">{error}</p>}
+        <div className="space-y-1.5 border-t border-line-soft p-3">
+          {error && <p className="text-sm text-bad">{error}</p>}
           {!error && traces.length === 0 && (
-            <p className="text-sm text-zinc-500">暂无节点记录。</p>
+            <p className="text-sm text-fg-3">暂无节点记录。</p>
           )}
           {traces.map((trace) => (
             <TraceRow key={trace.id} trace={trace} />

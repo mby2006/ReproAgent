@@ -1,4 +1,4 @@
-export type EvidenceStatus = "paper_explicit" | "inferred" | "missing";
+export type EvidenceStatus = "paper_explicit" | "paper_described" | "inferred" | "missing";
 
 export interface EvidenceField {
   value: string | number | boolean | null;
@@ -106,6 +106,7 @@ export interface NodeTrace {
 export type ParamSource = "paper_explicit" | "inferred" | "human_confirmed" | "mvp_scaling";
 export type PlanOrigin = "generated" | "user_edit" | "oom_retry";
 export type AssumptionKind = "inferred" | "missing_proposal" | "mvp_scaling" | "nonstandard_choice";
+export type RiskTier = "critical" | "routine" | "info";
 
 export interface PlanParam {
   value: string | number | boolean | null;
@@ -125,6 +126,8 @@ export interface Assumption {
   rationale: string;
   requires_confirmation: boolean;
   human_confirmed: boolean;
+  risk_tier?: RiskTier;
+  auto_acceptable?: boolean;
   card_status?: EvidenceStatus | null;
   evidence_quote?: string | null;
   source_page?: number | null;

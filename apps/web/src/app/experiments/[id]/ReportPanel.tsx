@@ -1,45 +1,15 @@
 "use client";
 
 import { useCallback, useEffect, useState } from "react";
+import MetricChart from "@/components/MetricChart";
+import { IconDownload, IconRefresh, IconWarn } from "@/components/icons";
 import { apiFetch } from "@/lib/api";
 import type {
   CheckStatus,
   EvaluationReport,
-  FinalStatus,
   RunReport,
 } from "@/lib/types";
-
-const FINAL_LABEL: Record<FinalStatus, string> = {
-  METHOD_VALIDATED: "方法已验证（缩放运行）",
-  SCALED_RUN_COMPLETED: "缩放运行已完成",
-  PARTIAL_MATCH: "部分匹配",
-  DEVIATION_FOUND: "发现偏差",
-  INSUFFICIENT_EVIDENCE: "证据不足",
-  EXECUTION_FAILED: "执行失败",
-};
-
-const FINAL_COLOR: Record<FinalStatus, string> = {
-  METHOD_VALIDATED: "bg-emerald-700 text-emerald-100",
-  SCALED_RUN_COMPLETED: "bg-sky-700 text-sky-100",
-  PARTIAL_MATCH: "bg-amber-700 text-amber-50",
-  DEVIATION_FOUND: "bg-red-800 text-red-100",
-  INSUFFICIENT_EVIDENCE: "bg-zinc-600 text-zinc-200",
-  EXECUTION_FAILED: "bg-red-800 text-red-100",
-};
-
-const CHECK_LABEL: Record<CheckStatus, string> = {
-  matched: "匹配",
-  deviated: "偏差",
-  unknown: "未知",
-  not_applicable: "不适用",
-};
-
-const CHECK_COLOR: Record<CheckStatus, string> = {
-  matched: "bg-emerald-800 text-emerald-100",
-  deviated: "bg-red-800 text-red-100",
-  unknown: "bg-amber-800 text-amber-100",
-  not_applicable: "bg-zinc-700 text-zinc-300",
-};
+import { CHECK_META, FINAL_META, TONE_BADGE, fmtNum } from "@/lib/ui";
 
 const METHOD_ITEM_LABEL: Record<string, string> = {
   architecture: "架构",
@@ -65,15 +35,8 @@ const EXPERIMENT_ITEM_LABEL: Record<string, string> = {
 };
 
 function CheckBadge({ status }: { status: CheckStatus }) {
-  return (
-    <span className={`rounded px-1.5 py-0.5 text-xs ${CHECK_COLOR[status]}`}>
-      {CHECK_LABEL[status]}
-    </span>
-  );
-}
-
-function fmt(value: number | null | undefined, digits = 4): string {
-  return value == null ? "—" : value.toFixed(digits);
+  const meta = CHECK_META[status];
+  return <span className={`chip py-0! ${TONE_BADGE[meta.tone]}`}>{meta.label}</span>;
 }
 
 function evidenceTitle(ref: { source_page?: number | null; quote?: string | null; file_path?: string | null; field_path?: string | null } | null): string {
@@ -86,18 +49,18 @@ function evidenceTitle(ref: { source_page?: number | null; quote?: string | null
   return parts.join(" · ") || "无证据";
 }
 
-function Section({ title, children }: { title: string; children: React.ReactNode }) {
+function Section({ title, count, children }: { title: string; count?: number; children: React.ReactNode }) {
   return (
-    <div className="space-y-1.5">
-      <h3 className="text-xs font-semibold uppercase tracking-wide text-zinc-500">{title}</h3>
+    <div className="space-y-2">
+      <div className="flex items-center gap-2">
+        <h3 className="label">{title}</h3>
+        {count != null && <span className="chip py-0! font-mono">{count}</span>}
+        <span className="h-px flex-1 bg-line-soft" />
+      </div>
       {children}
     </div>
   );
 }
-
-const TABLE_CLS = "w-full text-left text-xs";
-const TH_CLS = "border-b border-zinc-800 px-2 py-1 text-zinc-500";
-const TD_CLS = "border-b border-zinc-900 px-2 py-1 align-top text-zinc-300";
 
 export default function ReportPanel({ runId }: { runId: string }) {
   const [report, setReport] = useState<RunReport | null>(null);
@@ -155,90 +118,92 @@ export default function ReportPanel({ runId }: { runId: string }) {
   }
 
   const data: EvaluationReport | null = report?.report_json ?? null;
+  const finalMeta = data ? FINAL_META[data.final_status] : null;
 
   return (
-    <section className="space-y-3 rounded-xl border border-zinc-800 bg-zinc-950 p-4">
+    <section className="card space-y-4 p-4">
       <div className="flex flex-wrap items-center gap-3">
-        <h2 className="text-sm font-semibold uppercase tracking-wide text-zinc-400">
-          复现报告 Report
-        </h2>
-        {data && (
-          <span className={`rounded px-2 py-0.5 text-xs ${FINAL_COLOR[data.final_status]}`}>
-            {data.final_status} · {FINAL_LABEL[data.final_status]}
+        <h2 className="label">复现报告 Report</h2>
+        {data && finalMeta && (
+          <span className={`chip ${TONE_BADGE[finalMeta.tone]}`}>
+            {data.final_status} · {finalMeta.label}
           </span>
         )}
-        <div className="ml-auto flex gap-2">
+        <div className="ml-auto flex flex-wrap gap-2">
           {report && (
             <>
-              <button
-                onClick={() => setShowMarkdown((v) => !v)}
-                className="rounded bg-zinc-800 px-2 py-1 text-xs text-zinc-200 hover:bg-zinc-700"
-              >
+              <button onClick={() => setShowMarkdown((v) => !v)} className="btn btn-ghost btn-sm">
                 {showMarkdown ? "结构化视图" : "Markdown 原文"}
               </button>
-              <button
-                onClick={download}
-                className="rounded bg-zinc-800 px-2 py-1 text-xs text-zinc-200 hover:bg-zinc-700"
-              >
+              <button onClick={download} className="btn btn-ghost btn-sm">
+                <IconDownload className="h-3.5 w-3.5" />
                 下载 .md
               </button>
             </>
           )}
-          <button
-            onClick={regenerate}
-            disabled={busy}
-            className="rounded bg-sky-700 px-2 py-1 text-xs text-sky-100 hover:bg-sky-600 disabled:opacity-50"
-          >
+          <button onClick={regenerate} disabled={busy} className="btn btn-info btn-sm">
+            <IconRefresh className={`h-3.5 w-3.5 ${busy ? "animate-spin" : ""}`} />
             {busy ? "生成中…" : report ? "重新生成" : "生成报告"}
           </button>
         </div>
       </div>
 
       {error && (
-        <p className="rounded-lg border border-red-800 bg-red-950 px-4 py-2 text-sm text-red-300">
+        <p className="flex items-start gap-2 rounded-lg border border-bad/30 bg-bad/8 px-4 py-2 text-sm text-bad">
+          <IconWarn className="mt-0.5 h-4 w-4 shrink-0" />
           {error}
         </p>
       )}
       {missing && !error && (
-        <p className="text-sm text-zinc-500">报告尚未生成（运行结束后自动生成，或点击「生成报告」）。</p>
+        <p className="text-sm text-fg-3">报告尚未生成（运行结束后自动生成，或点击「生成报告」）。</p>
       )}
 
-      {data && !showMarkdown && (
-        <div className="space-y-4">
-          <p className="text-sm text-zinc-300">{data.summary}</p>
+      {data && finalMeta && !showMarkdown && (
+        <div className="space-y-5">
+          <div className={`rounded-lg border px-4 py-3 ${
+            finalMeta.tone === "ok" ? "border-ok/30 bg-ok/8"
+            : finalMeta.tone === "bad" ? "border-bad/30 bg-bad/8"
+            : finalMeta.tone === "warn" ? "border-warn/30 bg-warn/8"
+            : finalMeta.tone === "info" ? "border-info/30 bg-info/8"
+            : "border-line bg-ink-900"
+          }`}>
+            <p className="display text-lg font-semibold text-fg">{finalMeta.label}</p>
+            <p className="mt-1 text-sm leading-relaxed text-fg-2">{data.summary}</p>
+          </div>
 
-          <Section title={`结果对比 Results Comparison（${data.metric_comparisons.length}）`}>
-            <div className="overflow-x-auto rounded-lg border border-zinc-800">
-              <table className={TABLE_CLS}>
+          <Section title="结果对比 Results Comparison" count={data.metric_comparisons.length}>
+            <MetricChart comparisons={data.metric_comparisons} />
+            <div className="overflow-x-auto rounded-lg border border-line">
+              <table className="table-lab">
                 <thead>
                   <tr>
-                    <th className={TH_CLS}>指标</th>
-                    <th className={TH_CLS}>论文值</th>
-                    <th className={TH_CLS}>实验值</th>
-                    <th className={TH_CLS}>绝对差</th>
-                    <th className={TH_CLS}>相对差</th>
-                    <th className={TH_CLS}>百分点差</th>
-                    <th className={TH_CLS}>单位</th>
-                    <th className={TH_CLS}>状态</th>
+                    <th>指标</th>
+                    <th>论文值</th>
+                    <th>实验值</th>
+                    <th>绝对差</th>
+                    <th>相对差</th>
+                    <th>百分点差</th>
+                    <th>单位</th>
+                    <th>状态</th>
                   </tr>
                 </thead>
                 <tbody>
                   {data.metric_comparisons.map((c) => (
                     <tr key={c.metric} title={c.note ?? undefined}>
-                      <td className={TD_CLS}>{c.metric}</td>
-                      <td className={TD_CLS} title={evidenceTitle(c.paper_evidence)}>
-                        {fmt(c.paper_value)}
+                      <td className="font-mono">{c.metric}</td>
+                      <td className="font-mono text-info" title={evidenceTitle(c.paper_evidence)}>
+                        {fmtNum(c.paper_value)}
                       </td>
-                      <td className={TD_CLS}>{fmt(c.experiment_value)}</td>
-                      <td className={TD_CLS}>{fmt(c.absolute_difference)}</td>
-                      <td className={TD_CLS}>{fmt(c.relative_difference)}</td>
-                      <td className={TD_CLS}>
+                      <td className="font-mono text-brand">{fmtNum(c.experiment_value)}</td>
+                      <td className="font-mono">{fmtNum(c.absolute_difference)}</td>
+                      <td className="font-mono">{fmtNum(c.relative_difference)}</td>
+                      <td className="font-mono">
                         {c.percentage_point_difference == null
                           ? "—"
                           : `${c.percentage_point_difference >= 0 ? "+" : ""}${c.percentage_point_difference.toFixed(2)} pp`}
                       </td>
-                      <td className={TD_CLS}>{c.unit}</td>
-                      <td className={TD_CLS}>
+                      <td>{c.unit}</td>
+                      <td>
                         <CheckBadge status={c.comparison_status} />
                       </td>
                     </tr>
@@ -248,32 +213,32 @@ export default function ReportPanel({ runId }: { runId: string }) {
             </div>
           </Section>
 
-          <Section title={`方法验证 Method Validation（${data.method_checks.length}）`}>
-            <div className="overflow-x-auto rounded-lg border border-zinc-800">
-              <table className={TABLE_CLS}>
+          <Section title="方法验证 Method Validation" count={data.method_checks.length}>
+            <div className="overflow-x-auto rounded-lg border border-line">
+              <table className="table-lab">
                 <thead>
                   <tr>
-                    <th className={TH_CLS}>项</th>
-                    <th className={TH_CLS}>状态</th>
-                    <th className={TH_CLS}>论文值</th>
-                    <th className={TH_CLS}>实现值</th>
-                    <th className={TH_CLS}>说明</th>
+                    <th>项</th>
+                    <th>状态</th>
+                    <th>论文值</th>
+                    <th>实现值</th>
+                    <th>说明</th>
                   </tr>
                 </thead>
                 <tbody>
                   {data.method_checks.map((c) => (
                     <tr key={c.item}>
-                      <td className={TD_CLS}>{METHOD_ITEM_LABEL[c.item] ?? c.item}</td>
-                      <td className={TD_CLS}>
+                      <td>{METHOD_ITEM_LABEL[c.item] ?? c.item}</td>
+                      <td>
                         <CheckBadge status={c.status} />
                       </td>
-                      <td className={TD_CLS} title={evidenceTitle(c.paper_evidence)}>
+                      <td className="max-w-56 truncate" title={evidenceTitle(c.paper_evidence)}>
                         {c.paper_value ?? "—"}
                       </td>
-                      <td className={TD_CLS} title={evidenceTitle(c.implementation_evidence)}>
+                      <td className="max-w-56 truncate font-mono" title={evidenceTitle(c.implementation_evidence)}>
                         {c.implementation_value ?? "—"}
                       </td>
-                      <td className={TD_CLS}>{c.note}</td>
+                      <td className="text-fg-2">{c.note}</td>
                     </tr>
                   ))}
                 </tbody>
@@ -281,30 +246,30 @@ export default function ReportPanel({ runId }: { runId: string }) {
             </div>
           </Section>
 
-          <Section title={`实验验证 Experiment Validation（${data.experiment_checks.length}）`}>
-            <div className="overflow-x-auto rounded-lg border border-zinc-800">
-              <table className={TABLE_CLS}>
+          <Section title="实验验证 Experiment Validation" count={data.experiment_checks.length}>
+            <div className="overflow-x-auto rounded-lg border border-line">
+              <table className="table-lab">
                 <thead>
                   <tr>
-                    <th className={TH_CLS}>项</th>
-                    <th className={TH_CLS}>状态</th>
-                    <th className={TH_CLS}>计划值</th>
-                    <th className={TH_CLS}>实际值</th>
-                    <th className={TH_CLS}>说明</th>
+                    <th>项</th>
+                    <th>状态</th>
+                    <th>计划值</th>
+                    <th>实际值</th>
+                    <th>说明</th>
                   </tr>
                 </thead>
                 <tbody>
                   {data.experiment_checks.map((c) => (
                     <tr key={c.item}>
-                      <td className={TD_CLS}>{EXPERIMENT_ITEM_LABEL[c.item] ?? c.item}</td>
-                      <td className={TD_CLS}>
+                      <td>{EXPERIMENT_ITEM_LABEL[c.item] ?? c.item}</td>
+                      <td>
                         <CheckBadge status={c.status} />
                       </td>
-                      <td className={TD_CLS}>{c.plan_value ?? "—"}</td>
-                      <td className={TD_CLS} title={evidenceTitle(c.actual_evidence)}>
+                      <td className="max-w-48 truncate font-mono">{c.plan_value ?? "—"}</td>
+                      <td className="max-w-48 truncate font-mono" title={evidenceTitle(c.actual_evidence)}>
                         {c.actual_value ?? "—"}
                       </td>
-                      <td className={TD_CLS}>{c.note}</td>
+                      <td className="text-fg-2">{c.note}</td>
                     </tr>
                   ))}
                 </tbody>
@@ -314,11 +279,13 @@ export default function ReportPanel({ runId }: { runId: string }) {
 
           {data.scaling_deviations.length > 0 && (
             <Section title="缩放偏差 Scaling Deviations">
-              <ul className="list-disc space-y-1 pl-5 text-xs text-zinc-300">
+              <ul className="space-y-1.5">
                 {data.scaling_deviations.map((d) => (
-                  <li key={d.field_path}>
-                    <span className="font-mono">{d.field_path}</span>：{d.paper_value ?? "—"} →{" "}
-                    {d.plan_value}（{d.reason}）
+                  <li key={d.field_path} className="rounded-lg border border-scale/25 bg-scale/6 px-3 py-2 text-xs text-fg-2">
+                    <span className="font-mono text-scale">{d.field_path}</span>
+                    <span className="mx-1.5 font-mono">{d.paper_value ?? "—"}</span>→
+                    <span className="ml-1.5 font-mono text-fg">{d.plan_value}</span>
+                    <span className="ml-2 text-fg-3">（{d.reason}）</span>
                   </li>
                 ))}
               </ul>
@@ -327,22 +294,27 @@ export default function ReportPanel({ runId }: { runId: string }) {
 
           {data.missing_information.length > 0 && (
             <Section title="缺失信息 Missing Information">
-              <ul className="list-disc space-y-1 pl-5 text-xs text-amber-200">
+              <ul className="space-y-1.5">
                 {data.missing_information.map((m, i) => (
-                  <li key={i}>{m}</li>
+                  <li key={i} className="flex items-start gap-2 rounded-lg border border-warn/25 bg-warn/6 px-3 py-2 text-xs text-warn">
+                    <IconWarn className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+                    {m}
+                  </li>
                 ))}
               </ul>
             </Section>
           )}
 
           {data.assumptions.length > 0 && (
-            <Section title={`Agent 假设 Assumptions（${data.assumptions.length}）`}>
-              <ul className="list-disc space-y-1 pl-5 text-xs text-zinc-300">
+            <Section title="Agent 假设 Assumptions" count={data.assumptions.length}>
+              <ul className="space-y-1.5">
                 {data.assumptions.map((a, i) => (
-                  <li key={i}>
-                    <span className="font-mono">{a.field_path}</span> [{a.kind}] ={" "}
-                    {String(a.value)} — {a.rationale}
-                    {a.human_confirmed ? "（已确认）" : ""}
+                  <li key={i} className="rounded-lg border border-line bg-ink-900 px-3 py-2 text-xs text-fg-2">
+                    <span className="font-mono text-info">{a.field_path}</span>
+                    <span className="chip mx-1.5 py-0!">{a.kind}</span>=
+                    <span className="ml-1.5 font-mono text-fg">{String(a.value)}</span>
+                    <span className="ml-2 text-fg-3">— {a.rationale}</span>
+                    {a.human_confirmed && <span className="chip ml-2 py-0! badge-info">已确认</span>}
                   </li>
                 ))}
               </ul>
@@ -350,15 +322,18 @@ export default function ReportPanel({ runId }: { runId: string }) {
           )}
 
           <Section title="已知局限 Known Limitations">
-            <ul className="list-disc space-y-1 pl-5 text-xs text-zinc-400">
+            <ul className="space-y-1 text-xs leading-relaxed text-fg-3">
               {data.limitations.map((l, i) => (
-                <li key={i}>{l}</li>
+                <li key={i} className="flex gap-2">
+                  <span className="text-fg-3">·</span>
+                  {l}
+                </li>
               ))}
             </ul>
           </Section>
 
           <Section title="追溯引用 Trace References">
-            <div className="grid grid-cols-2 gap-1.5 text-xs lg:grid-cols-3">
+            <div className="grid grid-cols-1 gap-1.5 text-xs sm:grid-cols-2 lg:grid-cols-4">
               {[
                 ["Paper ID", data.references.paper_id],
                 ["Spec 版本", `v${data.references.spec_version} · ${data.references.spec_version_id}`],
@@ -369,9 +344,9 @@ export default function ReportPanel({ runId }: { runId: string }) {
                 ["Run ID", data.references.run_id],
                 ["固定代码文件", `${data.references.generated_file_ids.length} 个`],
               ].map(([label, value]) => (
-                <div key={label} className="rounded-lg border border-zinc-800 bg-zinc-900 px-3 py-2">
-                  <span className="block text-zinc-500">{label}</span>
-                  <span className="block break-all font-mono text-zinc-300">{value}</span>
+                <div key={label} className="rounded-lg border border-line bg-ink-900 px-3 py-2">
+                  <span className="label block text-[9px]!">{label}</span>
+                  <span className="mt-0.5 block break-all font-mono text-fg-2">{value}</span>
                 </div>
               ))}
             </div>
@@ -380,9 +355,17 @@ export default function ReportPanel({ runId }: { runId: string }) {
       )}
 
       {report && showMarkdown && (
-        <pre className="max-h-[32rem] overflow-auto rounded-lg border border-zinc-800 bg-black px-3 py-2 text-xs text-zinc-300">
-          {report.markdown}
-        </pre>
+        <div className="terminal">
+          <div className="terminal-bar">
+            <span className="terminal-dot bg-bad/70" />
+            <span className="terminal-dot bg-warn/70" />
+            <span className="terminal-dot bg-ok/70" />
+            <span className="font-mono text-[11px] text-fg-3">reproduction-report-{runId.slice(0, 8)}.md</span>
+          </div>
+          <pre className="max-h-[32rem] overflow-auto px-4 py-3 text-xs leading-relaxed text-fg-2">
+            {report.markdown}
+          </pre>
+        </div>
       )}
     </section>
   );

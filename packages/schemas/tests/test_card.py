@@ -63,6 +63,23 @@ class TestEvidenceField:
         with pytest.raises(ValidationError):
             EvidenceField(value="x", status=EvidenceStatus.PAPER_EXPLICIT, evidence_quote="q")
 
+    def test_paper_described_requires_quote_and_page(self):
+        ok = EvidenceField(
+            value="centered",
+            status=EvidenceStatus.PAPER_DESCRIBED,
+            evidence_quote="images are centered",
+            source_page=4,
+        )
+        assert ok.status is EvidenceStatus.PAPER_DESCRIBED
+        with pytest.raises(ValidationError):
+            EvidenceField(value="centered", status=EvidenceStatus.PAPER_DESCRIBED)
+        with pytest.raises(ValidationError):
+            EvidenceField(
+                value="centered",
+                status=EvidenceStatus.PAPER_DESCRIBED,
+                evidence_quote="images are centered",
+            )
+
     def test_missing_must_not_carry_value_or_evidence(self):
         with pytest.raises(ValidationError):
             EvidenceField(value="x", status=EvidenceStatus.MISSING)

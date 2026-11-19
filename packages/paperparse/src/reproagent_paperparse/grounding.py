@@ -128,7 +128,9 @@ def _ground_field(field: dict, locator: QuoteLocator) -> tuple[dict, bool]:
         if match is not None:
             grounded = {
                 **field,
-                "status": status if status in ("paper_explicit", "inferred") else "inferred",
+                "status": status
+                if status in ("paper_explicit", "paper_described", "inferred")
+                else "inferred",
                 "source_page": match.page,
                 "source_section": match.section,
                 "evidence_quote": quote.strip(),

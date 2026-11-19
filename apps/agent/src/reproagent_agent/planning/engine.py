@@ -24,6 +24,7 @@ from reproagent_schemas import (
     PreprocessingStep,
     ReproductionCard,
     ResourceEstimates,
+    RiskTier,
     RuntimeBudget,
     TrainingConfig,
 )
@@ -62,7 +63,10 @@ def _build_optimizer(card: ReproductionCard, assumptions: list[Assumption]) -> P
     field = card.optimizer
     fp = "training_config.optimizer"
     normalized = normalize_optimizer(field.value)
-    if field.status is EvidenceStatus.PAPER_EXPLICIT and normalized is not None:
+    if (
+        field.status in (EvidenceStatus.PAPER_EXPLICIT, EvidenceStatus.PAPER_DESCRIBED)
+        and normalized is not None
+    ):
         return PlanParam(
             value=normalized,
             source=ParamSource.PAPER_EXPLICIT,
@@ -71,7 +75,10 @@ def _build_optimizer(card: ReproductionCard, assumptions: list[Assumption]) -> P
             source_page=field.source_page,
             human_confirmed=field.human_confirmed,
         )
-    if field.status is EvidenceStatus.PAPER_EXPLICIT and normalized is None:
+    if (
+        field.status in (EvidenceStatus.PAPER_EXPLICIT, EvidenceStatus.PAPER_DESCRIBED)
+        and normalized is None
+    ):
         rationale = f"原文优化器「{field.value}」非标准实现，MVP 提出 SGD 替代，需人工确认"
         assumptions.append(
             Assumption(
@@ -80,7 +87,8 @@ def _build_optimizer(card: ReproductionCard, assumptions: list[Assumption]) -> P
                 value="sgd",
                 rationale=rationale,
                 requires_confirmation=True,
-                card_status=EvidenceStatus.PAPER_EXPLICIT,
+                risk_tier=RiskTier.CRITICAL,
+                card_status=field.status,
                 evidence_quote=field.evidence_quote,
                 source_page=field.source_page,
             )
@@ -107,6 +115,7 @@ def _build_optimizer(card: ReproductionCard, assumptions: list[Assumption]) -> P
                 value="sgd",
                 rationale=rationale,
                 requires_confirmation=True,
+                risk_tier=RiskTier.CRITICAL,
                 card_status=EvidenceStatus.INFERRED,
                 evidence_quote=field.evidence_quote,
                 source_page=field.source_page,
@@ -177,7 +186,19 @@ def _preprocessing(card: ReproductionCard, assumptions: list[Assumption]) -> Pre
     for key, field in card.data_preprocessing.items():
         if field.status is EvidenceStatus.MISSING or field.value is None:
             continue
-        if field.status is EvidenceStatus.PAPER_EXPLICIT:
+        # Prose-described preprocessing is paper-backed: either the new
+        # paper_described status, or a legacy inferred field whose quote was
+        # located in the paper (grounding assigns quote + page). Both carry real
+        # evidence, so they are shown with their quote and need no confirmation.
+        paper_backed = field.status in (
+            EvidenceStatus.PAPER_EXPLICIT,
+            EvidenceStatus.PAPER_DESCRIBED,
+        ) or (
+            field.status is EvidenceStatus.INFERRED
+            and field.evidence_quote
+            and field.source_page is not None
+        )
+        if paper_backed:
             source = ParamSource.PAPER_EXPLICIT
         elif field.human_confirmed:
             source = ParamSource.HUMAN_CONFIRMED
@@ -199,6 +220,8 @@ def _preprocessing(card: ReproductionCard, assumptions: list[Assumption]) -> Pre
                     value=str(field.value),
                     rationale="预处理步骤为推断值，论文未直接说明",
                     requires_confirmation=True,
+                    risk_tier=RiskTier.ROUTINE,
+                    auto_acceptable=True,
                     card_status=field.status,
                 )
             )
@@ -227,6 +250,8 @@ def _preprocessing(card: ReproductionCard, assumptions: list[Assumption]) -> Pre
                 value="to_tensor + normalize",
                 rationale="论文未明确预处理，采用 MNIST 标准 ToTensor+Normalize（非原文设置）",
                 requires_confirmation=False,
+                risk_tier=RiskTier.INFO,
+                auto_acceptable=True,
                 card_status=EvidenceStatus.MISSING,
             )
         )
@@ -308,9 +333,11 @@ def build_plan(card: ReproductionCard, scaling: ScalingConfig | None = None) -> 
             wd_field,
             "training_config.weight_decay",
             fallback_value=0.0,
-            fallback_rationale="论文未提供 weight_decay；MVP 提出 0.0，需人工确认",
+            fallback_rationale="论文未提供 weight_decay；MVP 提出 0.0（常规项，可批量采纳）",
             cast=as_float,
             assumptions=assumptions,
+            risk_tier=RiskTier.ROUTINE,
+            auto_acceptable=True,
         )
     batch_param, epochs_param = _scaling_params(card, scaling, deviations)
     training_config = TrainingConfig(
@@ -367,6 +394,8 @@ def build_plan(card: ReproductionCard, scaling: ScalingConfig | None = None) -> 
             value="mnist (preloaded)",
             rationale="Runner 无外网出口，MNIST 需预置；代码生成/执行阶段须使用本地数据集路径。",
             requires_confirmation=False,
+            risk_tier=RiskTier.INFO,
+            auto_acceptable=True,
         )
     )
 

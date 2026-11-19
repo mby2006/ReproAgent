@@ -4,8 +4,10 @@ import Link from "next/link";
 import { useSearchParams } from "next/navigation";
 import { Suspense, useCallback, useEffect, useRef, useState } from "react";
 import AuthGate from "@/components/AuthGate";
+import Shell from "@/components/Shell";
 import WorkflowInsights from "@/components/WorkflowInsights";
 import WorkflowStepper from "@/components/WorkflowStepper";
+import { IconArrowLeft, IconCheck, IconWarn } from "@/components/icons";
 import RunPanel from "./RunPanel";
 import { apiFetch, resumeWorkflow, retryWorkflow } from "@/lib/api";
 import { useWorkflow } from "@/lib/useWorkflow";
@@ -16,14 +18,9 @@ import type {
   PlanParam,
   PlanVersion,
   PlanVersionMeta,
+  RiskTier,
 } from "@/lib/types";
-
-const SOURCE_LABEL: Record<string, string> = {
-  paper_explicit: "原文",
-  inferred: "推断",
-  human_confirmed: "已确认",
-  mvp_scaling: "MVP缩放",
-};
+import { RISK_META, SOURCE_META, TONE_BADGE, TONE_TEXT, tierOf } from "@/lib/ui";
 
 const KIND_LABEL: Record<string, string> = {
   inferred: "推断",
@@ -39,17 +36,11 @@ const ORIGIN_LABEL: Record<string, string> = {
 };
 
 function SourceBadge({ source, confirmed }: { source: string; confirmed?: boolean }) {
-  const color =
-    source === "paper_explicit"
-      ? "bg-emerald-800 text-emerald-200"
-      : source === "mvp_scaling"
-        ? "bg-violet-700 text-violet-100"
-        : source === "human_confirmed"
-          ? "bg-sky-700 text-sky-100"
-          : "bg-amber-600 text-amber-50";
+  const meta = SOURCE_META[source as keyof typeof SOURCE_META];
+  const tone = meta?.tone ?? "mute";
   return (
-    <span className={`rounded px-1.5 py-0.5 text-xs ${color}`}>
-      {SOURCE_LABEL[source] ?? source}
+    <span className={`chip ${TONE_BADGE[tone]}`}>
+      {meta?.label ?? source}
       {confirmed && source !== "human_confirmed" ? "·已确认" : ""}
     </span>
   );
@@ -86,22 +77,21 @@ function buildEditables(plan: ExperimentPlan): Editable[] {
 function EditRow({ item, active, onClick }: { item: Editable; active: boolean; onClick: () => void }) {
   const p = item.param;
   return (
-    <button
-      onClick={onClick}
-      className={`flex w-full items-center justify-between gap-2 rounded-lg border px-3 py-2 text-left text-sm ${
-        active ? "border-emerald-500 bg-zinc-800" : "border-zinc-800 bg-zinc-900 hover:border-zinc-600"
-      }`}
-    >
+    <button onClick={onClick} className={`field-row ${active ? "field-row-active" : ""}`}>
       <span className="min-w-0">
-        <span className="block text-xs text-zinc-400">{item.label}</span>
-        <span className="block truncate">{item.value === null ? "—" : String(item.value)}</span>
+        <span className="block text-[11px] text-fg-3">{item.label}</span>
+        <span className="block truncate font-mono text-[13px] text-fg">
+          {item.value === null ? "—" : String(item.value)}
+        </span>
       </span>
       <span className="flex shrink-0 items-center gap-1.5">
         {p?.source === "mvp_scaling" && p.paper_value != null && (
-          <span className="text-xs text-zinc-500">原文 {String(p.paper_value)}</span>
+          <span className="font-mono text-[10.5px] text-fg-3">原文 {String(p.paper_value)}</span>
         )}
         {p && <SourceBadge source={p.source} confirmed={p.human_confirmed} />}
-        {p?.requires_confirmation && !p.human_confirmed && <span className="text-xs text-amber-400">⚠</span>}
+        {p?.requires_confirmation && !p.human_confirmed && (
+          <IconWarn className="h-3.5 w-3.5 text-warn" />
+        )}
       </span>
     </button>
   );
@@ -110,8 +100,58 @@ function EditRow({ item, active, onClick }: { item: Editable; active: boolean; o
 function Section({ title, children }: { title: string; children: React.ReactNode }) {
   return (
     <div className="space-y-1.5">
-      <h2 className="text-xs font-semibold uppercase tracking-wide text-zinc-500">{title}</h2>
+      <h2 className="label text-fg-2!">{title}</h2>
       {children}
+    </div>
+  );
+}
+
+const TIER_BORDER: Record<RiskTier, string> = {
+  critical: "border-l-bad",
+  routine: "border-l-warn",
+  info: "border-l-line",
+};
+
+function AssumptionCard({
+  a,
+  saving,
+  onConfirm,
+}: {
+  a: Assumption;
+  saving: boolean;
+  onConfirm: (a: Assumption) => void;
+}) {
+  const tier = tierOf(a);
+  const meta = RISK_META[tier];
+  const pending = a.requires_confirmation && !a.human_confirmed;
+  return (
+    <div className={`card space-y-1.5 border-l-2 p-3 text-sm ${TIER_BORDER[tier]}`}>
+      <div className="flex items-center justify-between gap-2">
+        <span className="truncate font-mono text-[10.5px] text-fg-3">{a.field_path}</span>
+        <span className="flex shrink-0 items-center gap-1.5">
+          <span className={`chip ${TONE_BADGE[meta.tone]}`}>{meta.label}</span>
+          <span className="chip">{KIND_LABEL[a.kind] ?? a.kind}</span>
+        </span>
+      </div>
+      <p className="text-[13px] leading-relaxed text-fg-2">{a.rationale}</p>
+      <p className="font-mono text-[10.5px] text-fg-3">提案值：{String(a.value)}</p>
+      {a.evidence_quote && (
+        <blockquote className="quote">
+          “{a.evidence_quote}”
+          {a.source_page != null && (
+            <span className="ml-2 font-mono text-[10.5px] not-italic text-fg-3">p.{a.source_page}</span>
+          )}
+        </blockquote>
+      )}
+      {pending ? (
+        <button onClick={() => onConfirm(a)} disabled={saving} className="btn btn-info btn-sm">
+          <IconCheck className="h-3 w-3" /> 确认此假设
+        </button>
+      ) : (
+        <span className={`text-xs ${a.human_confirmed ? "text-ok" : "text-fg-3"}`}>
+          {a.human_confirmed ? "✓ 已确认" : "无需确认（MVP 缩放/说明）"}
+        </span>
+      )}
     </div>
   );
 }
@@ -224,6 +264,43 @@ function PlanInner({ experimentId }: { experimentId: string }) {
     );
   }
 
+  async function acceptRoutine() {
+    const p = current?.plan;
+    if (!current || !p) return;
+    const targets = p.assumptions.filter(
+      (a) =>
+        tierOf(a) === "routine" &&
+        a.requires_confirmation &&
+        !a.human_confirmed &&
+        a.auto_acceptable,
+    );
+    if (targets.length === 0) return;
+    setSaving(true);
+    setError(null);
+    try {
+      await apiFetch<PlanVersion>(`/v1/experiments/${experimentId}/plans`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          base_version: current.version,
+          changes: targets.map((a) => ({
+            field_path: a.field_path,
+            value: a.value,
+            human_confirmed: true,
+          })),
+          change_reason: `批量采纳 ${targets.length} 项常规假设`,
+          origin: "user_edit",
+        }),
+      });
+      await loadVersions();
+      await loadExperiment();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "批量采纳失败");
+    } finally {
+      setSaving(false);
+    }
+  }
+
   async function approve() {
     if (!current) return;
     setApproving(true);
@@ -276,38 +353,47 @@ function PlanInner({ experimentId }: { experimentId: string }) {
 
   const plan = current?.plan;
   const editables = plan ? buildEditables(plan) : [];
-  const unconfirmed = plan
-    ? plan.assumptions.filter((a) => a.requires_confirmation && !a.human_confirmed)
-    : [];
+  const assumptions = plan?.assumptions ?? [];
+  const isPending = (a: Assumption) => a.requires_confirmation && !a.human_confirmed;
+  const criticalPending = assumptions.filter((a) => isPending(a) && tierOf(a) === "critical");
+  const routinePending = assumptions.filter(
+    (a) => isPending(a) && tierOf(a) === "routine" && a.auto_acceptable,
+  );
+  const groups: Record<RiskTier, Assumption[]> = {
+    critical: assumptions.filter((a) => tierOf(a) === "critical"),
+    routine: assumptions.filter((a) => tierOf(a) === "routine"),
+    info: assumptions.filter((a) => tierOf(a) === "info"),
+  };
   const approved = current?.approved_at != null;
-  const canApprove = unconfirmed.length === 0 && !approved && !!current;
+  const canApprove = criticalPending.length === 0 && !approved && !!current;
 
   return (
-    <main className="mx-auto w-full max-w-7xl flex-1 space-y-4 p-6">
-      <header className="flex flex-wrap items-center gap-3">
+    <main className="mx-auto w-full max-w-7xl space-y-4 px-5 py-6">
+      <header className="rise flex flex-wrap items-center gap-3">
         <Link
           href={
             experiment
               ? `/papers/${experiment.paper_id}${workflowDriven ? `?workflow=${workflowId}` : ""}`
               : "/papers"
           }
-          className="text-sm text-zinc-400 hover:text-zinc-200"
+          className="btn btn-ghost btn-sm px-2!"
+          title="返回论文"
         >
-          ← 返回论文
+          <IconArrowLeft className="h-4 w-4" />
         </Link>
-        <h1 className="min-w-0 flex-1 truncate text-xl font-semibold">
-          {experiment?.name ?? "实验计划"}
-        </h1>
-        {experiment && (
-          <span className="rounded bg-zinc-800 px-2 py-0.5 text-xs text-zinc-300">
-            {experiment.status}
-          </span>
-        )}
+        <div className="min-w-0 flex-1">
+          <p className="label mb-0.5">Experiment · Plan</p>
+          <h1 className="display truncate text-xl font-bold">
+            {experiment?.name ?? "实验计划"}
+          </h1>
+        </div>
+        {experiment && <span className="chip">{experiment.status}</span>}
         {versions.length > 0 && (
           <select
             value={current?.version ?? ""}
             onChange={(e) => switchVersion(Number(e.target.value))}
-            className="rounded border border-zinc-700 bg-zinc-900 px-2 py-1 text-sm"
+            className="select w-48!"
+            aria-label="计划版本"
           >
             {versions.map((v) => (
               <option key={v.id} value={v.version}>
@@ -320,8 +406,9 @@ function PlanInner({ experimentId }: { experimentId: string }) {
         <button
           onClick={approve}
           disabled={!canApprove || approving}
-          className="rounded bg-emerald-600 px-3 py-1 text-sm hover:bg-emerald-500 disabled:opacity-50"
+          className="btn btn-primary btn-sm"
         >
+          <IconCheck className="h-3.5 w-3.5" />
           {approving
             ? "提交中…"
             : approved
@@ -331,11 +418,7 @@ function PlanInner({ experimentId }: { experimentId: string }) {
                 : "批准计划"}
         </button>
         {workflowDriven && wfStatus === "awaiting_plan_approval" && approved && (
-          <button
-            onClick={continueWorkflow}
-            disabled={continuing}
-            className="rounded bg-sky-600 px-3 py-1 text-sm hover:bg-sky-500 disabled:opacity-50"
-          >
+          <button onClick={continueWorkflow} disabled={continuing} className="btn btn-info btn-sm">
             {continuing ? "提交中…" : "继续执行"}
           </button>
         )}
@@ -353,30 +436,29 @@ function PlanInner({ experimentId }: { experimentId: string }) {
       {workflow && <WorkflowInsights workflow={workflow} />}
 
       {approved && (
-        <p className="rounded-lg border border-emerald-700 bg-emerald-950 px-4 py-2 text-sm text-emerald-300">
+        <p className="rise rounded-lg border border-ok/40 bg-ok/10 px-4 py-2 text-sm text-ok">
           该计划版本已批准（{current?.approved_at}），可进入代码生成阶段。
         </p>
       )}
-      {!approved && unconfirmed.length > 0 && (
-        <p className="rounded-lg border border-amber-700 bg-amber-950 px-4 py-2 text-sm text-amber-300">
-          存在 {unconfirmed.length} 项未确认的关键假设，确认后方可批准：
-          {unconfirmed.map((a) => a.field_path).join("、")}
+      {!approved && criticalPending.length > 0 && (
+        <p className="rise flex flex-wrap items-center gap-2 rounded-lg border border-bad/40 bg-bad/10 px-4 py-2 text-sm text-bad">
+          <IconWarn className="h-4 w-4 shrink-0" />
+          还需确认 {criticalPending.length} 项关键假设后方可批准：
+          <span className="font-mono text-xs">{criticalPending.map((a) => a.field_path).join("、")}</span>
         </p>
       )}
       {error && (
-        <p className="rounded-lg border border-red-800 bg-red-950 px-4 py-2 text-sm text-red-300">
+        <p className="rise rounded-lg border border-bad/40 bg-bad/10 px-4 py-2 text-sm text-bad">
           {error}
         </p>
       )}
 
       {plan && (
-        <div className="grid gap-4 lg:grid-cols-2">
-          <section className="space-y-4">
-            <div className="rounded-xl border border-violet-800 bg-violet-950/40 p-3 text-sm text-violet-200">
-              <span className="mr-2 rounded bg-violet-700 px-1.5 py-0.5 text-xs">
-                {plan.scaling_profile}
-              </span>
-              {plan.rationale}
+        <div className="grid gap-5 lg:grid-cols-2">
+          <section className="rise rise-1 space-y-5">
+            <div className="card border-scale/30 bg-scale/8 p-4">
+              <span className="chip badge-scale mb-2">{plan.scaling_profile}</span>
+              <p className="text-[13px] leading-relaxed text-fg-2">{plan.rationale}</p>
             </div>
 
             <Section title="训练配置 Training（点击编辑/确认）">
@@ -390,7 +472,9 @@ function PlanInner({ experimentId }: { experimentId: string }) {
                     onClick={() => setSelected(item)}
                   />
                 ))}
-              <p className="text-xs text-zinc-500">随机种子 seed = {plan.training_config.seed}（固定）</p>
+              <p className="font-mono text-[10.5px] text-fg-3">
+                seed = {plan.training_config.seed}（固定）
+              </p>
             </Section>
 
             <Section title="数据集 Dataset">
@@ -404,43 +488,43 @@ function PlanInner({ experimentId }: { experimentId: string }) {
                     onClick={() => setSelected(item)}
                   />
                 ))}
-              <p className="text-xs text-zinc-500">
-                {plan.dataset_config.name} · 输入 {plan.dataset_config.input_shape.join("×")} ·{" "}
-                {plan.dataset_config.num_classes} 类 · 全量 train{" "}
+              <p className="font-mono text-[10.5px] text-fg-3">
+                {plan.dataset_config.name} · input {plan.dataset_config.input_shape.join("×")} ·{" "}
+                {plan.dataset_config.num_classes} classes · full train{" "}
                 {plan.dataset_config.full_train_size ?? "—"} / test{" "}
                 {plan.dataset_config.full_test_size ?? "—"}
               </p>
             </Section>
 
             <Section title="模型 Model">
-              <div className="rounded-lg border border-zinc-800 bg-zinc-900 px-3 py-2 text-sm">
-                <span className="text-zinc-400">{plan.model_config.architecture}</span>
+              <div className="card px-3 py-2 text-sm">
+                <span className="font-mono text-[13px] text-fg">{plan.model_config.architecture}</span>
                 {plan.model_config.description && (
-                  <span className="block text-xs text-zinc-500">{plan.model_config.description}</span>
+                  <span className="mt-0.5 block text-xs text-fg-3">{plan.model_config.description}</span>
                 )}
               </div>
             </Section>
 
             <Section title="预处理 Preprocessing">
               {plan.preprocessing_config.steps.map((s) => (
-                <div key={s.name} className="rounded-lg border border-zinc-800 bg-zinc-900 px-3 py-2 text-sm">
-                  <div className="flex items-center justify-between">
-                    <span>{s.name}</span>
+                <div key={s.name} className="card px-3 py-2 text-sm">
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="text-fg">{s.name}</span>
                     <SourceBadge source={s.source} />
                   </div>
-                  <span className="block text-xs text-zinc-500">{s.detail}</span>
+                  <span className="mt-0.5 block text-xs text-fg-3">{s.detail}</span>
                 </div>
               ))}
             </Section>
 
             <Section title="评估 Evaluation">
-              <div className="space-y-1.5 rounded-lg border border-zinc-800 bg-zinc-900 px-3 py-2 text-sm">
-                <p>
-                  指标：{plan.evaluation_config.metrics.join(", ")} · 目标：
-                  {plan.evaluation_config.target_metric}
+              <div className="card space-y-1.5 px-3 py-2 text-sm">
+                <p className="text-fg-2">
+                  指标：<span className="font-mono text-[12px] text-fg">{plan.evaluation_config.metrics.join(", ")}</span>
+                  {" · "}目标：<span className="font-mono text-[12px] text-brand">{plan.evaluation_config.target_metric}</span>
                 </p>
                 {plan.evaluation_config.reported_value != null && (
-                  <p className="text-xs text-zinc-400">
+                  <p className="font-mono text-[10.5px] text-fg-3">
                     原文报告：{plan.evaluation_config.reported_value}
                     {plan.evaluation_config.reported_condition
                       ? `（${plan.evaluation_config.reported_condition}）`
@@ -450,7 +534,7 @@ function PlanInner({ experimentId }: { experimentId: string }) {
                       : ""}
                   </p>
                 )}
-                <p className="text-xs text-amber-300/80">{plan.evaluation_config.comparison_note}</p>
+                <p className="text-xs text-warn/90">{plan.evaluation_config.comparison_note}</p>
               </div>
               {editables
                 .filter((e) => e.path === "evaluation_config.tolerance")
@@ -475,150 +559,145 @@ function PlanInner({ experimentId }: { experimentId: string }) {
                     onClick={() => setSelected(item)}
                   />
                 ))}
-              <div className="rounded-lg border border-zinc-800 bg-zinc-900 px-3 py-2 text-xs text-zinc-400">
+              <div className="card px-3 py-2 font-mono text-[10.5px] leading-relaxed text-fg-3">
                 <p>
-                  设备 {plan.runtime_budget.device} · 预计 {plan.expected_runtime.estimated_seconds}s ·
-                  内存 ~{plan.resource_estimates.estimated_memory_mb ?? "—"}MB · 磁盘 ~
+                  device {plan.runtime_budget.device} · est {plan.expected_runtime.estimated_seconds}s ·
+                  mem ~{plan.resource_estimates.estimated_memory_mb ?? "—"}MB · disk ~
                   {plan.resource_estimates.estimated_disk_mb ?? "—"}MB
                 </p>
-                <p className="mt-1 text-zinc-500">{plan.expected_runtime.basis}</p>
-                {plan.resource_estimates.note && (
-                  <p className="mt-1 text-zinc-500">{plan.resource_estimates.note}</p>
-                )}
+                <p className="mt-1">{plan.expected_runtime.basis}</p>
+                {plan.resource_estimates.note && <p className="mt-1">{plan.resource_estimates.note}</p>}
               </div>
             </Section>
           </section>
 
-          <section className="space-y-3">
+          <section className="rise rise-2 space-y-5">
             {selected ? (
-              <div className="space-y-3 rounded-xl border border-zinc-800 bg-zinc-900 p-4">
-                <div className="flex items-center justify-between">
-                  <h3 className="font-medium">{selected.label}</h3>
+              <div className="card space-y-3 p-4">
+                <div className="flex items-center justify-between gap-2">
+                  <h3 className="display min-w-0 truncate text-sm font-semibold">{selected.label}</h3>
                   {selected.param && (
                     <SourceBadge source={selected.param.source} confirmed={selected.param.human_confirmed} />
                   )}
                 </div>
                 {selected.param?.evidence_quote && (
-                  <blockquote className="rounded border-l-2 border-emerald-600 bg-zinc-950 px-3 py-2 text-sm italic text-zinc-300">
+                  <blockquote className="quote">
                     “{selected.param.evidence_quote}”
                     {selected.param.source_page != null && (
-                      <span className="ml-2 not-italic text-xs text-zinc-500">
+                      <span className="ml-2 font-mono text-[10.5px] not-italic text-fg-3">
                         p.{selected.param.source_page}
                       </span>
                     )}
                   </blockquote>
                 )}
                 {selected.param?.rationale && (
-                  <p className="text-xs text-amber-300/80">{selected.param.rationale}</p>
+                  <p className="text-xs text-warn/90">{selected.param.rationale}</p>
                 )}
                 <input
                   key={`${selected.path}-${current?.version}`}
                   ref={valueInput}
                   defaultValue={selected.value === null ? "" : String(selected.value)}
-                  className="w-full rounded border border-zinc-700 bg-zinc-950 px-3 py-1.5 text-sm"
+                  className="input"
+                  aria-label="参数值"
                 />
                 <input
                   ref={reasonInput}
                   placeholder="修改原因（必填，记入版本历史）"
-                  className="w-full rounded border border-zinc-700 bg-zinc-950 px-3 py-1.5 text-sm"
+                  className="input"
                 />
-                <label className="flex items-center gap-2 text-sm text-zinc-300">
-                  <input ref={confirmCheck} type="checkbox" defaultChecked className="accent-emerald-600" />
+                <label className="flex items-center gap-2 text-sm text-fg-2">
+                  <input ref={confirmCheck} type="checkbox" defaultChecked className="h-3.5 w-3.5 accent-[var(--color-brand)]" />
                   标记为已人工确认
                 </label>
-                <button
-                  onClick={saveSelected}
-                  disabled={saving}
-                  className="w-full rounded bg-emerald-600 px-3 py-1.5 text-sm hover:bg-emerald-500 disabled:opacity-50"
-                >
+                <button onClick={saveSelected} disabled={saving} className="btn btn-primary w-full">
                   {saving ? "保存中…" : "保存为新版本"}
                 </button>
               </div>
             ) : (
-              <p className="rounded-xl border border-dashed border-zinc-800 p-4 text-sm text-zinc-500">
+              <p className="rounded-xl border border-dashed border-line p-4 text-sm text-fg-3">
                 点击左侧参数可编辑或确认；每次修改都会生成新版本，旧版本保留。
               </p>
             )}
 
-            <Section title={`假设 Assumptions（${plan.assumptions.length}）`}>
-              {plan.assumptions.map((a) => (
-                <div key={a.field_path} className="space-y-1 rounded-lg border border-zinc-800 bg-zinc-900 p-3 text-sm">
-                  <div className="flex items-center justify-between gap-2">
-                    <span className="truncate text-xs text-zinc-400">{a.field_path}</span>
-                    <span className="shrink-0 rounded bg-zinc-700 px-1.5 py-0.5 text-xs text-zinc-200">
-                      {KIND_LABEL[a.kind] ?? a.kind}
-                    </span>
-                  </div>
-                  <p className="text-zinc-300">{a.rationale}</p>
-                  <p className="text-xs text-zinc-500">提案值：{String(a.value)}</p>
-                  {a.requires_confirmation && !a.human_confirmed ? (
-                    <button
-                      onClick={() => confirmAssumption(a)}
-                      disabled={saving}
-                      className="rounded bg-sky-600 px-2 py-1 text-xs hover:bg-sky-500 disabled:opacity-50"
-                    >
-                      确认此假设
-                    </button>
-                  ) : (
-                    <span className="text-xs text-emerald-400">
-                      {a.human_confirmed ? "✓ 已确认" : "无需确认（MVP 缩放/说明）"}
-                    </span>
-                  )}
-                </div>
-              ))}
-            </Section>
+            <div className="space-y-4">
+              <Section title={`关键假设 Critical（${groups.critical.length}）`}>
+                {groups.critical.length === 0 && <p className="text-sm text-fg-3">（无）</p>}
+                {groups.critical.map((a) => (
+                  <AssumptionCard key={a.field_path} a={a} saving={saving} onConfirm={confirmAssumption} />
+                ))}
+              </Section>
+
+              <Section title={`常规假设 Routine（${groups.routine.length}）`}>
+                {routinePending.length > 0 && (
+                  <button onClick={acceptRoutine} disabled={saving} className="btn btn-info btn-sm w-full">
+                    <IconCheck className="h-3 w-3" />
+                    {saving ? "采纳中…" : `一键采纳全部常规项（${routinePending.length}）`}
+                  </button>
+                )}
+                {groups.routine.length === 0 && <p className="text-sm text-fg-3">（无）</p>}
+                {groups.routine.map((a) => (
+                  <AssumptionCard key={a.field_path} a={a} saving={saving} onConfirm={confirmAssumption} />
+                ))}
+              </Section>
+
+              {groups.info.length > 0 && (
+                <Section title={`说明 Info（${groups.info.length}）`}>
+                  {groups.info.map((a) => (
+                    <AssumptionCard key={a.field_path} a={a} saving={saving} onConfirm={confirmAssumption} />
+                  ))}
+                </Section>
+              )}
+            </div>
 
             <Section title={`与原文偏差 Deviations（${plan.deviations_from_paper.length}）`}>
               {plan.deviations_from_paper.length === 0 && (
-                <p className="text-sm text-zinc-600">（无）</p>
+                <p className="text-sm text-fg-3">（无）</p>
               )}
               {plan.deviations_from_paper.map((d) => (
-                <div key={d.field_path} className="rounded-lg border border-zinc-800 bg-zinc-900 px-3 py-2 text-sm">
+                <div key={d.field_path} className="card px-3 py-2 text-sm">
                   <div className="flex items-center justify-between gap-2">
-                    <span className="truncate text-xs text-zinc-400">{d.field_path}</span>
-                    <span className="shrink-0 text-xs">
-                      <span className="text-zinc-500">原文 {d.paper_value ?? "—"}</span>
-                      <span className="mx-1 text-zinc-600">→</span>
-                      <span className="text-violet-300">{d.plan_value}</span>
+                    <span className="truncate font-mono text-[10.5px] text-fg-3">{d.field_path}</span>
+                    <span className="shrink-0 font-mono text-[10.5px]">
+                      <span className="text-fg-3">原文 {d.paper_value ?? "—"}</span>
+                      <span className="mx-1 text-fg-3">→</span>
+                      <span className="text-scale">{d.plan_value}</span>
                     </span>
                   </div>
-                  <p className="text-xs text-zinc-500">{d.reason}</p>
+                  <p className="mt-0.5 text-xs text-fg-3">{d.reason}</p>
                 </div>
               ))}
             </Section>
 
             <Section title="版本历史 Versions">
-              {versions.map((v) => (
-                <button
-                  key={v.id}
-                  onClick={() => switchVersion(v.version)}
-                  className={`block w-full rounded-lg border px-3 py-2 text-left text-sm ${
-                    current?.version === v.version
-                      ? "border-emerald-500 bg-zinc-800"
-                      : "border-zinc-800 bg-zinc-900 hover:border-zinc-600"
-                  }`}
-                >
-                  <span className="flex items-center justify-between">
-                    <span>
-                      v{v.version} · {ORIGIN_LABEL[v.origin] ?? v.origin}
+              <div className="space-y-1.5">
+                {versions.map((v) => (
+                  <button
+                    key={v.id}
+                    onClick={() => switchVersion(v.version)}
+                    className={`field-row cursor-pointer! ${current?.version === v.version ? "field-row-active" : ""}`}
+                  >
+                    <span className="min-w-0">
+                      <span className="block font-mono text-[12px] text-fg">
+                        v{v.version} · {ORIGIN_LABEL[v.origin] ?? v.origin}
+                      </span>
+                      {v.change_reason && (
+                        <span className="block truncate text-[11px] text-fg-3">{v.change_reason}</span>
+                      )}
                     </span>
-                    {v.approved_at && <span className="text-xs text-emerald-400">已批准</span>}
-                  </span>
-                  {v.change_reason && (
-                    <span className="block text-xs text-zinc-500">{v.change_reason}</span>
-                  )}
-                </button>
-              ))}
+                    {v.approved_at && <span className="chip badge-ok shrink-0">已批准</span>}
+                  </button>
+                ))}
+              </div>
               {current && current.changes.length > 0 && (
-                <div className="rounded-lg border border-zinc-800 bg-zinc-950 px-3 py-2 text-xs text-zinc-400">
-                  <p className="mb-1 text-zinc-500">本版本改动（前 → 后）：</p>
+                <div className="card space-y-1 bg-ink-950/70 px-3 py-2 font-mono text-[10.5px] text-fg-2">
+                  <p className="label text-[9px]!">本版本改动（前 → 后）</p>
                   {current.changes.map((c) => (
-                    <p key={c.field_path}>
+                    <p key={c.field_path} className="break-all">
                       {c.field_path}: {String(c.before)} → {String(c.after)}
                     </p>
                   ))}
                   {current.related_error && (
-                    <p className="mt-1 text-red-300">关联错误：{current.related_error}</p>
+                    <p className="mt-1 text-bad">关联错误：{current.related_error}</p>
                   )}
                 </div>
               )}
@@ -626,7 +705,52 @@ function PlanInner({ experimentId }: { experimentId: string }) {
           </section>
         </div>
       )}
-      {!plan && !error && <p className="text-sm text-zinc-500">加载中…</p>}
+      {!plan && !error && (
+        <div className="space-y-3">
+          <div className="skeleton h-24" />
+          <div className="skeleton h-64" />
+        </div>
+      )}
+
+      {plan && !approved && (
+        <div className="sticky bottom-0 z-20 -mx-5 mt-2 border-t border-line bg-ink-950/85 px-5 py-3 backdrop-blur">
+          <div className="flex flex-wrap items-center gap-3">
+            <span
+              className={`flex items-center gap-2 text-sm ${criticalPending.length ? "text-bad" : "text-ok"}`}
+            >
+              {criticalPending.length ? (
+                <IconWarn className="h-4 w-4" />
+              ) : (
+                <IconCheck className="h-4 w-4" />
+              )}
+              {criticalPending.length
+                ? `还需确认 ${criticalPending.length} 项关键假设`
+                : "关键假设已齐，可批准"}
+            </span>
+            <span className="hidden font-mono text-[10.5px] text-fg-3 sm:inline">
+              关键 {groups.critical.length} · 常规 {groups.routine.length} · 说明 {groups.info.length}
+            </span>
+            <span className="flex-1" />
+            {routinePending.length > 0 && (
+              <button onClick={acceptRoutine} disabled={saving} className="btn btn-ghost btn-sm">
+                一键采纳常规项（{routinePending.length}）
+              </button>
+            )}
+            <button
+              onClick={approve}
+              disabled={!canApprove || approving}
+              className="btn btn-primary btn-sm"
+            >
+              <IconCheck className="h-3.5 w-3.5" />
+              {approving
+                ? "提交中…"
+                : workflowDriven && wfStatus === "awaiting_plan_approval"
+                  ? "批准并执行"
+                  : "批准计划"}
+            </button>
+          </div>
+        </div>
+      )}
 
       <RunPanel
         experimentId={experimentId}
@@ -641,9 +765,11 @@ function PlanInner({ experimentId }: { experimentId: string }) {
 export default function PlanClient({ experimentId }: { experimentId: string }) {
   return (
     <AuthGate>
-      <Suspense fallback={<div className="p-6 text-zinc-500">加载中…</div>}>
-        <PlanInner experimentId={experimentId} />
-      </Suspense>
+      <Shell>
+        <Suspense fallback={<div className="p-6 text-fg-3">加载中…</div>}>
+          <PlanInner experimentId={experimentId} />
+        </Suspense>
+      </Shell>
     </AuthGate>
   );
 }

@@ -12,7 +12,7 @@ from reproagent_agent.planning import build_plan
 from reproagent_api import worker
 from reproagent_api.config import ApiSettings
 from reproagent_api.workflow import build_workflow_graph, make_memory_checkpointer
-from reproagent_schemas import RunStatus, WorkflowStatus
+from reproagent_schemas import BudgetConfig, RunStatus, WorkflowStatus
 from test_runs import (
     EXPERIMENT_ID,
     PLAN_ID,
@@ -225,3 +225,36 @@ async def test_recovery_continues_midflight_from_checkpoint(monkeypatch):
     await worker.recover_workflow_task(ctx, str(WORKFLOW_ID))
     assert admin.tables["workflows"][0]["status"] == WorkflowStatus.COMPLETED.value
     assert admin.tables["execution_runs"][0]["status"] == "succeeded"
+
+
+@pytest.mark.asyncio
+async def test_recovery_redrives_persisted_failure(monkeypatch):
+    admin = FakeAdmin(seed_workflow(), {str(PROJECT_ID): str(USER_ID)})
+    saver = make_memory_checkpointer()
+    failed = make_result(RunStatus.FAILED, 1, stderr="ModuleNotFoundError: No module named 'x'")
+    # A repairable failure whose run already burned the whole time budget: the
+    # next execute_code persists budget exhaustion and the graph reaches END in
+    # FAILED state with no pending node — a plain continue would silently no-op.
+    with monkeypatch.context() as m:
+        m.setattr(worker, "BudgetConfig", lambda: BudgetConfig(max_experiment_seconds=1))
+        ctx = _ctx(admin, [failed], saver, m)
+        await worker.run_workflow_task(ctx, str(WORKFLOW_ID))
+        await worker.resume_workflow_task(ctx, str(WORKFLOW_ID), "spec")
+        admin.tables["experiment_plans"][-1]["approved_at"] = "2026-01-01T00:00:00+00:00"
+        await worker.resume_workflow_task(ctx, str(WORKFLOW_ID), "plan")
+    assert admin.tables["workflows"][0]["status"] == WorkflowStatus.FAILED.value
+    assert admin.tables["execution_runs"][0]["status"] == "failed"
+
+    # Retry claim flips failed -> executing; recovery must re-drive from codegen
+    # with a fresh run row and budget on the same thread.
+    admin.tables["workflows"][0]["status"] = WorkflowStatus.EXECUTING.value
+    ctx2 = _ctx(
+        admin,
+        [make_result(RunStatus.SUCCEEDED, 0, metrics={"metric_value": 0.9})],
+        saver,
+        monkeypatch,
+    )
+    await worker.recover_workflow_task(ctx2, str(WORKFLOW_ID))
+    assert admin.tables["workflows"][0]["status"] == WorkflowStatus.COMPLETED.value
+    assert [r["status"] for r in admin.tables["execution_runs"]] == ["failed", "succeeded"]
+    assert admin.tables["workflows"][0]["run_id"] == admin.tables["execution_runs"][1]["id"]

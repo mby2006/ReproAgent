@@ -1,0 +1,38 @@
+# Node
+node_modules/
+.next/
+out/
+*.tsbuildinfo
+next-env.d.ts
+
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Env & secrets
+.env
+.env.*
+!.env.example
+
+# Supabase local
+infra/supabase/.temp/
+infra/supabase/.branches/
+supabase/.temp/
+supabase/.branches/
+
+# Runner workdir
+.runner-work*/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

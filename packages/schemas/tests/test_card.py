@@ -1,0 +1,164 @@
+from uuid import uuid4
+
+import pytest
+from pydantic import ValidationError
+from reproagent_schemas import (
+    Baseline,
+    CardEditRequest,
+    CardVersion,
+    EvidenceField,
+    EvidenceStatus,
+    FieldEdit,
+    ParsedDocument,
+    ReportedResult,
+    ReproductionCard,
+    SpecOrigin,
+    TextBlock,
+    UnderstandRequest,
+)
+
+PAPER_ID = uuid4()
+USER_ID = uuid4()
+
+
+def explicit(value, quote="some quote", page=3, **kw) -> EvidenceField:
+    return EvidenceField(
+        value=value,
+        status=EvidenceStatus.PAPER_EXPLICIT,
+        evidence_quote=quote,
+        source_page=page,
+        **kw,
+    )
+
+
+def make_card() -> ReproductionCard:
+    return ReproductionCard(
+        method=explicit("LeNet-5 convolutional network"),
+        model_architecture=explicit("2 conv layers + 3 fully connected"),
+        dataset=explicit("MNIST"),
+        hyperparameters={"learning_rate": explicit(0.001, page=8)},
+        optimizer=EvidenceField(value="SGD", status=EvidenceStatus.INFERRED, confidence=0.5),
+        loss_function=EvidenceField(status=EvidenceStatus.MISSING),
+        reported_results=[
+            ReportedResult(
+                metric="error_rate",
+                value=0.8,
+                condition="MNIST test set",
+                status=EvidenceStatus.PAPER_EXPLICIT,
+                evidence_quote="error rate of 0.8%",
+                source_page=21,
+            )
+        ],
+        baselines=[
+            Baseline(name="fully connected net", value="baseline", status=EvidenceStatus.INFERRED)
+        ],
+        missing_information=["batch size not stated"],
+    )
+
+
+class TestEvidenceField:
+    def test_explicit_requires_quote_and_page(self):
+        with pytest.raises(ValidationError):
+            EvidenceField(value="x", status=EvidenceStatus.PAPER_EXPLICIT)
+        with pytest.raises(ValidationError):
+            EvidenceField(value="x", status=EvidenceStatus.PAPER_EXPLICIT, evidence_quote="q")
+
+    def test_missing_must_not_carry_value_or_evidence(self):
+        with pytest.raises(ValidationError):
+            EvidenceField(value="x", status=EvidenceStatus.MISSING)
+        with pytest.raises(ValidationError):
+            EvidenceField(status=EvidenceStatus.MISSING, evidence_quote="q")
+        ok = EvidenceField(status=EvidenceStatus.MISSING)
+        assert ok.value is None
+
+    def test_inferred_requires_value_but_not_quote(self):
+        ok = EvidenceField(value="sgd", status=EvidenceStatus.INFERRED, confidence=0.4)
+        assert ok.evidence_quote is None
+        with pytest.raises(ValidationError):
+            EvidenceField(status=EvidenceStatus.INFERRED)
+
+    def test_confidence_bounds(self):
+        with pytest.raises(ValidationError):
+            EvidenceField(value="x", status=EvidenceStatus.INFERRED, confidence=1.5)
+
+    def test_blank_quote_rejected(self):
+        with pytest.raises(ValidationError):
+            EvidenceField(value="x", status=EvidenceStatus.INFERRED, evidence_quote="   ")
+
+    def test_page_must_be_positive(self):
+        with pytest.raises(ValidationError):
+            explicit("x", page=0)
+
+    def test_generic_value_types(self):
+        assert explicit(0.001).value == 0.001
+        assert explicit([1, 28, 28]).value == [1, 28, 28]
+
+
+class TestReproductionCard:
+    def test_valid_card_roundtrip(self):
+        card = make_card()
+        dumped = card.model_dump(mode="json")
+        restored = ReproductionCard.model_validate(dumped)
+        assert restored.reported_results[0].source_page == 21
+        assert restored.hyperparameters["learning_rate"].value == 0.001
+
+    def test_card_requires_core_fields(self):
+        with pytest.raises(ValidationError):
+            ReproductionCard()
+
+    def test_extra_field_rejected(self):
+        with pytest.raises(ValidationError):
+            ReproductionCard(**{**make_card().model_dump(), "secret": 1})
+
+
+class TestParsedDocument:
+    def test_block_page_positive(self):
+        with pytest.raises(ValidationError):
+            TextBlock(id="p0-b1", text="x", page=0)
+
+    def test_document_defaults(self):
+        doc = ParsedDocument(num_pages=43)
+        assert doc.blocks == []
+        assert doc.ocr_required_pages == []
+
+
+class TestVersioning:
+    def test_card_version(self):
+        v = CardVersion(
+            paper_id=PAPER_ID,
+            version=1,
+            origin=SpecOrigin.EXTRACTION,
+            card=make_card(),
+        )
+        assert v.parent_version_id is None
+
+    def test_version_must_be_positive(self):
+        with pytest.raises(ValidationError):
+            CardVersion(
+                paper_id=PAPER_ID,
+                version=0,
+                origin=SpecOrigin.EXTRACTION,
+                card=make_card(),
+            )
+
+    def test_field_edit_path_pattern(self):
+        FieldEdit(field_path="hyperparameters.learning_rate", value=0.01)
+        FieldEdit(field_path="optimizer", value=None)
+        with pytest.raises(ValidationError):
+            FieldEdit(field_path="reported_results[0].value", value=1)
+        with pytest.raises(ValidationError):
+            FieldEdit(field_path="../etc", value="x")
+
+    def test_edit_request_requires_edits(self):
+        with pytest.raises(ValidationError):
+            CardEditRequest(base_version=1, edits=[])
+
+
+class TestUnderstandContract:
+    def test_request_requires_pdf(self):
+        with pytest.raises(ValidationError):
+            UnderstandRequest(paper_id=PAPER_ID, pdf_b64="")
+
+    def test_request_valid(self):
+        req = UnderstandRequest(paper_id=PAPER_ID, pdf_b64="aGVsbG8=")
+        assert req.title_hint is None

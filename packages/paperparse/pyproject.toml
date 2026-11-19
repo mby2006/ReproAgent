@@ -1,0 +1,19 @@
+[project]
+name = "reproagent-paperparse"
+version = "0.1.0"
+description = "Deterministic PDF parsing and evidence grounding for ReproAgent"
+requires-python = ">=3.12"
+dependencies = [
+    "pymupdf>=1.24",
+    "reproagent-schemas",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/reproagent_paperparse"]
+
+[tool.uv.sources]
+reproagent-schemas = { workspace = true }

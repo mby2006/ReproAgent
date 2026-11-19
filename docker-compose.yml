@@ -1,0 +1,164 @@
+# ReproAgent development environment.
+#
+# Supabase runs separately via `supabase start` (from infra/); app containers
+# reach it through host.docker.internal.
+#
+# Security boundaries:
+#   - api:    Supabase keys only, no LLM key
+#   - worker: same trust domain as api (Supabase keys), drives async jobs via Redis
+#   - agent:  LLM key only, no Supabase keys
+#   - runner: no keys at all, isolated `runner` network (internal: true, no egress)
+
+name: reproagent
+
+services:
+  web:
+    build:
+      context: .
+      dockerfile: infra/docker/web.Dockerfile
+      args:
+        NPM_REGISTRY: ${NPM_REGISTRY:-https://registry.npmjs.org}
+    ports:
+      - "3000:3000"
+    environment:
+      NEXT_PUBLIC_API_URL: http://localhost:8000
+      NEXT_PUBLIC_SUPABASE_URL: http://localhost:54321
+      NEXT_PUBLIC_SUPABASE_ANON_KEY: ${SUPABASE_ANON_KEY}
+      WATCHPACK_POLLING: "true"
+    volumes:
+      - ./apps/web:/app/apps/web
+      - web_node_modules:/app/apps/web/node_modules
+      - root_node_modules:/app/node_modules
+    command: pnpm dev --hostname 0.0.0.0
+    networks:
+      - frontend
+    depends_on:
+      - api
+
+  api:
+    build:
+      context: .
+      dockerfile: infra/docker/api.Dockerfile
+      args:
+        PYPI_INDEX: ${PYPI_INDEX:-https://pypi.org/simple}
+        UV_IMAGE: ${UV_IMAGE:-ghcr.io/astral-sh/uv:latest}
+    ports:
+      - "8000:8000"
+    environment:
+      ENVIRONMENT: ${ENVIRONMENT:-development}
+      SUPABASE_URL: http://host.docker.internal:54321
+      SUPABASE_PUBLIC_URL: ${SUPABASE_PUBLIC_URL:-http://localhost:54321}
+      SUPABASE_ANON_KEY: ${SUPABASE_ANON_KEY}
+      SUPABASE_SERVICE_ROLE_KEY: ${SUPABASE_SERVICE_ROLE_KEY}
+      AGENT_BASE_URL: http://agent:8001
+      RUNNER_BASE_URL: http://runner:8002
+      REDIS_URL: redis://redis:6379
+      CORS_ORIGINS: http://localhost:3000
+    volumes:
+      - ./apps/api/src:/app/apps/api/src
+      - ./packages/schemas/src:/app/packages/schemas/src
+      - ./packages/paperparse/src:/app/packages/paperparse/src
+    command: uvicorn reproagent_api.main:app --host 0.0.0.0 --port 8000 --reload
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    networks:
+      - frontend
+      - backend
+      - runner
+    depends_on:
+      - redis
+
+  worker:
+    build:
+      context: .
+      dockerfile: infra/docker/api.Dockerfile
+      args:
+        PYPI_INDEX: ${PYPI_INDEX:-https://pypi.org/simple}
+        UV_IMAGE: ${UV_IMAGE:-ghcr.io/astral-sh/uv:latest}
+    environment:
+      ENVIRONMENT: ${ENVIRONMENT:-development}
+      SUPABASE_URL: http://host.docker.internal:54321
+      SUPABASE_ANON_KEY: ${SUPABASE_ANON_KEY}
+      SUPABASE_SERVICE_ROLE_KEY: ${SUPABASE_SERVICE_ROLE_KEY}
+      AGENT_BASE_URL: http://agent:8001
+      RUNNER_BASE_URL: http://runner:8002
+      REDIS_URL: redis://redis:6379
+      # LangGraph Postgres checkpointer reaches the host Supabase DB via the
+      # gateway (127.0.0.1 inside the container is not the host).
+      SUPABASE_DB_URL: ${SUPABASE_DB_URL_CONTAINER:-postgresql://postgres:postgres@host.docker.internal:54322/postgres}
+    volumes:
+      - ./apps/api/src:/app/apps/api/src
+      - ./packages/schemas/src:/app/packages/schemas/src
+      - ./packages/paperparse/src:/app/packages/paperparse/src
+    command: arq reproagent_api.worker.WorkerSettings
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    networks:
+      - backend
+      - runner
+    depends_on:
+      - redis
+      - agent
+
+  redis:
+    image: redis:7-alpine
+    networks:
+      - backend
+
+  agent:
+    build:
+      context: .
+      dockerfile: infra/docker/agent.Dockerfile
+      args:
+        PYPI_INDEX: ${PYPI_INDEX:-https://pypi.org/simple}
+        UV_IMAGE: ${UV_IMAGE:-ghcr.io/astral-sh/uv:latest}
+    ports:
+      - "8001:8001"
+    environment:
+      ENVIRONMENT: ${ENVIRONMENT:-development}
+      QWEN_API_KEY: ${QWEN_API_KEY}
+      QWEN_BASE_URL: ${QWEN_BASE_URL:-https://dashscope.aliyuncs.com/compatible-mode/v1}
+      QWEN_MODEL: ${QWEN_MODEL:-qwen-plus}
+      RUNNER_BASE_URL: http://runner:8002
+    volumes:
+      - ./apps/agent/src:/app/apps/agent/src
+      - ./packages/schemas/src:/app/packages/schemas/src
+      - ./packages/paperparse/src:/app/packages/paperparse/src
+    command: uvicorn reproagent_agent.main:app --host 0.0.0.0 --port 8001 --reload
+    networks:
+      - backend
+      - runner
+
+  runner:
+    build:
+      context: .
+      dockerfile: infra/docker/runner.Dockerfile
+      args:
+        PYPI_INDEX: ${PYPI_INDEX:-https://pypi.org/simple}
+        UV_IMAGE: ${UV_IMAGE:-ghcr.io/astral-sh/uv:latest}
+    # No published ports: reachable only from the agent via the isolated network.
+    environment:
+      ENVIRONMENT: ${ENVIRONMENT:-development}
+      RUNNER_WORK_DIR: /tmp/runner-work
+      RUNNER_TIMEOUT_SECONDS: ${RUNNER_TIMEOUT_SECONDS:-300}
+      RUNNER_EXEC_IMAGE: ${EXEC_IMAGE:-reproagent-exec:latest}
+    volumes:
+      - ./apps/runner/src:/app/apps/runner/src
+      - ./packages/schemas/src:/app/packages/schemas/src
+      # Sibling-container sandbox: spawn locked-down exec containers via the host
+      # daemon. The work dir is a host bind so spawned containers can mount it.
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./.runner-work:/tmp/runner-work
+    command: uvicorn reproagent_runner.main:app --host 0.0.0.0 --port 8002 --reload
+    networks:
+      - runner
+
+networks:
+  frontend:
+  backend:
+  runner:
+    internal: true
+
+volumes:
+  web_node_modules:
+  root_node_modules:

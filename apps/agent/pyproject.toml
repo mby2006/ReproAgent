@@ -1,0 +1,27 @@
+[project]
+name = "reproagent-agent"
+version = "0.1.0"
+description = "ReproAgent LangGraph agent service: paper understanding, spec extraction, planning, codegen"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.30",
+    "pydantic>=2.8",
+    "pydantic-settings>=2.4",
+    "httpx>=0.27",
+    "langgraph>=0.2",
+    "openai>=1.40",
+    "reproagent-schemas",
+    "reproagent-paperparse",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/reproagent_agent"]
+
+[tool.uv.sources]
+reproagent-schemas = { workspace = true }
+reproagent-paperparse = { workspace = true }

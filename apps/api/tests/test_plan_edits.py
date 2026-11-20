@@ -2,7 +2,12 @@ from datetime import datetime
 from uuid import uuid4
 
 import pytest
-from reproagent_api.services import PlanEditError, apply_delegated_review, apply_plan_edits
+from reproagent_api.services import (
+    PlanEditError,
+    apply_delegated_review,
+    apply_plan_edits,
+    apply_tier_override,
+)
 from reproagent_schemas import (
     Assumption,
     AssumptionKind,
@@ -376,3 +381,86 @@ def test_ordinary_service_cannot_be_used_for_auto_acceptance():
         apply_plan_edits(make_plan(), PlanEditRequest(
             base_version=1, review_mode="assisted", change_reason="Cannot grant authority",
         ), confirmed_by=ConfirmationSource.AUTO)
+
+
+def test_tier_override_critical_to_routine_unblocks_gate():
+    plan = make_plan()
+    assert len(plan.unconfirmed_critical()) == 1
+    new_plan, records = apply_tier_override(
+        plan, "training_config.loss_function", RiskTier.ROUTINE, actor=uuid4()
+    )
+    assert new_plan.unconfirmed_critical() == []
+    assert new_plan.approval_ready()
+    assert new_plan.assumptions[0].risk_tier is RiskTier.ROUTINE
+    assert new_plan.assumptions[0].auto_acceptable is True
+    assert new_plan.assumptions[0].requires_confirmation is True
+    record = records[-1]
+    assert record.field_path == "training_config.loss_function.risk_tier"
+    assert record.before == "critical" and record.after == "routine"
+    assert record.confirmed_by is ConfirmationSource.HUMAN
+    assert record.actor is not None
+    # base plan untouched
+    assert plan.assumptions[0].risk_tier is RiskTier.CRITICAL
+
+
+def test_tier_override_routine_to_critical_blocks_gate():
+    plan = make_plan()
+    plan.assumptions[0].risk_tier = RiskTier.ROUTINE
+    plan.assumptions[0].auto_acceptable = True
+    assert plan.approval_ready()
+    new_plan, _ = apply_tier_override(
+        plan, "training_config.loss_function", RiskTier.CRITICAL, actor=uuid4()
+    )
+    assert len(new_plan.unconfirmed_critical()) == 1
+    assert not new_plan.approval_ready()
+    assert new_plan.assumptions[0].auto_acceptable is False
+
+
+def test_tier_override_to_info_stops_blocking_and_syncs_param():
+    plan = make_plan()
+    new_plan, _ = apply_tier_override(
+        plan, "training_config.loss_function", RiskTier.INFO, actor=uuid4()
+    )
+    assert new_plan.assumptions[0].requires_confirmation is False
+    assert new_plan.unconfirmed_required() == []
+    assert new_plan.training_config.loss_function.requires_confirmation is False
+
+
+def test_tier_override_info_to_critical_requires_confirmation():
+    plan = make_plan()
+    plan.assumptions[0].risk_tier = RiskTier.INFO
+    plan.assumptions[0].requires_confirmation = False
+    new_plan, _ = apply_tier_override(
+        plan, "training_config.loss_function", RiskTier.CRITICAL, actor=uuid4()
+    )
+    assert new_plan.assumptions[0].requires_confirmation is True
+    assert new_plan.assumptions[0].auto_acceptable is False
+    assert len(new_plan.unconfirmed_critical()) == 1
+
+
+def test_tier_override_unknown_path_rejected():
+    with pytest.raises(PlanEditError, match="not found"):
+        apply_tier_override(
+            make_plan(), "training_config.optimizer", RiskTier.ROUTINE, actor=uuid4(),
+        )
+
+
+def test_tier_override_same_tier_rejected():
+    with pytest.raises(PlanEditError, match="unchanged"):
+        apply_tier_override(
+            make_plan(), "training_config.loss_function", RiskTier.CRITICAL, actor=uuid4(),
+        )
+
+
+def test_tier_override_revokes_delegated_authorization():
+    actor = uuid4()
+    plan = make_plan().model_copy(update={
+        "review_mode": ReviewMode.DELEGATED, "delegated_at": utcnow(), "delegated_by": actor,
+    })
+    new_plan, records = apply_tier_override(
+        plan, "training_config.loss_function", RiskTier.ROUTINE, actor=actor
+    )
+    assert new_plan.review_mode is ReviewMode.ASSISTED
+    assert new_plan.delegated_at is None and new_plan.delegated_by is None
+    assert records[0].field_path == "review_mode"
+    assert records[0].before is ReviewMode.DELEGATED

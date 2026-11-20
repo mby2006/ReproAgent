@@ -31,13 +31,14 @@ from reproagent_schemas import (
     ReviewModeRequest,
     ReviewRequest,
     SchemaModel,
+    TierOverrideRequest,
 )
 
 from ..auth import get_current_user_id
 from ..clients.agent import AgentClient
 from ..clients.supabase import make_service_client
 from ..services import PlanEditError, apply_plan_edits, insert_versioned
-from ..services.plan_edits import apply_delegated_review
+from ..services.plan_edits import apply_delegated_review, apply_tier_override
 from ..services.review import generate_review
 
 router = APIRouter(prefix="/v1", tags=["experiments"])
@@ -366,6 +367,56 @@ async def edit_plan(
         )
 
     plan_row = insert_versioned(next_version, insert)
+    return _to_plan_version(plan_row)
+
+
+@router.post(
+    "/experiments/{experiment_id}/plans/{version}/tier",
+    response_model=PlanVersion,
+    status_code=status.HTTP_201_CREATED,
+)
+async def override_plan_tier(
+    request: Request,
+    experiment_id: UUID,
+    version: int,
+    body: TierOverrideRequest,
+    user_id: Annotated[UUID, Depends(get_current_user_id)],
+) -> PlanVersion:
+    admin = _admin(request)
+    _get_experiment(admin, experiment_id, user_id)
+    base_rows = (
+        admin.table("experiment_plans")
+        .select(PLAN_COLUMNS)
+        .eq("experiment_id", str(experiment_id))
+        .eq("version", version)
+        .execute()
+        .data
+    )
+    if not base_rows:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Base plan version not found")
+    base = base_rows[0]
+    try:
+        new_plan, records = apply_tier_override(
+            ExperimentPlan.model_validate(base["config_json"]),
+            body.field_path, body.risk_tier, actor=user_id,
+        )
+    except PlanEditError as exc:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)) from exc
+
+    def next_version() -> int:
+        latest = _latest_plan(admin, str(experiment_id))
+        return latest["version"] + 1 if latest else 1
+
+    plan_row = insert_versioned(
+        next_version,
+        lambda v: _insert_plan(
+            admin, str(experiment_id), v, new_plan,
+            origin=PlanOrigin.USER_EDIT.value,
+            parent_version_id=base["id"],
+            change_reason=f"人工调整假设分级：{body.field_path} → {body.risk_tier.value}",
+            changes_json=[r.model_dump(mode="json") for r in records],
+        ),
+    )
     return _to_plan_version(plan_row)
 
 

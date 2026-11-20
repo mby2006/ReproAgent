@@ -22,7 +22,9 @@ _STATUS_LABELS = {
 }
 
 
-_REVIEW_LABELS = {"expert": "专家审核", "assisted": "AI 辅助审核", "delegated": "托管审核"}
+_REVIEW_LABELS = {
+    "expert": "人工逐项核验", "assisted": "AI 辅助审核", "delegated": "托管自动（未逐项核验）",
+}
 _SOURCE_LABELS = {
     ConfirmationSource.HUMAN: "human（人工确认）",
     ConfirmationSource.AI_ASSISTED: "ai_assisted（AI 辅助，人工采纳）",

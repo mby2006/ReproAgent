@@ -1,7 +1,7 @@
 from functools import lru_cache
 from pathlib import Path
 
-from pydantic import Field
+from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -25,6 +25,13 @@ class RunnerSettings(BaseSettings):
     max_concurrent_runs: int = Field(default=4, gt=0, le=64)
     run_ttl_seconds: int = Field(default=3600, gt=0)
     reap_interval_seconds: int = Field(default=60, gt=0)
+
+    @field_validator("work_dir")
+    @classmethod
+    def _absolute_work_dir(cls, value: Path) -> Path:
+        # Sibling-container bind mounts need an absolute daemon-visible host path;
+        # a relative work_dir is rejected by Docker on Windows ("not a valid path").
+        return value.resolve()
 
 
 @lru_cache

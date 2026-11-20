@@ -9,7 +9,7 @@ import WorkflowInsights from "@/components/WorkflowInsights";
 import WorkflowStepper from "@/components/WorkflowStepper";
 import { IconArrowLeft, IconCheck, IconWarn } from "@/components/icons";
 import RunPanel from "./RunPanel";
-import { adoptPlanRecommendations, apiFetch, delegatePlan, explainPlan, recommendPlan, resumeWorkflow, retryWorkflow } from "@/lib/api";
+import { adoptPlanRecommendations, apiFetch, delegatePlan, explainPlan, overridePlanTier, recommendPlan, resumeWorkflow, retryWorkflow } from "@/lib/api";
 import { ConfirmationBadge, DelegationDialog, DelegationNotice, ExplanationCard, PreselectionHint, RecommendationCard, ReviewModeSelector, ReviewRequestStatus } from "@/components/ReviewControls";
 import { hasDelegation, isReviewHandled, ordinaryReviewMode, useReviewMode, useReviewRequest, useReviewSelection } from "@/lib/useReview";
 import { useWorkflow } from "@/lib/useWorkflow";
@@ -131,6 +131,9 @@ function AssumptionCard({
   delegated,
   onCheck,
   onAdopt,
+  onModify,
+  onTierChange,
+  tierDisabled,
 }: {
   a: Assumption;
   saving: boolean;
@@ -143,6 +146,9 @@ function AssumptionCard({
   delegated: boolean;
   onCheck: (checked: boolean) => void;
   onAdopt: () => void;
+  onModify: () => void;
+  onTierChange: (tier: RiskTier) => void;
+  tierDisabled: boolean;
 }) {
   const tier = tierOf(a);
   const meta = RISK_META[tier];
@@ -152,7 +158,18 @@ function AssumptionCard({
       <div className="flex items-center justify-between gap-2">
         <span className="truncate font-mono text-[10.5px] text-fg-3">{a.field_path}</span>
         <span className="flex shrink-0 items-center gap-1.5">
-          <span className={`chip ${TONE_BADGE[meta.tone]}`}>{meta.label}</span>
+          <select
+            className={`select w-auto! py-0.5! pl-2! pr-6! text-[10.5px] ${TONE_BADGE[meta.tone]}`}
+            value={tier}
+            disabled={tierDisabled}
+            aria-label={`调整 ${a.field_path} 的风险分级`}
+            title={`${meta.hint}。人工调整将生成新版本并留痕。`}
+            onChange={(event) => onTierChange(event.target.value as RiskTier)}
+          >
+            <option value="critical">关键</option>
+            <option value="routine">常规</option>
+            <option value="info">说明</option>
+          </select>
           <span className="chip">{KIND_LABEL[a.kind] ?? a.kind}</span>
         </span>
       </div>
@@ -169,7 +186,7 @@ function AssumptionCard({
       {explanation && <ExplanationCard explanation={explanation} mode={mode} />}
       {pending && recommendation && (
         <RecommendationCard recommendation={recommendation} currentValue={a.value} checked={checked}
-          disabled={adviceDisabled} onCheck={onCheck} onAdopt={onAdopt} />
+          disabled={adviceDisabled} onCheck={onCheck} onAdopt={onAdopt} onModify={onModify} />
       )}
       <ConfirmationBadge by={a.confirmed_by} />
       {pending ? (
@@ -191,6 +208,7 @@ function PlanInner({ experimentId }: { experimentId: string }) {
   const [versions, setVersions] = useState<PlanVersionMeta[]>([]);
   const [current, setCurrent] = useState<PlanVersion | null>(null);
   const [selected, setSelected] = useState<Editable | null>(null);
+  const [editPrefill, setEditPrefill] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
   const [approving, setApproving] = useState(false);
@@ -251,6 +269,7 @@ function PlanInner({ experimentId }: { experimentId: string }) {
       if (!preserveCurrent) {
         setCurrent(exp.plan);
         setSelected(null);
+        setEditPrefill(null);
       }
     } finally {
       if (sequence === loadSequence.current) setLoading(false);
@@ -278,6 +297,7 @@ function PlanInner({ experimentId }: { experimentId: string }) {
       if (sequence !== loadSequence.current) return;
       setCurrent(pv);
       setSelected(null);
+      setEditPrefill(null);
     } catch (err) {
       if (sequence === loadSequence.current) setError(err instanceof Error ? err.message : "加载版本失败");
     } finally {
@@ -291,6 +311,7 @@ function PlanInner({ experimentId }: { experimentId: string }) {
     setLoading(false);
     setCurrent(next);
     setSelected(null);
+    setEditPrefill(null);
     setExperiment((previous) => previous ? { ...previous, plan: next } : previous);
     setVersions((previous) => previous.some((v) => v.id === next.id) ? previous : [next, ...previous]);
   }
@@ -373,6 +394,29 @@ function PlanInner({ experimentId }: { experimentId: string }) {
       true,
       `确认假设：${a.field_path}`,
     );
+  }
+
+  async function changeTier(a: Assumption, tier: RiskTier) {
+    if (!current || operationBusy || tier === tierOf(a)) return;
+    setSaving(true);
+    setError(null);
+    try {
+      const next = await overridePlanTier(experimentId, current.version, a.field_path, tier);
+      showSavedVersion(next);
+      await loadVersions();
+      await loadExperiment();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "调整分级失败");
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  function openModify(r: FieldRecommendation) {
+    const item = editables.find((e) => e.path === r.field_path);
+    if (!item) return;
+    setSelected(item);
+    setEditPrefill(r.suggested_value == null ? "" : String(r.suggested_value));
   }
 
   async function acceptRoutine() {
@@ -494,6 +538,9 @@ function PlanInner({ experimentId }: { experimentId: string }) {
     routine: assumptions.filter((a) => tierOf(a) === "routine"),
     info: assumptions.filter((a) => tierOf(a) === "info"),
   };
+  const decisionItems = assumptions.filter((a) => tierOf(a) !== "info");
+  const handledCount = decisionItems.filter((a) => isReviewHandled(a, delegated)).length;
+  const progressPct = decisionItems.length === 0 ? 100 : Math.round((handledCount / decisionItems.length) * 100);
   const savedApproved = current?.approved_at != null;
   // An existing delegated approval must not masquerade as an expert/assisted approval.
   const approved = savedApproved && !reviewingDelegatedNormally &&
@@ -508,7 +555,10 @@ function PlanInner({ experimentId }: { experimentId: string }) {
       mode={mode} explanation={explanations.data?.explanations.find((e) => e.field_path === a.field_path)}
       recommendation={recommendation} checked={selectedPaths.includes(a.field_path)} adviceDisabled={adviceDisabled}
       onCheck={(checked) => toggle(a.field_path, checked)}
-      onAdopt={() => recommendation && adoptRecommendations([recommendation])} />;
+      onAdopt={() => recommendation && adoptRecommendations([recommendation])}
+      onModify={() => recommendation && openModify(recommendation)}
+      onTierChange={(tier) => changeTier(a, tier)}
+      tierDisabled={operationBusy} />;
   }
 
   return (
@@ -636,7 +686,7 @@ function PlanInner({ experimentId }: { experimentId: string }) {
                     item={item}
                     delegated={delegated}
                     active={selected?.path === item.path}
-                    onClick={() => setSelected(item)}
+                    onClick={() => { setEditPrefill(null); setSelected(item); }}
                   />
                 ))}
               <p className="font-mono text-[10.5px] text-fg-3">
@@ -653,7 +703,7 @@ function PlanInner({ experimentId }: { experimentId: string }) {
                     item={item}
                     delegated={delegated}
                     active={selected?.path === item.path}
-                    onClick={() => setSelected(item)}
+                    onClick={() => { setEditPrefill(null); setSelected(item); }}
                   />
                 ))}
               <p className="font-mono text-[10.5px] text-fg-3">
@@ -712,7 +762,7 @@ function PlanInner({ experimentId }: { experimentId: string }) {
                     item={item}
                     delegated={delegated}
                     active={selected?.path === item.path}
-                    onClick={() => setSelected(item)}
+                    onClick={() => { setEditPrefill(null); setSelected(item); }}
                   />
                 ))}
             </Section>
@@ -726,7 +776,7 @@ function PlanInner({ experimentId }: { experimentId: string }) {
                     item={item}
                     delegated={delegated}
                     active={selected?.path === item.path}
-                    onClick={() => setSelected(item)}
+                    onClick={() => { setEditPrefill(null); setSelected(item); }}
                   />
                 ))}
               <div className="card px-3 py-2 font-mono text-[10.5px] leading-relaxed text-fg-3">
@@ -764,10 +814,10 @@ function PlanInner({ experimentId }: { experimentId: string }) {
                   <p className="text-xs text-warn/90">{selected.param.rationale}</p>
                 )}
                 <input
-                  key={`${selected.path}-${current?.version}`}
+                  key={`${selected.path}-${current?.version}-${editPrefill ?? ""}`}
                   ref={valueInput}
                   disabled={operationBusy}
-                  defaultValue={selected.value === null ? "" : String(selected.value)}
+                  defaultValue={editPrefill ?? (selected.value === null ? "" : String(selected.value))}
                   className="input"
                   aria-label="参数值"
                 />
@@ -834,9 +884,14 @@ function PlanInner({ experimentId }: { experimentId: string }) {
               </Section>
 
               {groups.info.length > 0 && (
-                <Section title={`说明 Info（${groups.info.length}）`}>
-                  {groups.info.map(renderAssumption)}
-                </Section>
+                <details>
+                  <summary className="label cursor-pointer text-fg-2! focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-brand">
+                    说明 Info（{groups.info.length}）· 仅告知，不需确认
+                  </summary>
+                  <div className="mt-1.5 space-y-1.5">
+                    {groups.info.map(renderAssumption)}
+                  </div>
+                </details>
               )}
             </div>
 
@@ -928,6 +983,22 @@ function PlanInner({ experimentId }: { experimentId: string }) {
             </span>
             <span className="hidden font-mono text-[10.5px] text-fg-3 sm:inline">
               关键 {groups.critical.length} · 常规 {groups.routine.length} · 说明 {groups.info.length}
+            </span>
+            <span className="flex items-center gap-2 font-mono text-[10.5px] text-fg-3">
+              已确认 {handledCount} / {decisionItems.length}
+              <span
+                role="progressbar"
+                aria-label="假设确认进度"
+                aria-valuenow={handledCount}
+                aria-valuemin={0}
+                aria-valuemax={decisionItems.length}
+                className="h-1.5 w-24 overflow-hidden rounded-full bg-line"
+              >
+                <span
+                  className={`block h-full transition-all ${progressPct === 100 ? "bg-ok" : "bg-brand"}`}
+                  style={{ width: `${progressPct}%` }}
+                />
+              </span>
             </span>
             <span className="flex-1" />
             {routinePending.length > 0 && (

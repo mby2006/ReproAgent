@@ -1342,3 +1342,83 @@ def test_card_manual_confirm_revokes_authorization_with_trace(review_env):
         "card.status", "review_mode",
     }
     assert ok(env.client.get(card_url() + "?version=2", headers=AUTH)) == delegated
+
+
+def override_tier(env, experiment, field_path, tier, version=1, headers=AUTH):
+    return env.client.post(
+        plan_url(experiment, version) + "/tier", headers=headers,
+        json={"field_path": field_path, "risk_tier": tier},
+    )
+
+
+def test_tier_override_is_versioned_human_audited_and_unblocks_gate(review_env):
+    env = review_env
+    experiment = new_experiment(env)
+    calls_before = len(env.agent.calls)
+    original = ok(env.client.get(plan_url(experiment), headers=AUTH))
+    assert env.client.post(plan_url(experiment) + "/approve", headers=AUTH).status_code == 409
+    first = ok(override_tier(env, experiment, LOSS, "routine"), 201)
+    assert first["version"] == 2
+    assert first["parent_version_id"] == original["id"]
+    assert first["origin"] == "user_edit"
+    assert first["approved_at"] is None
+    assert "人工调整假设分级" in first["change_reason"]
+    assumption = next(a for a in first["plan"]["assumptions"] if a["field_path"] == LOSS)
+    assert assumption["risk_tier"] == "routine"
+    assert assumption["auto_acceptable"] is True
+    record = first["changes"][-1]
+    assert record["field_path"] == LOSS + ".risk_tier"
+    assert record["before"] == "critical" and record["after"] == "routine"
+    assert record["confirmed_by"] == "human"
+    assert record["actor"] == str(USER_ID)
+    second = ok(override_tier(env, experiment, OPTIMIZER, "info", version=2), 201)
+    assert second["version"] == 3
+    info = next(a for a in second["plan"]["assumptions"] if a["field_path"] == OPTIMIZER)
+    assert info["requires_confirmation"] is False
+    assert second["plan"]["training_config"]["optimizer"]["requires_confirmation"] is False
+    approved = ok(env.client.post(plan_url(experiment, 3) + "/approve", headers=AUTH))
+    assert approved["approved_at"] is not None
+    assert ok(env.client.get(plan_url(experiment), headers=AUTH)) == original
+    assert len(env.agent.calls) == calls_before
+
+
+@pytest.mark.parametrize("headers,expected", [({}, 401), (BOB_AUTH, 404)])
+def test_tier_override_checks_auth_and_ownership_before_writes(review_env, headers, expected):
+    env = review_env
+    experiment = new_experiment(env)
+    before = deepcopy(env.admin.tables)
+    response = override_tier(env, experiment, LOSS, "routine", headers=headers)
+    assert response.status_code == expected, response.text
+    assert env.admin.tables == before
+
+
+@pytest.mark.parametrize("body,version", [
+    ({"field_path": "training_config.optimizer", "risk_tier": "routine"}, 9),
+    ({"field_path": "training_config.seed", "risk_tier": "routine"}, 1),
+    ({"field_path": LOSS, "risk_tier": "critical"}, 1),
+    ({"field_path": LOSS, "risk_tier": "extreme"}, 1),
+])
+def test_tier_override_rejects_invalid_requests_without_writes(review_env, body, version):
+    env = review_env
+    experiment = new_experiment(env)
+    before = deepcopy(env.admin.tables)
+    response = env.client.post(
+        plan_url(experiment, version) + "/tier", headers=AUTH, json=body,
+    )
+    assert response.status_code in (404, 422), response.text
+    assert env.admin.tables == before
+
+
+def test_tier_override_revokes_delegation_and_restores_critical_gate(review_env):
+    env = review_env
+    experiment = new_experiment(env)
+    delegated = ok(delegate_plan(env, experiment), 201)
+    changed = ok(override_tier(env, experiment, LOSS, "routine", version=2), 201)
+    assert changed["version"] == 3
+    assert changed["plan"]["review_mode"] == "assisted"
+    assert changed["plan"]["delegated_at"] is None
+    assert changed["plan"]["delegated_by"] is None
+    assert changed["approved_at"] is None
+    assert changed["changes"][0]["field_path"] == "review_mode"
+    assert env.client.post(plan_url(experiment, 3) + "/approve", headers=AUTH).status_code == 409
+    assert ok(env.client.get(plan_url(experiment, 2), headers=AUTH)) == delegated

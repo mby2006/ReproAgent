@@ -36,7 +36,7 @@ const EXPERIMENT_ITEM_LABEL: Record<string, string> = {
 };
 
 const REVIEW_LABEL: Record<string, string> = {
-  expert: "专家审核", assisted: "AI 辅助审核", delegated: "托管审核",
+  expert: "人工逐项核验", assisted: "AI 辅助审核", delegated: "托管自动（未逐项核验）",
 };
 const SOURCE_LABEL: Record<string, string> = {
   human: "human · 人工确认",

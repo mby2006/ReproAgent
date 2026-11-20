@@ -39,14 +39,14 @@ test("delegated report displays the exact warning and real authorizer/time", () 
     assumptions: [], review_decisions: [decision],
   } });
   assert.ok(html.includes(disclaimer));
-  for (const text of ["托管审核", "authorizer-id", decision.timestamp, "审核来源声明"]) assert.ok(html.includes(text));
+  for (const text of ["托管自动（未逐项核验）", "authorizer-id", decision.timestamp, "审核来源声明"]) assert.ok(html.includes(text));
 });
 
 test("historical automatic events still warn after switching to expert", () => {
   const html = render(ReportReview, { data: {
     review_mode: "expert", assumptions: [], review_decisions: [decision], review_disclaimer: "ordinary",
   } });
-  assert.ok(html.includes("专家审核"));
+  assert.ok(html.includes("人工逐项核验"));
   assert.ok(html.includes(disclaimer));
   assert.ok(!html.includes("ordinary"));
 });

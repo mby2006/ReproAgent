@@ -34,6 +34,7 @@ from .assumptions import (
     as_int,
     confirmation_source,
     inferred_source,
+    normalize_loss,
     normalize_optimizer,
     param_from_evidence,
 )
@@ -144,6 +145,89 @@ def _build_optimizer(card: ReproductionCard, assumptions: list[Assumption]) -> P
         fp,
         fallback_value="sgd",
         fallback_rationale="论文未明确优化器；LeNet-5/MNIST 常用 SGD，提出待确认",
+        cast=str,
+        assumptions=assumptions,
+    )
+
+
+def _build_loss(card: ReproductionCard, assumptions: list[Assumption]) -> PlanParam:
+    field = card.loss_function
+    fp = "training_config.loss_function"
+    normalized = normalize_loss(field.value)
+    if (
+        field.status in (EvidenceStatus.PAPER_EXPLICIT, EvidenceStatus.PAPER_DESCRIBED)
+        and normalized is not None
+    ):
+        return PlanParam(
+            value=normalized,
+            source=ParamSource.PAPER_EXPLICIT,
+            paper_value=str(field.value),
+            evidence_quote=field.evidence_quote,
+            source_page=field.source_page,
+            human_confirmed=field.human_confirmed,
+            confirmed_by=confirmation_source(field),
+            confidence=field.confidence,
+        )
+    if (
+        field.status in (EvidenceStatus.PAPER_EXPLICIT, EvidenceStatus.PAPER_DESCRIBED)
+        and normalized is None
+    ):
+        rationale = f"原文损失「{field.value}」非标准实现，MVP 提出交叉熵替代，需人工确认"
+        assumptions.append(
+            Assumption(
+                field_path=fp,
+                kind=AssumptionKind.NONSTANDARD_CHOICE,
+                value="cross_entropy",
+                rationale=rationale,
+                requires_confirmation=True,
+                risk_tier=RiskTier.CRITICAL,
+                card_status=field.status,
+                evidence_quote=field.evidence_quote,
+                source_page=field.source_page,
+            )
+        )
+        return PlanParam(
+            value="cross_entropy",
+            source=ParamSource.INFERRED,
+            paper_value=str(field.value),
+            evidence_quote=field.evidence_quote,
+            source_page=field.source_page,
+            rationale=rationale,
+            requires_confirmation=True,
+        )
+    if (
+        field.status is EvidenceStatus.INFERRED
+        and field.value is not None
+        and normalized is None
+    ):
+        rationale = f"推断损失「{field.value}」非标准实现，MVP 提出交叉熵替代，需人工确认"
+        assumptions.append(
+            Assumption(
+                field_path=fp,
+                kind=AssumptionKind.NONSTANDARD_CHOICE,
+                value="cross_entropy",
+                rationale=rationale,
+                requires_confirmation=True,
+                risk_tier=RiskTier.CRITICAL,
+                card_status=EvidenceStatus.INFERRED,
+                evidence_quote=field.evidence_quote,
+                source_page=field.source_page,
+            )
+        )
+        return PlanParam(
+            value="cross_entropy",
+            source=ParamSource.INFERRED,
+            paper_value=str(field.value),
+            evidence_quote=field.evidence_quote,
+            source_page=field.source_page,
+            rationale=rationale,
+            requires_confirmation=True,
+        )
+    return param_from_evidence(
+        field,
+        fp,
+        fallback_value="cross_entropy",
+        fallback_rationale="论文未明确损失函数；MNIST 十分类常用交叉熵，提出待确认",
         cast=str,
         assumptions=assumptions,
     )
@@ -323,14 +407,7 @@ def build_plan(card: ReproductionCard, scaling: ScalingConfig | None = None) -> 
         cast=as_float,
         assumptions=assumptions,
     )
-    loss_param = param_from_evidence(
-        card.loss_function,
-        "training_config.loss_function",
-        fallback_value="cross_entropy",
-        fallback_rationale="论文未明确损失函数；MNIST 十分类常用交叉熵，提出待确认",
-        cast=str,
-        assumptions=assumptions,
-    )
+    loss_param = _build_loss(card, assumptions)
     wd_field = card.hyperparameters.get("weight_decay")
     wd_param = None
     if wd_field is not None:

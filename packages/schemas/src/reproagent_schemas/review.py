@@ -179,3 +179,8 @@ class DelegateReviewRequest(SchemaModel):
 
 class ReviewModeRequest(SchemaModel):
     review_mode: ManualReviewMode = ReviewMode.ASSISTED
+
+
+class TierOverrideRequest(SchemaModel):
+    field_path: str = Field(min_length=1)
+    risk_tier: RiskTier

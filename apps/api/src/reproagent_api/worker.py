@@ -16,9 +16,11 @@ Entry points:
 
 import logging
 import os
+from contextlib import contextmanager
 from datetime import UTC, datetime
-from uuid import uuid4
+from uuid import UUID, uuid4
 
+import psycopg
 from arq.connections import RedisSettings
 from reproagent_schemas import (
     BudgetConfig,
@@ -47,6 +49,33 @@ TERMINAL = {s.value for s in (WorkflowStatus.COMPLETED, WorkflowStatus.FAILED)}
 AWAITING = {
     s.value for s in (WorkflowStatus.AWAITING_SPEC_REVIEW, WorkflowStatus.AWAITING_PLAN_APPROVAL)
 }
+
+
+def _advisory_key(workflow_id: str) -> int:
+    return int(UUID(workflow_id)) & 0x7FFFFFFFFFFFFFFF
+
+
+@contextmanager
+def _drive_lock(settings: ApiSettings, workflow_id: str):
+    """Non-blocking, session-scoped mutex: only one job may drive a thread at a time.
+
+    Restart recovery can enqueue recover_workflow_task for a workflow whose original
+    run_workflow_task is still queued/running; without this lock both drive the same
+    thread_id and corrupt the shared checkpoint (duplicate nodes, versions, forked
+    checkpoint chains). pg_try_advisory_lock returns immediately so the loser skips.
+    The lock belongs to this connection's session, so a worker crash drops it and
+    recovery can take over without guessing a TTL. Sync psycopg keeps the brief
+    acquire/release independent of the event loop (Windows Proactor included); the
+    connection then idle-holds the session lock for the duration of the drive.
+    """
+    conn = psycopg.connect(settings.supabase_db_url, autocommit=True)
+    try:
+        row = conn.execute(
+            "select pg_try_advisory_lock(%s)", (_advisory_key(workflow_id),)
+        ).fetchone()
+        yield bool(row and row[0])
+    finally:
+        conn.close()
 
 
 async def _get_checkpointer(ctx: dict, settings: ApiSettings):
@@ -78,13 +107,17 @@ async def run_workflow_task(ctx: dict, workflow_id: str) -> None:
     workflow = _load_workflow(admin, workflow_id)
     if workflow is None:
         return
-    wctx = _build_context(ctx, admin, settings)
-    checkpointer = await _get_checkpointer(ctx, settings)
-    try:
-        await start_workflow(wctx, checkpointer, initial_state(workflow, wctx.budget_config))
-    finally:
-        await wctx.agent.aclose()
-        await wctx.runner.aclose()
+    with _drive_lock(settings, workflow_id) as acquired:
+        if not acquired:
+            logger.info("workflow %s: another driver holds the thread; skipping", workflow_id)
+            return
+        wctx = _build_context(ctx, admin, settings)
+        checkpointer = await _get_checkpointer(ctx, settings)
+        try:
+            await start_workflow(wctx, checkpointer, initial_state(workflow, wctx.budget_config))
+        finally:
+            await wctx.agent.aclose()
+            await wctx.runner.aclose()
 
 
 async def resume_workflow_task(ctx: dict, workflow_id: str, stage: str) -> None:
@@ -102,14 +135,20 @@ async def resume_workflow_task(ctx: dict, workflow_id: str, stage: str) -> None:
     )
     if workflow["status"] != expected:
         return
-    wctx = _build_context(ctx, admin, settings)
-    checkpointer = await _get_checkpointer(ctx, settings)
-    fallback = initial_state(workflow, wctx.budget_config)
-    try:
-        await resume_workflow(wctx, checkpointer, workflow["thread_id"], {"stage": stage}, fallback)
-    finally:
-        await wctx.agent.aclose()
-        await wctx.runner.aclose()
+    with _drive_lock(settings, workflow_id) as acquired:
+        if not acquired:
+            logger.info("workflow %s: another driver holds the thread; skipping", workflow_id)
+            return
+        wctx = _build_context(ctx, admin, settings)
+        checkpointer = await _get_checkpointer(ctx, settings)
+        fallback = initial_state(workflow, wctx.budget_config)
+        try:
+            await resume_workflow(
+                wctx, checkpointer, workflow["thread_id"], {"stage": stage}, fallback
+            )
+        finally:
+            await wctx.agent.aclose()
+            await wctx.runner.aclose()
 
 
 async def run_experiment_task(ctx: dict, run_id: str) -> None:
@@ -156,25 +195,29 @@ async def run_experiment_task(ctx: dict, run_id: str) -> None:
         .data[0]
     )
 
-    wctx = _build_context(ctx, admin, settings)
-    checkpointer = await _get_checkpointer(ctx, settings)
-    state = initial_state(workflow, wctx.budget_config)
-    state.update(
-        card=card,
-        plan=plan,
-        experiment_id=str(experiment["id"]),
-        run_id=run_id,
-        plan_id=plan_row["id"],
-        plan_version=plan_row["version"],
-        spec_version_id=spec["id"],
-        spec_version=spec["version"],
-        status=WorkflowStatus.EXECUTING.value,
-    )
-    try:
-        await drive_from_execution(wctx, checkpointer, state)
-    finally:
-        await wctx.agent.aclose()
-        await wctx.runner.aclose()
+    with _drive_lock(settings, workflow["id"]) as acquired:
+        if not acquired:
+            logger.info("workflow %s: another driver holds the thread; skipping", workflow["id"])
+            return
+        wctx = _build_context(ctx, admin, settings)
+        checkpointer = await _get_checkpointer(ctx, settings)
+        state = initial_state(workflow, wctx.budget_config)
+        state.update(
+            card=card,
+            plan=plan,
+            experiment_id=str(experiment["id"]),
+            run_id=run_id,
+            plan_id=plan_row["id"],
+            plan_version=plan_row["version"],
+            spec_version_id=spec["id"],
+            spec_version=spec["version"],
+            status=WorkflowStatus.EXECUTING.value,
+        )
+        try:
+            await drive_from_execution(wctx, checkpointer, state)
+        finally:
+            await wctx.agent.aclose()
+            await wctx.runner.aclose()
 
 
 def _recovery_execution_state(admin, workflow: dict, budget_config: BudgetConfig):
@@ -217,32 +260,36 @@ async def recover_workflow_task(ctx: dict, workflow_id: str) -> None:
     workflow = _load_workflow(admin, workflow_id)
     if workflow is None or workflow["status"] in TERMINAL or workflow["status"] in AWAITING:
         return
-    wctx = _build_context(ctx, admin, settings)
-    checkpointer = await _get_checkpointer(ctx, settings)
-    fallback = initial_state(workflow, wctx.budget_config)
-    graph = build_workflow_graph(wctx, checkpointer)
-    snapshot = await graph.aget_state({"configurable": {"thread_id": workflow["thread_id"]}})
-    try:
-        if snapshot.values and snapshot.next:
-            await continue_workflow(wctx, checkpointer, workflow["thread_id"], fallback)
-        elif snapshot.values:
-            try:
-                state = _recovery_execution_state(admin, workflow, wctx.budget_config)
-            except ValueError:
-                wctx.finalize_workflow(
-                    fallback, WorkflowStatus.FAILED,
-                    "Execution authorization invalid; approve the latest plan before retrying",
-                )
-                return
-            if state is not None:
-                await drive_from_execution(wctx, checkpointer, state)
+    with _drive_lock(settings, workflow_id) as acquired:
+        if not acquired:
+            logger.info("workflow %s: another driver holds the thread; skipping", workflow_id)
+            return
+        wctx = _build_context(ctx, admin, settings)
+        checkpointer = await _get_checkpointer(ctx, settings)
+        fallback = initial_state(workflow, wctx.budget_config)
+        graph = build_workflow_graph(wctx, checkpointer)
+        snapshot = await graph.aget_state({"configurable": {"thread_id": workflow["thread_id"]}})
+        try:
+            if snapshot.values and snapshot.next:
+                await continue_workflow(wctx, checkpointer, workflow["thread_id"], fallback)
+            elif snapshot.values:
+                try:
+                    state = _recovery_execution_state(admin, workflow, wctx.budget_config)
+                except ValueError:
+                    wctx.finalize_workflow(
+                        fallback, WorkflowStatus.FAILED,
+                        "Execution authorization invalid; approve the latest plan before retrying",
+                    )
+                    return
+                if state is not None:
+                    await drive_from_execution(wctx, checkpointer, state)
+                else:
+                    await start_workflow(wctx, checkpointer, fallback)
             else:
                 await start_workflow(wctx, checkpointer, fallback)
-        else:
-            await start_workflow(wctx, checkpointer, fallback)
-    finally:
-        await wctx.agent.aclose()
-        await wctx.runner.aclose()
+        finally:
+            await wctx.agent.aclose()
+            await wctx.runner.aclose()
 
 
 class WorkerSettings:

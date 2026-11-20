@@ -5,6 +5,7 @@ drive the unified graph, that restart recovery skips terminal/awaiting workflows
 starts uncheckpointed ones, and continues mid-flight ones from their checkpoint.
 """
 
+from contextlib import contextmanager
 from uuid import uuid4
 
 import pytest
@@ -34,8 +35,20 @@ from test_workflow_graph import (
 )
 
 
+@contextmanager
+def _always_acquired(settings, workflow_id):
+    """DB-free stand-in for the advisory lock; real exclusion is integration-tested."""
+    yield True
+
+
+@contextmanager
+def _never_acquired(settings, workflow_id):
+    yield False
+
+
 def _ctx(admin, results, saver, monkeypatch):
     monkeypatch.setattr(worker, "make_service_client", lambda s: admin)
+    monkeypatch.setattr(worker, "_drive_lock", _always_acquired)
     admin.storage.files["u/p.pdf"] = b"%PDF-1.4 fake"
     return {
         "settings": ApiSettings(
@@ -265,3 +278,26 @@ async def test_recovery_redrives_persisted_failure(monkeypatch):
     assert admin.tables["workflows"][0]["status"] == WorkflowStatus.COMPLETED.value
     assert [r["status"] for r in admin.tables["execution_runs"]] == ["failed", "succeeded"]
     assert admin.tables["workflows"][0]["run_id"] == admin.tables["execution_runs"][1]["id"]
+
+
+@pytest.mark.asyncio
+async def test_run_workflow_skips_when_thread_already_locked(monkeypatch):
+    admin = FakeAdmin(seed_workflow(), {str(PROJECT_ID): str(USER_ID)})
+    ctx = _ctx(admin, [], make_memory_checkpointer(), monkeypatch)
+    monkeypatch.setattr(worker, "_drive_lock", _never_acquired)
+    await worker.run_workflow_task(ctx, str(WORKFLOW_ID))
+    # A concurrent driver holds the thread: this job must not touch the graph.
+    assert admin.tables["workflows"][0]["status"] == WorkflowStatus.UPLOADED.value
+    assert admin.tables["reproduction_specs"] == []
+    assert admin.tables["experiments"] == []
+
+
+@pytest.mark.asyncio
+async def test_recovery_skips_when_thread_already_locked(monkeypatch):
+    admin = FakeAdmin(seed_workflow(), {str(PROJECT_ID): str(USER_ID)})
+    ctx = _ctx(admin, [], make_memory_checkpointer(), monkeypatch)
+    admin.tables["workflows"][0]["status"] = WorkflowStatus.GENERATING_CODE.value
+    monkeypatch.setattr(worker, "_drive_lock", _never_acquired)
+    await worker.recover_workflow_task(ctx, str(WORKFLOW_ID))
+    assert admin.tables["workflows"][0]["status"] == WorkflowStatus.GENERATING_CODE.value
+    assert admin.tables["experiments"] == []

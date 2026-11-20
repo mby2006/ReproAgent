@@ -3,7 +3,12 @@ from uuid import uuid4
 import pytest
 from reproagent_agent.graph.build import build_planning_graph
 from reproagent_agent.planning import ScalingConfig, UnsupportedPaperError, build_plan
-from reproagent_agent.planning.assumptions import as_float, as_int, normalize_optimizer
+from reproagent_agent.planning.assumptions import (
+    as_float,
+    as_int,
+    normalize_loss,
+    normalize_optimizer,
+)
 from reproagent_schemas import (
     AssumptionKind,
     ConfirmationSource,
@@ -61,6 +66,12 @@ class TestHelpers:
         assert normalize_optimizer("Adam") == "adam"
         assert normalize_optimizer("diagonal Levenberg-Marquardt") is None
         assert normalize_optimizer(None) is None
+
+    def test_normalize_loss(self):
+        assert normalize_loss("cross-entropy") == "cross_entropy"
+        assert normalize_loss("Softmax Loss") == "cross_entropy"
+        assert normalize_loss("discriminative forward loss function") is None
+        assert normalize_loss(None) is None
 
 
 class TestGuards:
@@ -134,6 +145,48 @@ class TestProvenance:
         plan = build_plan(make_card(optimizer=explicit("Adam")))
         assert plan.training_config.optimizer.value == "adam"
         assert plan.training_config.optimizer.source is ParamSource.PAPER_EXPLICIT
+
+    def test_standard_loss_normalized(self):
+        plan = build_plan(make_card(loss_function=explicit("cross-entropy")))
+        loss = plan.training_config.loss_function
+        assert loss.value == "cross_entropy"
+        assert loss.source is ParamSource.PAPER_EXPLICIT
+        assert loss.paper_value == "cross-entropy"
+        assert plan.unconfirmed_required() == []
+
+    def test_nonstandard_loss_proposes_cross_entropy(self):
+        plan = build_plan(make_card(loss_function=explicit("discriminative forward loss function")))
+        loss = plan.training_config.loss_function
+        assert loss.value == "cross_entropy"
+        assert loss.source is ParamSource.INFERRED
+        assert loss.paper_value == "discriminative forward loss function"
+        assert loss.requires_confirmation is True
+        assumption = next(
+            a for a in plan.assumptions if a.field_path == "training_config.loss_function"
+        )
+        assert assumption.kind is AssumptionKind.NONSTANDARD_CHOICE
+        assert assumption.value == "cross_entropy"
+        assert assumption.risk_tier is RiskTier.CRITICAL
+        assert assumption in plan.unconfirmed_critical()
+
+    def test_inferred_nonstandard_loss_proposes_cross_entropy(self):
+        inferred = EvidenceField(
+            value="discriminative forward loss",
+            status=EvidenceStatus.INFERRED,
+            confidence=0.6,
+            evidence_quote="...forward loss...",
+            source_page=8,
+        )
+        plan = build_plan(make_card(loss_function=inferred))
+        loss = plan.training_config.loss_function
+        assert loss.value == "cross_entropy"
+        assert loss.requires_confirmation is True
+        assert loss.paper_value == "discriminative forward loss"
+        assumption = next(
+            a for a in plan.assumptions if a.field_path == "training_config.loss_function"
+        )
+        assert assumption.kind is AssumptionKind.NONSTANDARD_CHOICE
+        assert assumption.risk_tier is RiskTier.CRITICAL
 
 
 class TestAssistedReviewPhase1:

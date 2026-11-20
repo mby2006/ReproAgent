@@ -192,13 +192,14 @@ export function PreselectionHint({ threshold }: { threshold: number }) {
   return <p className="text-xs leading-relaxed text-fg-3">高置信阈值 {(threshold * 100).toFixed(0)}% · 仅预选，确认后才生效。关键项不会自动勾选。</p>;
 }
 
-export function RecommendationCard({ recommendation, currentValue, checked, disabled, onCheck, onAdopt }: {
+export function RecommendationCard({ recommendation, currentValue, checked, disabled, onCheck, onAdopt, onModify }: {
   recommendation: FieldRecommendation;
   currentValue: unknown;
   checked: boolean;
   disabled: boolean;
   onCheck: (checked: boolean) => void;
   onAdopt: () => void;
+  onModify?: () => void;
 }) {
   const display = (value: unknown) => value == null ? "—" : String(value);
   return (
@@ -217,7 +218,15 @@ export function RecommendationCard({ recommendation, currentValue, checked, disa
       </p>
       <p className="whitespace-pre-wrap break-words leading-relaxed text-fg-2">理由：{recommendation.reasoning}</p>
       <p className="whitespace-pre-wrap break-words leading-relaxed text-warn">风险：{recommendation.risk}</p>
-      <button className="btn btn-info btn-sm" disabled={disabled} onClick={onAdopt}>采纳此推荐</button>
+      <div className="flex flex-wrap gap-2">
+        <button className="btn btn-info btn-sm" disabled={disabled} onClick={onAdopt}>采纳此推荐</button>
+        {recommendation.action === "modify" && onModify && (
+          <button className="btn btn-ghost btn-sm" disabled={disabled} onClick={onModify}
+            title="打开字段编辑，预填建议值；保存为新版本并记为人工修改">
+            修改…
+          </button>
+        )}
+      </div>
     </div>
   );
 }

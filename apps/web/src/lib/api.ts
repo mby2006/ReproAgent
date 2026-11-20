@@ -1,5 +1,5 @@
 import { supabase } from "./supabase";
-import type { CardVersion, ExplainResponse, NodeTrace, PlanVersion, RecommendResponse, OrdinaryReviewMode, WorkflowDetail } from "./types";
+import type { CardVersion, ExplainResponse, NodeTrace, PlanVersion, RecommendResponse, OrdinaryReviewMode, RiskTier, WorkflowDetail } from "./types";
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
 
@@ -142,5 +142,13 @@ export function adoptPlanRecommendations(
     body: JSON.stringify({
       recommendation_ids: recommendationIds, context_hash: contextHash, review_mode: reviewMode,
     }),
+  });
+}
+
+export function overridePlanTier(experimentId: string, version: number, fieldPath: string, riskTier: RiskTier) {
+  return apiFetch<PlanVersion>(`/v1/experiments/${experimentId}/plans/${version}/tier`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ field_path: fieldPath, risk_tier: riskTier }),
   });
 }

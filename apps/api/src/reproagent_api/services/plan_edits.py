@@ -253,3 +253,52 @@ def apply_delegated_review(
         review_mode=ReviewMode.DELEGATED, actor=actor, timestamp=now,
     ))
     return new_plan, records
+
+
+def apply_tier_override(
+    plan: ExperimentPlan,
+    field_path: str,
+    risk_tier: RiskTier,
+    *,
+    actor: UUID,
+) -> tuple[ExperimentPlan, list[PlanChangeRecord]]:
+    """Expert re-tiering is a human decision: new version, audited, never silent."""
+    data = plan.model_dump(mode="json")
+    assumption = next(
+        (a for a in data["assumptions"] if a["field_path"] == field_path), None
+    )
+    if assumption is None:
+        raise PlanEditError(f"assumption '{field_path}' not found")
+    before = assumption["risk_tier"]
+    if before == risk_tier.value:
+        raise PlanEditError("risk tier is unchanged")
+    mode = (
+        ReviewMode.ASSISTED if plan.review_mode is ReviewMode.DELEGATED else plan.review_mode
+    )
+    data.update(review_mode=mode, delegated_at=None, delegated_by=None)
+    assumption["risk_tier"] = risk_tier.value
+    assumption["auto_acceptable"] = risk_tier is not RiskTier.CRITICAL
+    if risk_tier is RiskTier.INFO:
+        assumption["requires_confirmation"] = False
+    elif not assumption["human_confirmed"]:
+        assumption["requires_confirmation"] = True
+    if field_path in PARAM_PATHS:
+        container, name = field_path.split(".")
+        node = data[container].get(name)
+        if node is not None:
+            node["requires_confirmation"] = assumption["requires_confirmation"]
+    now = utcnow()
+    records = [PlanChangeRecord(
+        field_path=f"{field_path}.risk_tier", before=before, after=risk_tier.value,
+        confirmed_by=ConfirmationSource.HUMAN, review_mode=mode, actor=actor, timestamp=now,
+    )]
+    if mode != plan.review_mode:
+        records.insert(0, PlanChangeRecord(
+            field_path="review_mode", before=plan.review_mode, after=mode,
+            review_mode=mode, actor=actor, timestamp=now,
+        ))
+    try:
+        new_plan = ExperimentPlan.model_validate(data)
+    except ValueError as exc:
+        raise PlanEditError(f"edited plan is invalid: {exc}") from exc
+    return new_plan, records

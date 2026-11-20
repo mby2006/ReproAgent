@@ -99,6 +99,7 @@ from .review import (
     ReviewField,
     ReviewModeRequest,
     ReviewRequest,
+    TierOverrideRequest,
     preselected_paths,
 )
 from .spec import (
@@ -156,6 +157,7 @@ __all__ = [
     "ReviewMode",
     "ReviewModeRequest",
     "ReviewRequest",
+    "TierOverrideRequest",
     "preselected_paths",
     "Assumption",
     "AssumptionKind",

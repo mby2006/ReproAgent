@@ -120,8 +120,8 @@ export function evidenceMeta(field: EvidenceField): { label: string; tone: Tone 
   }
   if (field.status === "paper_described") {
     return field.human_confirmed
-      ? { label: "原文描述·已确认", tone: "ok" }
-      : { label: "原文描述", tone: "ok" };
+      ? { label: "原文描述·已确认", tone: "info" }
+      : { label: "原文描述", tone: "info" };
   }
   return field.human_confirmed
     ? { label: "原文·已确认", tone: "ok" }

@@ -32,6 +32,27 @@ def test_dependencies_runner_ok(client, monkeypatch):
     assert body["dependencies"][0]["name"] == "runner"
 
 
+@pytest.mark.parametrize("dependency_status", [200, 503])
+def test_dependencies_ignore_host_proxy_settings(client, monkeypatch, dependency_status):
+    monkeypatch.setenv("NO_PROXY", "localhost,[::1]")
+    monkeypatch.setenv("no_proxy", "localhost,[::1]")
+
+    async def get(self, url, **kwargs):
+        assert url == "http://runner.test/health"
+        return httpx.Response(dependency_status, request=httpx.Request("GET", url))
+
+    # Keep the real constructor so NO_PROXY parsing is exercised.
+    monkeypatch.setattr(httpx.AsyncClient, "get", get)
+    response = client.get("/health/dependencies")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == ("ok" if dependency_status == 200 else "degraded")
+    assert body["dependencies"][0]["name"] == "runner"
+    assert body["dependencies"][0]["status"] == (
+        "ok" if dependency_status == 200 else "unavailable"
+    )
+
+
 def test_dependencies_runner_down(client, monkeypatch):
     def handler(request):
         raise httpx.ConnectError("refused", request=request)

@@ -59,6 +59,36 @@ def test_dependencies_all_ok(client, settings, monkeypatch):
     assert {dep["name"] for dep in body["dependencies"]} == {"agent", "supabase", "runner"}
 
 
+@pytest.mark.parametrize("dependency_status", [200, 503])
+def test_dependencies_ignore_host_proxy_settings(client, monkeypatch, dependency_status):
+    monkeypatch.setenv("NO_PROXY", "localhost,[::1]")
+    monkeypatch.setenv("no_proxy", "localhost,[::1]")
+
+    async def get(self, url, **kwargs):
+        request = httpx.Request("GET", url)
+        return httpx.Response(
+            dependency_status,
+            request=request,
+            json={
+                "service": "agent",
+                "status": "ok",
+                "dependencies": [{"name": "runner", "status": "ok"}],
+            },
+        )
+
+    # Keep the real constructor so NO_PROXY parsing is exercised.
+    monkeypatch.setattr(httpx.AsyncClient, "get", get)
+    response = client.get("/health/dependencies")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == ("ok" if dependency_status == 200 else "degraded")
+    assert {dep["name"] for dep in body["dependencies"]} == {"agent", "supabase", "runner"}
+    assert all(
+        dep["status"] == ("ok" if dependency_status == 200 else "unavailable")
+        for dep in body["dependencies"]
+    )
+
+
 def test_dependencies_degraded_when_agent_down(client, monkeypatch):
     def handler(request: httpx.Request) -> httpx.Response:
         if request.url.host == "agent.test":

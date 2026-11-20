@@ -7,6 +7,7 @@ enum deliberately has no "full reproduction" verdict: a scaled MVP run can at
 best be METHOD_VALIDATED, never a claim of full paper equivalence.
 """
 
+from datetime import datetime
 from enum import StrEnum
 from typing import Any
 from uuid import UUID
@@ -14,7 +15,7 @@ from uuid import UUID
 from pydantic import Field, model_validator
 
 from .card import ReproductionCard
-from .common import SchemaModel
+from .common import ReviewDecision, ReviewMode, SchemaModel
 from .execution import CodeFile, ErrorCategory, RunAudit, RunStatus
 from .plan import Assumption, Deviation, ExperimentPlan
 
@@ -131,6 +132,7 @@ class ReportReferences(SchemaModel):
     code_hash: str | None = None
     run_id: UUID
     generated_file_ids: list[UUID] = Field(default_factory=list)
+    review_trace_ids: list[UUID] = Field(default_factory=list)
 
 
 class EvaluationReport(SchemaModel):
@@ -144,6 +146,11 @@ class EvaluationReport(SchemaModel):
     missing_information: list[str] = Field(default_factory=list)
     assumptions: list[Assumption] = Field(default_factory=list)
     limitations: list[str] = Field(default_factory=list)
+    review_mode: ReviewMode | None = None
+    delegated_at: datetime | None = None
+    delegated_by: UUID | None = None
+    review_decisions: list[ReviewDecision] = Field(default_factory=list)
+    review_disclaimer: str | None = None
 
 
 class EvaluateRequest(SchemaModel):
@@ -152,6 +159,7 @@ class EvaluateRequest(SchemaModel):
     references: ReportReferences
     card: ReproductionCard
     plan: ExperimentPlan
+    review_decisions: list[ReviewDecision] = Field(default_factory=list)
     paper_title: str | None = None
     code_files: list[CodeFile] = Field(default_factory=list)
     run_status: RunStatus

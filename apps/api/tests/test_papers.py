@@ -52,6 +52,28 @@ def test_upload_requires_auth(client):
     assert response.status_code == 401
 
 
+def test_delete_requires_auth(client):
+    response = client.delete(f"/v1/papers/{uuid4()}")
+    assert response.status_code == 401
+
+
+def test_delete_checks_ownership_before_database_access(client, monkeypatch):
+    from fastapi import HTTPException
+
+    def deny(admin, paper_id, user_id):
+        assert user_id == USER_ID
+        raise HTTPException(404, "Paper not found")
+
+    def unexpected_connection(*args, **kwargs):
+        pytest.fail("Deletion must check ownership before connecting to Postgres")
+
+    monkeypatch.setattr(papers, "_admin", lambda request: object())
+    monkeypatch.setattr(papers, "_get_paper", deny)
+    monkeypatch.setattr(papers.psycopg, "connect", unexpected_connection)
+    response = client.delete(f"/v1/papers/{uuid4()}", headers=AUTH)
+    assert response.status_code == 404
+
+
 def test_upload_rejects_non_pdf(client):
     response = upload(client, b"this is plain text, not a pdf")
     assert response.status_code == 422

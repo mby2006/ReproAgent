@@ -1,9 +1,10 @@
 "use client";
 
 import Link from "next/link";
-import { useSearchParams } from "next/navigation";
+import { useRouter, useSearchParams } from "next/navigation";
 import { Suspense, useCallback, useEffect, useRef, useState } from "react";
 import AuthGate from "@/components/AuthGate";
+import DeletePaperButton from "@/components/DeletePaperButton";
 import Shell from "@/components/Shell";
 import WorkflowInsights from "@/components/WorkflowInsights";
 import WorkflowStepper from "@/components/WorkflowStepper";
@@ -15,7 +16,9 @@ import {
   IconQuote,
   IconRefresh,
 } from "@/components/icons";
-import { apiFetch, confirmCard, getPaperWorkflow, resumeWorkflow, retryWorkflow } from "@/lib/api";
+import { apiFetch, confirmCard, confirmCardBatch, delegateCard, explainCard, getPaperWorkflow, resumeWorkflow, retryWorkflow } from "@/lib/api";
+import { ConfirmationBadge, DelegationDialog, DelegationNotice, ExplanationCard, PreselectionHint, ReviewModeSelector, ReviewRequestStatus } from "@/components/ReviewControls";
+import { hasDelegation, isReviewHandled, isRoutineCardPath, ordinaryReviewMode, useReviewMode, useReviewRequest, useReviewSelection } from "@/lib/useReview";
 import { useWorkflow } from "@/lib/useWorkflow";
 import type { CardVersion, CardVersionMeta, EvidenceField, PaperSummary } from "@/lib/types";
 import { evidenceMeta, TONE_BADGE, WF_BUSY } from "@/lib/ui";
@@ -27,8 +30,12 @@ interface Selection {
 }
 
 function StatusBadge({ field }: { field: EvidenceField }) {
+  if (field.confirmed_by === "auto") return <ConfirmationBadge by="auto" />;
   const meta = evidenceMeta(field);
-  return <span className={`chip ${TONE_BADGE[meta.tone]}`}>{meta.label}</span>;
+  return <span className="flex flex-wrap items-center gap-1">
+    <span className={`chip ${TONE_BADGE[meta.tone]}`}>{meta.label}</span>
+    <ConfirmationBadge by={field.confirmed_by} />
+  </span>;
 }
 
 function FieldRow({
@@ -61,6 +68,7 @@ function FieldRow({
 }
 
 function PaperInner({ paperId }: { paperId: string }) {
+  const router = useRouter();
   const search = useSearchParams();
   const [paper, setPaper] = useState<PaperSummary | null>(null);
   const [versions, setVersions] = useState<CardVersionMeta[]>([]);
@@ -71,13 +79,29 @@ function PaperInner({ paperId }: { paperId: string }) {
   const [error, setError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
   const [confirming, setConfirming] = useState(false);
+  const [delegationTarget, setDelegationTarget] = useState<CardVersion | null>(null);
+  const [delegating, setDelegating] = useState(false);
+  const [confirmedVersionId, setConfirmedVersionId] = useState<string | null>(null);
   const [continuing, setContinuing] = useState(false);
   const [retrying, setRetrying] = useState(false);
+  const [loading, setLoading] = useState(true);
+  const loadSequence = useRef(0);
   const editInput = useRef<HTMLInputElement>(null);
   const { workflowId, setWorkflowId, workflow, error: wfError, refresh } = useWorkflow(
     search.get("workflow")
   );
   const wfStatus = workflow?.status;
+  const reviewKey = cardVersion ? `${paperId}:${cardVersion.id}` : "";
+  const { mode, setMode } = useReviewMode(reviewKey, cardVersion?.card.review_mode);
+  const normalMode = ordinaryReviewMode(mode);
+  const storedDelegated = hasDelegation(cardVersion?.card);
+  const delegated = storedDelegated && mode === "delegated";
+  const canContinueSaved = delegated || (mode !== "delegated" && !!cardVersion &&
+    confirmedVersionId === cardVersion.id && cardVersion.card.review_mode === mode);
+  const busy = wfStatus != null && WF_BUSY.includes(wfStatus);
+  const operationBusy = saving || confirming || delegating || continuing || retrying || loading || busy;
+  const isLatest = cardVersion != null && cardVersion.version === Math.max(0, ...versions.map((v) => v.version));
+  const writeDisabled = operationBusy || !isLatest;
 
   const loadVersions = useCallback(async () => {
     const list = await apiFetch<CardVersionMeta[]>(`/v1/papers/${paperId}/versions`);
@@ -87,10 +111,18 @@ function PaperInner({ paperId }: { paperId: string }) {
 
   const loadCard = useCallback(
     async (v: number | null) => {
-      const query = v === null ? "" : `?version=${v}`;
-      const card = await apiFetch<CardVersion>(`/v1/papers/${paperId}/card${query}`);
-      setCardVersion(card);
-      setSelected(null);
+      const sequence = ++loadSequence.current;
+      setLoading(true);
+      try {
+        const query = v === null ? "" : `?version=${v}`;
+        const card = await apiFetch<CardVersion>(`/v1/papers/${paperId}/card${query}`);
+        if (sequence !== loadSequence.current) return;
+        setCardVersion(card);
+        setVersion(v);
+        setSelected(null);
+      } finally {
+        if (sequence === loadSequence.current) setLoading(false);
+      }
     },
     [paperId]
   );
@@ -106,8 +138,9 @@ function PaperInner({ paperId }: { paperId: string }) {
       .then((list) => {
         setVersions(list);
         if (list.length > 0) return loadCard(null);
+        setLoading(false);
       })
-      .catch(() => {});
+      .catch((err) => { setLoading(false); setError(err.message); });
   }, [paperId, loadCard]);
 
   useEffect(() => {
@@ -130,7 +163,8 @@ function PaperInner({ paperId }: { paperId: string }) {
   }, [wfStatus, paperId, loadVersions, loadCard]);
 
   async function switchVersion(v: number) {
-    setVersion(v);
+    if (operationBusy) return;
+    setError(null);
     try {
       await loadCard(v);
     } catch (err) {
@@ -150,18 +184,59 @@ function PaperInner({ paperId }: { paperId: string }) {
     }
   }
 
+  function showSavedVersion(next: CardVersion) {
+    ++loadSequence.current;
+    setLoading(false);
+    setCardVersion(next);
+    setSelected(null);
+    setVersion(null);
+    setVersions((previous) => previous.some((v) => v.id === next.id) ? previous : [next, ...previous]);
+  }
+
+  async function authorizeDelegation() {
+    if (!delegationTarget || !cardVersion || writeDisabled || cardVersion.id !== delegationTarget.id) {
+      throw new Error("版本已变化或暂不可授权，请取消后加载最新版本。");
+    }
+    setDelegating(true);
+    setError(null);
+    try {
+      const next = await delegateCard(paperId, delegationTarget.version);
+      showSavedVersion(next);
+      setConfirmedVersionId(next.id);
+      setDelegationTarget(null);
+      // A refresh/resume failure must retain the saved version, not repeat authorization.
+      try {
+        await loadVersions();
+      } catch (err) {
+        setError(`托管版本 v${next.version} 已保存，但刷新失败：${err instanceof Error ? err.message : "请加载最新版本"}`);
+      }
+      if (workflowId && wfStatus === "awaiting_spec_review") await continueWorkflow();
+    } finally {
+      setDelegating(false);
+    }
+  }
+
   async function confirmAndContinue() {
-    if (!workflowId) return;
+    if (!workflowId || writeDisabled) return;
+    if (canContinueSaved) {
+      await continueWorkflow();
+      return;
+    }
     setConfirming(true);
     setError(null);
     try {
-      await confirmCard(paperId);
-      await loadVersions();
-      await loadCard(null);
+      const next = await confirmCard(paperId, normalMode);
+      showSavedVersion(next);
+      setConfirmedVersionId(next.id);
     } catch (err) {
       setError(err instanceof Error ? err.message : "确认 Card 失败");
       setConfirming(false);
       return;
+    }
+    try {
+      await loadVersions();
+    } catch (err) {
+      setError(`Card 已确认，但版本列表刷新失败：${err instanceof Error ? err.message : "请加载最新版本"}`);
     }
     setConfirming(false);
     await continueWorkflow();
@@ -175,7 +250,7 @@ function PaperInner({ paperId }: { paperId: string }) {
       await resumeWorkflow(workflowId, "spec");
       await refresh();
     } catch (err) {
-      setError(err instanceof Error ? err.message : "继续执行失败");
+      setError(`Card 版本已保存，继续工作流失败：${err instanceof Error ? err.message : "请重试"}。请点击「继续工作流」，无需重复授权或确认。`);
     } finally {
       setContinuing(false);
     }
@@ -196,7 +271,7 @@ function PaperInner({ paperId }: { paperId: string }) {
   }
 
   async function saveEdit() {
-    if (!selected?.path || !cardVersion) return;
+    if (!selected?.path || !cardVersion || operationBusy) return;
     const raw = editInput.current?.value ?? "";
     let value: string | number | boolean | null;
     if (raw.trim() === "") value = null;
@@ -212,16 +287,17 @@ function PaperInner({ paperId }: { paperId: string }) {
     setSaving(true);
     setError(null);
     try {
-      await apiFetch(`/v1/papers/${paperId}/card/edits`, {
+      const next = await apiFetch<CardVersion>(`/v1/papers/${paperId}/card/edits`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           base_version: cardVersion.version,
+          review_mode: normalMode,
           edits: [{ field_path: selected.path, value }],
         }),
       });
+      showSavedVersion(next);
       await loadVersions();
-      setVersion(null);
       await loadCard(null);
     } catch (err) {
       setError(err instanceof Error ? err.message : "保存失败");
@@ -281,7 +357,35 @@ function PaperInner({ paperId }: { paperId: string }) {
     });
   }
 
-  const busy = wfStatus != null && WF_BUSY.includes(wfStatus);
+  const pendingFields = rows.flatMap((group) => group.items).filter((item): item is Selection & { path: string } =>
+    item.path != null && !isReviewHandled(item.field, delegated) && (item.field.status === "inferred" || item.field.status === "missing"),
+  );
+  const versionNumber = cardVersion?.version;
+  const requestExplanations = useCallback((signal: AbortSignal) => explainCard(paperId, versionNumber!, signal), [paperId, versionNumber]);
+  const explanations = useReviewRequest(reviewKey, mode === "assisted" && pendingFields.length > 0 && !operationBusy && !delegationTarget, requestExplanations);
+  const eligiblePaths = pendingFields.filter(({ path, field }) =>
+    explanations.data?.preselected_paths.includes(path) && isRoutineCardPath(path) &&
+    field.status === "inferred" && field.confidence >= explanations.data.selection_threshold,
+  ).map((item) => item.path);
+  const { selectedPaths, toggle } = useReviewSelection(reviewKey, eligiblePaths, eligiblePaths);
+  const batchDisabled = writeDisabled || explanations.loading || !!explanations.error || !explanations.data || selectedPaths.length === 0;
+
+  async function acceptHighConfidence() {
+    if (!cardVersion || !explanations.data || batchDisabled) return;
+    setSaving(true);
+    setError(null);
+    try {
+      const next = await confirmCardBatch(paperId, cardVersion.version, selectedPaths, explanations.data.context_hash, normalMode);
+      showSavedVersion(next);
+      await loadVersions();
+      await loadCard(null);
+    } catch (err) {
+      setError(`${err instanceof Error ? err.message : "批量确认失败"}。若版本已更新，请加载最新版本后重新获取解读。`);
+    } finally {
+      setSaving(false);
+    }
+  }
+
   const shownError = error ?? wfError;
 
   return (
@@ -297,6 +401,7 @@ function PaperInner({ paperId }: { paperId: string }) {
         {versions.length > 0 && (
           <select
             value={version ?? cardVersion?.version ?? ""}
+            disabled={operationBusy}
             onChange={(e) => switchVersion(Number(e.target.value))}
             className="select w-44!"
             aria-label="Card 版本"
@@ -308,24 +413,22 @@ function PaperInner({ paperId }: { paperId: string }) {
             ))}
           </select>
         )}
-        <button onClick={reparse} disabled={busy} className="btn btn-ghost btn-sm">
+        <button onClick={reparse} disabled={operationBusy} className="btn btn-ghost btn-sm">
           <IconRefresh className="h-3.5 w-3.5" /> 重新解析
         </button>
-        {wfStatus === "awaiting_spec_review" &&
-          (cardVersion?.origin === "user_edit" ? (
-            <button onClick={continueWorkflow} disabled={continuing} className="btn btn-info btn-sm">
-              {continuing ? "提交中…" : "继续执行"}
-            </button>
-          ) : (
-            <button
-              onClick={confirmAndContinue}
-              disabled={confirming || !card}
-              className="btn btn-primary btn-sm"
-            >
-              <IconCheck className="h-3.5 w-3.5" />
-              {confirming ? "提交中…" : "确认 Card 并继续"}
-            </button>
-          ))}
+        {paper && (
+          <DeletePaperButton
+            paper={paper}
+            disabled={operationBusy}
+            onDeleted={() => router.replace("/papers")}
+          />
+        )}
+        {wfStatus === "awaiting_spec_review" && (
+          <button onClick={confirmAndContinue} disabled={writeDisabled || !card} className="btn btn-primary btn-sm">
+            <IconCheck className="h-3.5 w-3.5" />
+            {confirming || continuing ? "提交中…" : canContinueSaved ? "继续工作流（已保存）" : "确认 Card 并继续"}
+          </button>
+        )}
         {workflow?.experiment_id && (
           <Link
             href={`/experiments/${workflow.experiment_id}?workflow=${workflow.id}`}
@@ -335,6 +438,22 @@ function PaperInner({ paperId }: { paperId: string }) {
           </Link>
         )}
       </header>
+
+      <ReviewModeSelector mode={mode} onChange={setMode} disabled={operationBusy || !cardVersion}
+        delegationDisabled={writeDisabled} onDelegate={() => { if (!writeDisabled) setDelegationTarget(cardVersion); }} />
+      {delegationTarget && <DelegationDialog version={delegationTarget.version} workflowDriven={workflowId != null}
+        onConfirm={authorizeDelegation} onCancel={() => setDelegationTarget(null)}
+        onExpert={() => { setDelegationTarget(null); setMode("expert"); }} />}
+      {card?.review_mode === "delegated" && <DelegationNotice delegatedAt={card.delegated_at} delegatedBy={card.delegated_by} />}
+      {storedDelegated && mode !== "delegated" && <p role="status" className="text-sm text-warn">
+        当前普通模式尚未保存；原版本仍为托管版本，不代表已人工核验。人工编辑或确认保存后将撤销新版本授权。
+      </p>}
+      {cardVersion && !isLatest && <p className="text-sm text-warn">正在查看历史版本，人工编辑会创建新版本；授权、批量确认或继续工作流前请加载最新版本。</p>}
+      {loading && <p role="status" className="text-xs text-fg-3">正在加载 Card 版本…</p>}
+      <button className="btn btn-ghost btn-sm" disabled={operationBusy} onClick={() => {
+        setError(null);
+        Promise.all([loadVersions(), loadCard(null)]).catch((err) => setError(err.message));
+      }}>加载最新版本</button>
 
       {workflow && (
         <WorkflowStepper
@@ -355,12 +474,13 @@ function PaperInner({ paperId }: { paperId: string }) {
       )}
       {wfStatus === "awaiting_spec_review" && (
         <p className="rise rounded-lg border border-warn/40 bg-warn/10 px-4 py-2 text-sm text-warn">
-          请核对 Reproduction Card：推断值与缺失信息可在右侧确认或修改，然后点击「确认 Card 并继续」生成实验计划。
+          {delegated ? "Card 已托管授权，可继续工作流；系统将自动生成建议、接受、批准并按当前预算执行，无需后续逐项点击。"
+            : "请核对 Reproduction Card：推断值与缺失信息可在右侧确认或修改，然后点击「确认 Card 并继续」生成实验计划。"}
         </p>
       )}
       {wfStatus === "awaiting_plan_approval" && (
         <p className="rise rounded-lg border border-warn/40 bg-warn/10 px-4 py-2 text-sm text-warn">
-          实验计划已生成，请前往实验页批准并执行。
+          {storedDelegated ? "托管工作流正在处理实验计划，无需逐项点击；可前往实验页查看授权及执行状态。" : "实验计划已生成，请前往实验页批准并执行。"}
         </p>
       )}
       {wfStatus === "completed" && (
@@ -369,9 +489,10 @@ function PaperInner({ paperId }: { paperId: string }) {
         </p>
       )}
       {shownError && (
-        <p className="rise rounded-lg border border-bad/40 bg-bad/10 px-4 py-2 text-sm text-bad">
-          {shownError}
-        </p>
+        <div role="alert" className="rise space-y-2 rounded-lg border border-bad/40 bg-bad/10 px-4 py-2 text-sm text-bad">
+          <p>{shownError}</p>
+          {storedDelegated && <button className="btn btn-ghost btn-sm" disabled={operationBusy} onClick={() => setMode("expert")}>切换专家模式，人工审核</button>}
+        </div>
       )}
 
       <div className="grid gap-5 lg:grid-cols-2">
@@ -397,6 +518,45 @@ function PaperInner({ paperId }: { paperId: string }) {
               ))}
             </div>
           ))}
+          {card && (
+            <div className="card space-y-3 p-4">
+              <h2 className="label text-info!">待审核字段 · AI 辅助（{pendingFields.length}）</h2>
+              <ReviewRequestStatus label="通俗解读" loading={explanations.loading} error={explanations.error}
+                loaded={!!explanations.data} disabled={operationBusy || pendingFields.length === 0}
+                onLoad={explanations.load} onExpert={() => setMode("expert")} />
+              {explanations.data && <>
+                <PreselectionHint threshold={explanations.data.selection_threshold} />
+                <button className="btn btn-info btn-sm" disabled={batchDisabled} onClick={acceptHighConfidence}>
+                  {saving ? "保存中…" : `接受已选高置信项（${selectedPaths.length}）`}
+                </button>
+                <p className="text-xs text-fg-3">仅确认所选常规推断项，不确认整张 Card，也不继续工作流。</p>
+              </>}
+              {pendingFields.length === 0 && <p className="text-xs text-fg-3">本版本没有待审核的推断或缺失字段。</p>}
+              {pendingFields.map((item) => {
+                const explanation = explanations.data?.explanations.find((e) => e.field_path === item.path);
+                const routine = isRoutineCardPath(item.path);
+                return (
+                  <div key={`${reviewKey}:${item.path}`} className={`space-y-2 rounded-lg border border-line border-l-2 p-3 ${routine ? "border-l-warn" : "border-l-bad"}`}>
+                    <div className="flex flex-wrap items-center gap-2">
+                      <span className={`chip ${routine ? "badge-warn" : "badge-bad"}`}>{routine ? "常规" : "关键"}</span>
+                      <button className="text-left text-xs text-info underline underline-offset-2" onClick={() => setSelected(item)}>{item.label} · {item.path}</button>
+                    </div>
+                    <p className="break-words font-mono text-xs text-fg-2">当前值：{item.field.value == null ? "—（缺失）" : String(item.field.value)} · 置信度 {(item.field.confidence * 100).toFixed(0)}%</p>
+                    {eligiblePaths.includes(item.path) ? (
+                      <label className="flex items-center gap-2 text-xs text-fg-2">
+                        <input type="checkbox" checked={selectedPaths.includes(item.path)}
+                          disabled={writeDisabled || explanations.loading || !!explanations.error}
+                          onChange={(event) => toggle(item.path, event.target.checked)}
+                          className="h-4 w-4 accent-[var(--color-brand)]" />
+                        建议接受此高置信推断项
+                      </label>
+                    ) : <p className="text-xs text-fg-3">需人工核对并编辑或确认，不参与高置信批量确认。</p>}
+                    {explanation && <ExplanationCard explanation={explanation} mode={mode} />}
+                  </div>
+                );
+              })}
+            </div>
+          )}
           {card && card.missing_information.length > 0 && (
             <div className="card space-y-2 border-warn/30 bg-warn/5 p-4">
               <h2 className="label text-warn!">缺失信息 Missing Information</h2>
@@ -406,6 +566,21 @@ function PaperInner({ paperId }: { paperId: string }) {
                 ))}
               </ul>
             </div>
+          )}
+          {!!card?.review_decisions?.length && (
+            <details className="card space-y-2 p-4">
+              <summary className="cursor-pointer text-sm text-fg focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-brand">本版本审核记录（{card.review_decisions.length}）</summary>
+              {card.review_decisions.map((decision) => (
+                <div key={decision.id} className="space-y-1 border-t border-line pt-2 text-xs text-fg-2">
+                  <p className="break-words font-mono">{decision.field_path}: {String(decision.before)} → {String(decision.after)}</p>
+                  <ConfirmationBadge by={decision.confirmed_by} />
+                  <p className="break-words">{decision.review_mode === "delegated" ? "托管模式" : decision.review_mode === "expert" ? "专家模式" : decision.review_mode === "assisted" ? "辅助模式" : "审核模式未记录"}
+                    {decision.actor && ` · 操作者 ${decision.actor}`}{decision.timestamp && ` · ${decision.timestamp}`}</p>
+                  {decision.recommendation_reasoning && <p className="break-words">推荐理由：{decision.recommendation_reasoning}</p>}
+                  {decision.recommendation_risk && <p className="break-words text-warn">风险：{decision.recommendation_risk}</p>}
+                </div>
+              ))}
+            </details>
           )}
           {!card && !busy && (
             <p className="rounded-xl border border-dashed border-line p-6 text-center text-sm text-fg-3">
@@ -445,11 +620,13 @@ function PaperInner({ paperId }: { paperId: string }) {
                   <input
                     key={`${selected.path}-${cardVersion?.version}`}
                     ref={editInput}
+                    disabled={operationBusy}
+                    aria-label={`${selected.label}字段值`}
                     defaultValue={selected.field.value === null ? "" : String(selected.field.value)}
                     placeholder="留空表示标记为缺失"
                     className="input min-w-0 flex-1"
                   />
-                  <button onClick={saveEdit} disabled={saving} className="btn btn-primary btn-sm shrink-0">
+                  <button onClick={saveEdit} disabled={operationBusy} className="btn btn-primary btn-sm shrink-0">
                     {saving ? "保存中…" : "保存为新版本"}
                   </button>
                 </div>
@@ -497,7 +674,7 @@ export default function PaperClient({ paperId }: { paperId: string }) {
     <AuthGate>
       <Shell>
         <Suspense fallback={<div className="p-6 text-fg-3">加载中…</div>}>
-          <PaperInner paperId={paperId} />
+          <PaperInner key={paperId} paperId={paperId} />
         </Suspense>
       </Shell>
     </AuthGate>

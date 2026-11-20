@@ -7,6 +7,7 @@ the /v1/evaluate route. No LLM is involved anywhere (NullLLM raises if called).
 """
 
 import re
+from datetime import UTC, datetime
 from uuid import uuid4
 
 import pytest
@@ -42,6 +43,8 @@ from reproagent_schemas import (
     RunAudit,
     RunStatus,
 )
+from reproagent_schemas.common import ConfirmationSource, ReviewDecision, ReviewMode
+from reproagent_schemas.plan import Assumption, AssumptionKind, ExperimentPlan, RiskTier
 
 ALL_FINAL = {
     "METHOD_VALIDATED",
@@ -716,3 +719,136 @@ def test_evaluate_route_rejects_invalid_body():
     with make_client() as client:
         response = client.post("/v1/evaluate", json={"references": {}})
     assert response.status_code == 422
+
+
+# --- Review provenance, disclaimers and immutable audit references -------------
+
+DELEGATED_NOTICE = "本实验关键假设由系统自动接受，未经人工逐项核验；结果仅供趋势参考。"
+
+
+def review_assumption(source=None, **kwargs):
+    return Assumption(
+        field_path="training_config.batch_size", kind=AssumptionKind.INFERRED,
+        value=64, rationale="routine choice", risk_tier=RiskTier.ROUTINE,
+        human_confirmed=source in (ConfirmationSource.HUMAN, ConfirmationSource.AI_ASSISTED),
+        confirmed_by=source, **kwargs,
+    )
+
+
+def review_event(source=ConfirmationSource.AUTO):
+    return ReviewDecision(
+        field_path="training_config.batch_size", before={"value": 32}, after={"value": 64},
+        confirmed_by=source, actor=uuid4(), review_mode=ReviewMode.DELEGATED,
+        timestamp=datetime(2026, 1, 2, tzinfo=UTC), recommendation_id="recommendation-1",
+        recommendation_reasoning="safe|routine", recommendation_confidence=0.95,
+    )
+
+
+def test_delegated_report_warns_early_and_preserves_actual_authorization_and_refs():
+    plan = make_plan()
+    stamp, actor = datetime(2026, 1, 2, tzinfo=UTC), uuid4()
+    plan = ExperimentPlan.model_validate(plan.model_dump() | {
+        "review_mode": "delegated", "delegated_at": stamp, "delegated_by": actor,
+        "assumptions": [review_assumption(ConfirmationSource.AUTO)],
+    })
+    decision = review_event()
+    request = make_request(plan=plan, review_decisions=[decision, decision])
+    response = evaluate_run(request)
+    report = response.report
+    assert report.review_mode is ReviewMode.DELEGATED
+    assert report.delegated_at == stamp and report.delegated_by == actor
+    assert report.review_disclaimer == DELEGATED_NOTICE
+    assert report.review_decisions == [decision]
+    assert report.references.review_trace_ids == [decision.id]
+    assert request.references.review_trace_ids == []
+    assert response.markdown.index(DELEGATED_NOTICE) < response.markdown.index("## 1.")
+    assert f"{actor}" in response.markdown and stamp.isoformat() in response.markdown
+    assert f"#review-{decision.id}" in response.markdown
+    assert f'id="review-{decision.id}"' in response.markdown
+    assert "safe\\|routine" in response.markdown
+    for text in ("old", "new", "actor", "time", "source", "auto（系统自动接受，非人工确认）"):
+        assert text in response.markdown
+
+
+@pytest.mark.parametrize("mode", [ReviewMode.EXPERT, ReviewMode.ASSISTED])
+def test_past_auto_acceptance_remains_disclaimed_after_mode_switch(mode):
+    plan = make_plan()
+    plan.review_mode = mode
+    plan.assumptions = [review_assumption(ConfirmationSource.HUMAN)]
+    response = evaluate_run(make_request(plan=plan, review_decisions=[review_event()]))
+    assert response.report.review_mode is mode
+    assert response.report.review_disclaimer == DELEGATED_NOTICE
+    assert response.report.delegated_at is None and response.report.delegated_by is None
+
+
+def test_expert_with_unconfirmed_routine_never_claims_itemwise_human_review():
+    plan = make_plan()
+    plan.review_mode = ReviewMode.EXPERT
+    plan.assumptions = [review_assumption()]
+    response = evaluate_run(make_request(plan=plan, review_decisions=[
+        review_event(ConfirmationSource.HUMAN),
+    ]))
+    assert "未经人工确认" in response.report.review_disclaimer
+    assert "不能认定已人工逐项核验" in response.markdown
+    assert "未确认" in response.markdown
+
+
+@pytest.mark.parametrize("source,label", [
+    (ConfirmationSource.HUMAN, "human（人工确认）"),
+    (ConfirmationSource.AI_ASSISTED, "ai_assisted（AI 辅助，人工采纳）"),
+    (ConfirmationSource.AUTO, "auto（系统自动接受，非人工确认）"),
+    (None, "未确认"),
+])
+def test_assumptions_keep_their_confirmation_source(source, label):
+    plan = make_plan()
+    plan.assumptions = [review_assumption(source)]
+    response = evaluate_run(make_request(plan=plan))
+    assert response.report.assumptions[0].confirmed_by is source
+    assert label in response.markdown
+    if source is ConfirmationSource.AUTO:
+        assert not response.report.assumptions[0].human_confirmed
+        assert response.report.review_disclaimer == DELEGATED_NOTICE
+
+
+def test_legacy_report_is_honestly_unknown_without_synthetic_history():
+    raw = make_plan().model_dump()
+    for field in ("review_mode", "delegated_at", "delegated_by"):
+        raw.pop(field, None)
+    plan = ExperimentPlan.model_validate(raw)
+    response = evaluate_run(make_request(plan=plan))
+    assert response.report.review_mode is None
+    assert response.report.review_decisions == []
+    assert response.report.references.review_trace_ids == []
+    assert "unknown" in response.report.review_disclaimer
+    assert "审核来源未知" in response.markdown
+
+
+@pytest.mark.parametrize("source", list(ConfirmationSource))
+def test_inferred_result_is_not_upgraded_to_paper_evidence_by_acceptance(source):
+    card = make_card(reported_results=[ReportedResult(
+        metric="accuracy", value=0.999, status=EvidenceStatus.INFERRED,
+        human_confirmed=source is not ConfirmationSource.AUTO, confirmed_by=source,
+        evidence_quote="suggested accuracy 99.9%", source_page=10,
+    )])
+    response = evaluate_run(make_request(card=card))
+    acc = next(c for c in response.report.metric_comparisons if c.metric == "accuracy")
+    assert acc.paper_value is None and acc.paper_evidence is None
+    assert acc.comparison_status is CheckStatus.NOT_APPLICABLE
+    assert response.report.final_status is FinalStatus.INSUFFICIENT_EVIDENCE
+    assert "论文报告值：0.999" not in response.markdown
+
+
+@pytest.mark.parametrize("source", [ConfirmationSource.AUTO, ConfirmationSource.AI_ASSISTED])
+def test_inferred_method_evidence_cannot_become_paper_facts(source):
+    card = make_card()
+    for name in ("method", "model_architecture", "dataset", "loss_function"):
+        field = getattr(card, name)
+        setattr(card, name, EvidenceField(
+            value=field.value, status=EvidenceStatus.INFERRED,
+            confirmed_by=source, human_confirmed=source is ConfirmationSource.AI_ASSISTED,
+            evidence_quote="LeNet-5 with 6 feature maps and max pooling", source_page=10,
+        ))
+    facts, _ = make_facts()
+    checks = validate_method(card, facts)
+    assert all(c.status is CheckStatus.UNKNOWN for c in checks)
+    assert all(c.paper_evidence is None and c.paper_value is None for c in checks)

@@ -1,5 +1,5 @@
 import { supabase } from "./supabase";
-import type { CardVersion, NodeTrace, WorkflowDetail } from "./types";
+import type { CardVersion, ExplainResponse, NodeTrace, PlanVersion, RecommendResponse, OrdinaryReviewMode, WorkflowDetail } from "./types";
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
 
@@ -35,6 +35,12 @@ export function uploadPaper(file: File | null, title: string, url?: string) {
   });
 }
 
+export function deletePaper(paperId: string) {
+  return apiFetch<{ paper_id: string; status: "deleted" }>(`/v1/papers/${paperId}`, {
+    method: "DELETE",
+  });
+}
+
 export function getWorkflow(workflowId: string) {
   return apiFetch<WorkflowDetail>(`/v1/workflows/${workflowId}`);
 }
@@ -65,6 +71,76 @@ export function retryWorkflow(workflowId: string) {
   );
 }
 
-export function confirmCard(paperId: string) {
-  return apiFetch<CardVersion>(`/v1/papers/${paperId}/card/confirm`, { method: "POST" });
+export function confirmCard(paperId: string, reviewMode?: OrdinaryReviewMode) {
+  return apiFetch<CardVersion>(`/v1/papers/${paperId}/card/confirm`, {
+    method: "POST",
+    ...(reviewMode ? {
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ review_mode: reviewMode }),
+    } : {}),
+  });
+}
+
+export function delegateCard(paperId: string, baseVersion: number) {
+  return apiFetch<CardVersion>(`/v1/papers/${paperId}/card/delegate`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ base_version: baseVersion, consent: true }),
+  });
+}
+
+export function delegatePlan(experimentId: string, version: number) {
+  return apiFetch<PlanVersion>(`/v1/experiments/${experimentId}/plans/${version}/delegate`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ base_version: version, consent: true }),
+  });
+}
+
+export function explainCard(paperId: string, baseVersion: number, signal?: AbortSignal) {
+  return apiFetch<ExplainResponse>(`/v1/papers/${paperId}/card/explain`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ base_version: baseVersion, field_paths: [] }),
+    signal,
+  });
+}
+
+export function confirmCardBatch(
+  paperId: string, baseVersion: number, fieldPaths: string[], contextHash: string, reviewMode: OrdinaryReviewMode,
+) {
+  return apiFetch<CardVersion>(`/v1/papers/${paperId}/card/confirm-batch`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      base_version: baseVersion, field_paths: fieldPaths, context_hash: contextHash, review_mode: reviewMode,
+    }),
+  });
+}
+
+export function explainPlan(experimentId: string, version: number, signal?: AbortSignal) {
+  return apiFetch<ExplainResponse>(`/v1/experiments/${experimentId}/plans/${version}/explain`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ field_paths: [] }),
+    signal,
+  });
+}
+
+export function recommendPlan(experimentId: string, version: number, signal?: AbortSignal) {
+  return apiFetch<RecommendResponse>(`/v1/experiments/${experimentId}/plans/${version}/recommend`, {
+    method: "POST", signal,
+  });
+}
+
+export function adoptPlanRecommendations(
+  experimentId: string, version: number, recommendationIds: string[], contextHash: string, reviewMode: OrdinaryReviewMode,
+) {
+  return apiFetch<PlanVersion>(`/v1/experiments/${experimentId}/plans/${version}/adopt`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      recommendation_ids: recommendationIds, context_hash: contextHash, review_mode: reviewMode,
+    }),
+  });
 }

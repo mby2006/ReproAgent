@@ -4,6 +4,7 @@ import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import AuthGate from "@/components/AuthGate";
+import DeletePaperButton from "@/components/DeletePaperButton";
 import Shell from "@/components/Shell";
 import {
   IconArrowRight,
@@ -27,6 +28,7 @@ const STATUS_META: Record<PaperSummary["status"], { label: string; tone: Tone }>
 function PapersInner() {
   const router = useRouter();
   const [papers, setPapers] = useState<PaperSummary[]>([]);
+  const [notice, setNotice] = useState<string | null>(null);
   const [title, setTitle] = useState("");
   const [file, setFile] = useState<File | null>(null);
   const [url, setUrl] = useState("");
@@ -238,6 +240,8 @@ function PapersInner() {
         </select>
       </div>
 
+      {notice && <p role="status" className="text-sm text-ok">{notice}</p>}
+
       {visible.length === 0 ? (
         <div className="rise rise-3 flex flex-col items-center gap-3 rounded-xl border border-dashed border-line py-16 text-center">
           <IconPdf className="h-10 w-10 text-fg-3" />
@@ -251,8 +255,8 @@ function PapersInner() {
           {visible.map((paper, i) => {
             const meta = STATUS_META[paper.status];
             return (
-              <li key={paper.id} className="rise" style={{ animationDelay: `${Math.min(i, 8) * 0.05}s` }}>
-                <Link href={`/papers/${paper.id}`} className="card card-hover group flex h-full flex-col p-4">
+              <li key={paper.id} className="card card-hover rise flex flex-col" style={{ animationDelay: `${Math.min(i, 8) * 0.05}s` }}>
+                <Link href={`/papers/${paper.id}`} className="group flex flex-1 flex-col p-4">
                   <div className="mb-3 flex items-center justify-between gap-2">
                     <span className="chip">
                       {paper.source === "upload" ? (
@@ -277,6 +281,16 @@ function PapersInner() {
                     <IconArrowRight className="h-4 w-4 text-fg-3 transition group-hover:translate-x-1 group-hover:text-brand" />
                   </div>
                 </Link>
+                <div className="flex justify-end border-t border-line px-3 py-2">
+                  <DeletePaperButton
+                    paper={paper}
+                    disabled={paper.status === "uploaded"}
+                    onDeleted={() => {
+                      setPapers((current) => current.filter((item) => item.id !== paper.id));
+                      setNotice(`已删除「${paper.title}」`);
+                    }}
+                  />
+                </div>
               </li>
             );
           })}

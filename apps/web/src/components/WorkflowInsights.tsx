@@ -32,17 +32,32 @@ function BudgetBar({ budget }: { budget: Record<string, unknown> }) {
   );
 }
 
-function TraceRow({ trace }: { trace: NodeTrace }) {
+const REVIEW_SOURCES: Record<string, string> = {
+  human: "人工确认", ai_assisted: "AI 辅助，人工采纳", auto: "系统自动接受（非人工确认）",
+};
+const REVIEW_MODES: Record<string, string> = {
+  expert: "专家审核", assisted: "AI 辅助审核", delegated: "托管审核",
+};
+
+function traceValue(value: unknown) {
+  return value == null ? "未知" : typeof value === "string" ? value : JSON.stringify(value);
+}
+
+export function TraceRow({ trace }: { trace: NodeTrace }) {
+  const review = trace.node_name === "review_decision";
+  const output = trace.output_json;
+  const source = REVIEW_SOURCES[String(output.confirmed_by)] ?? "来源未知 / 未确认";
   const tokens =
     trace.token_usage && typeof trace.token_usage.total_tokens === "number"
       ? trace.token_usage.total_tokens.toLocaleString()
       : null;
   return (
-    <details className="group card overflow-hidden">
+    <details id={`workflow-trace-${trace.id}`} className="group card scroll-mt-4 overflow-hidden">
       <summary className="flex cursor-pointer list-none flex-wrap items-center gap-x-3 gap-y-1 px-3 py-2 text-sm [&::-webkit-details-marker]:hidden">
         <IconChevronDown className="h-3.5 w-3.5 text-fg-3 transition group-open:rotate-180" />
         <span className={`h-1.5 w-1.5 rounded-full ${trace.error ? "bg-bad" : "bg-ok"}`} />
-        <span className="font-mono text-[12px] text-fg">{trace.node_name}</span>
+        <span className="font-mono text-[12px] text-fg">{review ? "审核决策" : trace.node_name}</span>
+        {review && <span className="break-all text-xs text-fg-2">{traceValue(trace.input_json.field_path)} · {source}</span>}
         {trace.duration_ms !== null && (
           <span className="font-mono text-[10.5px] text-fg-3">{trace.duration_ms}ms</span>
         )}
@@ -53,13 +68,31 @@ function TraceRow({ trace }: { trace: NodeTrace }) {
         {trace.retry_count > 0 && (
           <span className="chip badge-warn py-0!">retry {trace.retry_count}</span>
         )}
-        <span className={`chip ml-auto py-0! ${trace.error ? "badge-bad" : "badge-ok"}`}>
-          {trace.error ? "ERR" : "OK"}
+        <span className={`chip ml-auto py-0! ${trace.error ? "badge-bad" : review && output.confirmed_by === "auto" ? "badge-warn" : "badge-ok"}`}>
+          {trace.error ? "ERR" : review ? "已记录" : "OK"}
         </span>
       </summary>
       <div className="space-y-2 border-t border-line-soft px-3 py-2">
         {trace.error && <p className="text-xs text-bad">{trace.error}</p>}
-        <div className="grid gap-2 lg:grid-cols-2">
+        {review ? (
+          <dl className="grid gap-2 break-all text-xs sm:grid-cols-2">
+            {[
+              ["审核事件 ID", trace.id], ["字段", traceValue(trace.input_json.field_path)],
+              ["旧值（已脱敏）", traceValue(trace.input_json.before)],
+              ["新值（已脱敏）", traceValue(output.after)], ["确认来源", source],
+              ["审核模式", REVIEW_MODES[String(output.review_mode)] ?? "未知"],
+              ["操作用户", traceValue(output.actor)],
+              ["时间", traceValue(output.timestamp ?? trace.created_at)],
+              ["推荐 ID", traceValue(output.recommendation_id)],
+              ["推荐置信度", traceValue(output.recommendation_confidence)],
+              ["推荐风险", traceValue(output.recommendation_risk)],
+              ["预选阈值", traceValue(output.preselection_threshold)],
+              ["推荐理由（已脱敏）", traceValue(output.recommendation_reasoning)],
+            ].map(([label, value]) => (
+              <div key={label}><dt className="text-fg-3">{label}</dt><dd className="mt-1 whitespace-pre-wrap text-fg-2">{value}</dd></div>
+            ))}
+          </dl>
+        ) : <div className="grid gap-2 lg:grid-cols-2">
           <div>
             <p className="label mb-1 text-[9px]!">input（已脱敏）</p>
             <pre className="max-h-48 overflow-auto rounded-lg bg-ink-950 p-2 font-mono text-[10.5px] leading-relaxed text-fg-2">
@@ -72,7 +105,7 @@ function TraceRow({ trace }: { trace: NodeTrace }) {
               {JSON.stringify(trace.output_json, null, 2)}
             </pre>
           </div>
-        </div>
+        </div>}
       </div>
     </details>
   );

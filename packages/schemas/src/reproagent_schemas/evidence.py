@@ -4,7 +4,7 @@ from enum import StrEnum
 
 from pydantic import Field, model_validator
 
-from .common import SchemaModel
+from .common import ConfirmationSource, SchemaModel, check_confirmation
 
 
 class EvidenceStatus(StrEnum):
@@ -22,13 +22,26 @@ class EvidenceField[T](SchemaModel):
     evidence_quote: str | None = None
     confidence: float = Field(default=0.0, ge=0.0, le=1.0)
     human_confirmed: bool = False
+    confirmed_by: ConfirmationSource | None = None
 
     @model_validator(mode="after")
     def check_evidence_consistency(self) -> "EvidenceField[T]":
+        check_confirmation(self.confirmed_by, self.human_confirmed)
+        if self.confirmed_by is ConfirmationSource.AUTO and self.status not in (
+            EvidenceStatus.INFERRED, EvidenceStatus.MISSING,
+        ):
+            raise ValueError("automatic acceptance must remain inferred or missing")
+        if (
+            self.confirmed_by is ConfirmationSource.AI_ASSISTED
+            and self.status is not EvidenceStatus.INFERRED
+        ):
+            raise ValueError("AI-assisted acceptance must remain inferred")
         if self.status is EvidenceStatus.MISSING:
             if self.value is not None:
                 raise ValueError("missing field must not carry a value")
-            if self.evidence_quote is not None or self.source_page is not None:
+            if any(v is not None for v in (
+                self.evidence_quote, self.source_page, self.source_section,
+            )):
                 raise ValueError("missing field must not carry evidence")
         elif self.value is None:
             raise ValueError(f"{self.status} field requires a value")

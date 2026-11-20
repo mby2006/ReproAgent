@@ -7,7 +7,7 @@ from uuid import UUID, uuid4
 from pydantic import Field
 
 from .card import ReproductionCard
-from .common import SchemaModel, utcnow
+from .common import ManualReviewMode, SchemaModel, utcnow
 from .jobs import JobStatus
 from .parsed import ParsedDocument
 from .workflow import LLMUsage
@@ -90,3 +90,4 @@ class FieldEdit(SchemaModel):
 class CardEditRequest(SchemaModel):
     base_version: int = Field(ge=1)
     edits: list[FieldEdit] = Field(min_length=1)
+    review_mode: ManualReviewMode | None = None

@@ -16,13 +16,12 @@ Entry points:
 
 import logging
 import os
+from datetime import UTC, datetime
 from uuid import uuid4
 
 from arq.connections import RedisSettings
 from reproagent_schemas import (
     BudgetConfig,
-    ExperimentPlan,
-    ReproductionCard,
     WorkflowStatus,
 )
 
@@ -30,6 +29,7 @@ from .clients.agent import AgentClient
 from .clients.runner import RunnerClient
 from .clients.supabase import make_service_client
 from .config import ApiSettings
+from .services.runs import load_execution_plan
 from .workflow import (
     WorkflowContext,
     build_workflow_graph,
@@ -120,27 +120,20 @@ async def run_experiment_task(ctx: dict, run_id: str) -> None:
     if not runs:
         return
     run = runs[0]
-    experiment = (
-        admin.table("experiments")
-        .select("*")
-        .eq("id", run["experiment_id"])
-        .single()
-        .execute()
-        .data
-    )
-    plan_row = (
-        admin.table("experiment_plans").select("*").eq("id", run["plan_id"]).single().execute().data
-    )
-    spec = (
-        admin.table("reproduction_specs")
-        .select("id,version,spec_json")
-        .eq("id", experiment["spec_id"])
-        .single()
-        .execute()
-        .data
-    )
-    card = ReproductionCard.model_validate(spec["spec_json"])
-    plan = ExperimentPlan.model_validate(plan_row["config_json"])
+    if run["status"] != "queued":
+        return
+    try:
+        experiment, plan_row, plan, spec, card, _ = load_execution_plan(
+            admin, run["experiment_id"], run["plan_id"],
+        )
+        if run["plan_version"] != plan_row["version"]:
+            raise ValueError("Queued plan version does not match the selected plan")
+    except ValueError:
+        admin.table("execution_runs").update({
+            "status": "failed", "finished_at": datetime.now(UTC).isoformat(),
+            "error": "Execution authorization invalid; approve the latest plan before retrying",
+        }).eq("id", run_id).eq("status", "queued").execute()
+        return
 
     workflow_id = uuid4()
     workflow = (
@@ -194,35 +187,15 @@ def _recovery_execution_state(admin, workflow: dict, budget_config: BudgetConfig
     experiment_id = workflow.get("experiment_id")
     if not experiment_id:
         return None
-    experiment = (
-        admin.table("experiments").select("*").eq("id", experiment_id).single().execute().data
-    )
-    plan_rows = (
-        admin.table("experiment_plans")
-        .select("id,version,config_json,approved_at")
-        .eq("experiment_id", experiment_id)
-        .not_.is_("approved_at", "null")
-        .order("version", desc=True)
-        .limit(1)
-        .execute()
-        .data
-    )
-    if not plan_rows or not experiment.get("spec_id"):
-        return None
-    plan_row = plan_rows[0]
-    spec = (
-        admin.table("reproduction_specs")
-        .select("id,version,spec_json")
-        .eq("id", experiment["spec_id"])
-        .single()
-        .execute()
-        .data
+    _, plan_row, plan, spec, card, _ = load_execution_plan(
+        admin, experiment_id, project_id=workflow["project_id"], paper_id=workflow["paper_id"],
+        spec_id=workflow.get("spec_version_id"),
     )
     admin.table("experiments").update({"status": "running"}).eq("id", experiment_id).execute()
     state = initial_state(workflow, budget_config)
     state.update(
-        card=ReproductionCard.model_validate(spec["spec_json"]),
-        plan=ExperimentPlan.model_validate(plan_row["config_json"]),
+        card=card,
+        plan=plan,
         experiment_id=experiment_id,
         run_id=None,
         plan_id=plan_row["id"],
@@ -253,7 +226,14 @@ async def recover_workflow_task(ctx: dict, workflow_id: str) -> None:
         if snapshot.values and snapshot.next:
             await continue_workflow(wctx, checkpointer, workflow["thread_id"], fallback)
         elif snapshot.values:
-            state = _recovery_execution_state(admin, workflow, wctx.budget_config)
+            try:
+                state = _recovery_execution_state(admin, workflow, wctx.budget_config)
+            except ValueError:
+                wctx.finalize_workflow(
+                    fallback, WorkflowStatus.FAILED,
+                    "Execution authorization invalid; approve the latest plan before retrying",
+                )
+                return
             if state is not None:
                 await drive_from_execution(wctx, checkpointer, state)
             else:

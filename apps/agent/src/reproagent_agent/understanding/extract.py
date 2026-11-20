@@ -10,6 +10,7 @@ extract_card remains the composite used by the legacy /v1/understand endpoint.
 """
 
 import json
+from copy import deepcopy
 
 from pydantic import ValidationError
 from reproagent_paperparse import ground_card
@@ -40,9 +41,33 @@ def _parse_json(text: str) -> dict:
     return parsed
 
 
+def _without_review_metadata(raw: dict) -> dict:
+    """Untrusted extraction cannot attest to an API review."""
+    data = deepcopy(raw)
+    metadata = (
+        "review_mode", "review_selection_threshold", "delegated_at", "delegated_by",
+        "review_decisions", "human_confirmed", "confirmed_by",
+    )
+    fields = [data]
+    fields.extend(data.get(key) for key in (
+        "method", "model_architecture", "dataset", "optimizer", "loss_function",
+    ))
+    for key in ("data_preprocessing", "hyperparameters"):
+        if isinstance(data.get(key), dict):
+            fields.extend(data[key].values())
+    for key in ("evaluation_metrics", "reported_results", "baselines"):
+        if isinstance(data.get(key), list):
+            fields.extend(data[key])
+    for field in fields:
+        if isinstance(field, dict):
+            for key in metadata:
+                field.pop(key, None)
+    return data
+
+
 def ground_and_validate(raw: dict, document: ParsedDocument) -> ReproductionCard:
     """Deterministic evidence grounding + strict validation (no LLM)."""
-    grounded = ground_card(raw, document)
+    grounded = ground_card(_without_review_metadata(raw), document)
     try:
         return ReproductionCard.model_validate(grounded)
     except ValidationError as exc:
@@ -70,7 +95,7 @@ async def extract_raw(
         usages.append(response.usage)
         reply = response.content
         try:
-            raw = _parse_json(reply)
+            raw = _without_review_metadata(_parse_json(reply))
         except (ValueError, json.JSONDecodeError) as exc:
             last_error = f"invalid JSON: {exc}"
             messages.append(ChatMessage(role="assistant", content=reply))

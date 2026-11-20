@@ -15,7 +15,16 @@ from uuid import UUID, uuid4
 from pydantic import ConfigDict, Field, model_validator
 
 from .card import ReproductionCard
-from .common import SchemaModel, utcnow
+from .common import (
+    ConfirmationSource,
+    ManualReviewMode,
+    ReviewDecision,
+    ReviewMode,
+    SchemaModel,
+    check_confirmation,
+    check_delegation,
+    utcnow,
+)
 from .evidence import EvidenceStatus
 
 
@@ -79,9 +88,17 @@ class PlanParam[T](SchemaModel):
     rationale: str | None = None
     requires_confirmation: bool = False
     human_confirmed: bool = False
+    confirmed_by: ConfirmationSource | None = None
+    confidence: float = Field(default=0.0, ge=0, le=1)
 
     @model_validator(mode="after")
     def check_provenance(self) -> "PlanParam[T]":
+        check_confirmation(self.confirmed_by, self.human_confirmed)
+        if (
+            self.confirmed_by in (ConfirmationSource.AUTO, ConfirmationSource.AI_ASSISTED)
+            and self.source is not ParamSource.INFERRED
+        ):
+            raise ValueError("AI acceptance must remain inferred")
         if self.source is ParamSource.PAPER_EXPLICIT:
             if not self.evidence_quote or self.source_page is None:
                 raise ValueError("paper_explicit param requires evidence_quote and source_page")
@@ -101,11 +118,18 @@ class Assumption(SchemaModel):
     rationale: str = Field(min_length=1)
     requires_confirmation: bool = True
     human_confirmed: bool = False
+    confirmed_by: ConfirmationSource | None = None
+    confidence: float = Field(default=0.0, ge=0, le=1)
     risk_tier: RiskTier = RiskTier.CRITICAL
     auto_acceptable: bool = False
     card_status: EvidenceStatus | None = None
     evidence_quote: str | None = None
     source_page: int | None = Field(default=None, ge=1)
+
+    @model_validator(mode="after")
+    def check_provenance(self) -> "Assumption":
+        check_confirmation(self.confirmed_by, self.human_confirmed)
+        return self
 
 
 class Deviation(SchemaModel):
@@ -190,6 +214,9 @@ class ResourceEstimates(SchemaModel):
 
 
 class ExperimentPlan(_PlanModel):
+    review_mode: ReviewMode = ReviewMode.ASSISTED
+    delegated_at: datetime | None = None
+    delegated_by: UUID | None = None
     scaling_profile: str = "mvp_lenet5_mnist_v1"
     rationale: str = Field(min_length=1)
     dataset_config: DatasetConfig
@@ -202,6 +229,26 @@ class ExperimentPlan(_PlanModel):
     resource_estimates: ResourceEstimates
     assumptions: list[Assumption] = Field(default_factory=list)
     deviations_from_paper: list[Deviation] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def check_authorization(self) -> "ExperimentPlan":
+        check_delegation(self.review_mode, self.delegated_at, self.delegated_by)
+        return self
+
+    def approval_ready(self, actor: UUID | None = None) -> bool:
+        if self.review_mode is not ReviewMode.DELEGATED:
+            return not self.unconfirmed_critical()
+        if self.delegated_at is None or self.delegated_by is None:
+            return False
+        if self.delegated_at.tzinfo is None or self.delegated_at.utcoffset() is None:
+            return False
+        if actor is not None and actor != self.delegated_by:
+            return False
+        return all(
+            a.human_confirmed or a.confirmed_by is ConfirmationSource.AUTO
+            for a in self.assumptions
+            if a.requires_confirmation and a.risk_tier is not RiskTier.INFO
+        )
 
     def unconfirmed_required(self) -> list[Assumption]:
         return [a for a in self.assumptions if a.requires_confirmation and not a.human_confirmed]
@@ -234,24 +281,29 @@ class PlanResponse(_PlanModel):
 
 
 class PlanChange(SchemaModel):
-    field_path: str = Field(pattern=r"^[a-z_]+(\.[a-z_]+)*$")
+    field_path: str = Field(pattern=r"^[a-z_]+(\.[A-Za-z0-9_\-]+)*$")
     value: Any
     human_confirmed: bool = True
 
 
-class PlanChangeRecord(SchemaModel):
-    field_path: str
-    before: Any
-    after: Any
+class PlanChangeRecord(ReviewDecision):
+    """Backward-compatible plan-specific name for an auditable review decision."""
 
 
 class PlanEditRequest(SchemaModel):
     base_version: int = Field(ge=1)
-    changes: list[PlanChange] = Field(min_length=1)
+    changes: list[PlanChange] = Field(default_factory=list)
+    review_mode: ManualReviewMode | None = None
     change_reason: str = Field(min_length=1)
     origin: PlanOrigin = PlanOrigin.USER_EDIT
     related_error: str | None = None
     related_run_id: UUID | None = None
+
+    @model_validator(mode="after")
+    def require_change(self) -> "PlanEditRequest":
+        if not self.changes and self.review_mode is None:
+            raise ValueError("changes or review_mode is required")
+        return self
 
 
 class PlanVersion(_PlanModel):

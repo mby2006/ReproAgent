@@ -7,6 +7,7 @@ import { apiFetch } from "@/lib/api";
 import type {
   CheckStatus,
   EvaluationReport,
+  ReviewDecision,
   RunReport,
 } from "@/lib/types";
 import { CHECK_META, FINAL_META, TONE_BADGE, fmtNum } from "@/lib/ui";
@@ -33,6 +34,75 @@ const EXPERIMENT_ITEM_LABEL: Record<string, string> = {
   dataset_fingerprint: "数据集指纹",
   runtime_environment: "运行环境",
 };
+
+const REVIEW_LABEL: Record<string, string> = {
+  expert: "专家审核", assisted: "AI 辅助审核", delegated: "托管审核",
+};
+const SOURCE_LABEL: Record<string, string> = {
+  human: "human · 人工确认",
+  ai_assisted: "ai_assisted · AI 辅助，人工采纳",
+  auto: "auto · 系统自动接受，非人工确认",
+};
+const DELEGATED_DISCLAIMER = "本实验关键假设由系统自动接受，未经人工逐项核验；结果仅供趋势参考。";
+
+function sourceLabel(source?: string | null, confirmed = false) {
+  return (source && SOURCE_LABEL[source]) || (confirmed ? "unknown · 旧记录来源未知" : "未确认");
+}
+
+function auditValue(value: unknown) {
+  return value == null ? "—" : typeof value === "string" ? value : JSON.stringify(value);
+}
+
+export function ReportReview({ data }: { data: EvaluationReport }) {
+  const automatic = data.review_mode === "delegated"
+    || data.assumptions.some((a) => a.confirmed_by === "auto")
+    || (data.review_decisions ?? []).some((d) => d.confirmed_by === "auto");
+  const disclaimer = automatic ? DELEGATED_DISCLAIMER : data.review_disclaimer
+    || "审核来源未知（unknown）：缺少审核记录，不能认定已人工逐项核验。";
+  return (
+    <aside aria-label="审核来源声明" className="space-y-2 rounded-lg border border-warn/30 bg-warn/8 px-4 py-3">
+      <span className="chip badge-warn">{REVIEW_LABEL[data.review_mode ?? ""] ?? "审核来源未知 · unknown"}</span>
+      <p className="text-sm font-medium text-warn">{disclaimer}</p>
+      {data.delegated_by && data.delegated_at && (
+        <p className="break-all text-xs text-fg-2">
+          托管授权用户：{data.delegated_by} · 授权时间：<time dateTime={data.delegated_at}>{data.delegated_at}</time>
+        </p>
+      )}
+      <p className="text-xs text-fg-3">确认来源不等于论文原文证据；自动接受与 AI 辅助采纳仍保留推断属性。</p>
+    </aside>
+  );
+}
+
+export function ReviewAudit({ decisions }: { decisions: ReviewDecision[] }) {
+  return (
+    <div className="space-y-2">
+      {decisions.length === 0 && <p className="text-xs text-fg-3">无持久审核事件；旧记录来源未知。</p>}
+      {decisions.map((d) => (
+        <details key={d.id} id={`review-${d.id}`} className="scroll-mt-4 rounded-lg border border-line bg-ink-900 p-3 open:border-info/40">
+          <summary className="cursor-pointer break-all text-xs text-fg-2">
+            <span className="font-mono text-info">{d.field_path}</span>
+            <span className="chip mx-2 py-0!">{sourceLabel(d.confirmed_by)}</span>
+            <span className="font-mono">{d.id}</span>
+          </summary>
+          <dl className="mt-3 grid gap-2 break-all text-xs sm:grid-cols-2">
+            {[
+              ["旧值（已脱敏）", auditValue(d.before)], ["新值（已脱敏）", auditValue(d.after)],
+              ["审核模式", REVIEW_LABEL[d.review_mode ?? ""] ?? "unknown"],
+              ["操作用户", d.actor ?? "unknown"], ["时间", d.timestamp ?? "unknown"],
+              ["推荐 ID", d.recommendation_id ?? "—"],
+              ["推荐置信度", d.recommendation_confidence ?? "—"],
+              ["推荐风险", d.recommendation_risk ?? "—"],
+              ["预选阈值", d.preselection_threshold ?? "—"],
+              ["推荐理由（已脱敏）", d.recommendation_reasoning ?? "—"],
+            ].map(([label, value]) => (
+              <div key={label}><dt className="text-fg-3">{label}</dt><dd className="mt-1 whitespace-pre-wrap text-fg-2">{value}</dd></div>
+            ))}
+          </dl>
+        </details>
+      ))}
+    </div>
+  );
+}
 
 function CheckBadge({ status }: { status: CheckStatus }) {
   const meta = CHECK_META[status];
@@ -157,6 +227,8 @@ export default function ReportPanel({ runId }: { runId: string }) {
       {missing && !error && (
         <p className="text-sm text-fg-3">报告尚未生成（运行结束后自动生成，或点击「生成报告」）。</p>
       )}
+
+      {data && <ReportReview data={data} />}
 
       {data && finalMeta && !showMarkdown && (
         <div className="space-y-5">
@@ -314,12 +386,18 @@ export default function ReportPanel({ runId }: { runId: string }) {
                     <span className="chip mx-1.5 py-0!">{a.kind}</span>=
                     <span className="ml-1.5 font-mono text-fg">{String(a.value)}</span>
                     <span className="ml-2 text-fg-3">— {a.rationale}</span>
-                    {a.human_confirmed && <span className="chip ml-2 py-0! badge-info">已确认</span>}
+                    <span className={`chip ml-2 py-0! ${a.confirmed_by === "auto" ? "badge-warn" : "badge-info"}`}>
+                      {sourceLabel(a.confirmed_by, a.human_confirmed)}
+                    </span>
                   </li>
                 ))}
               </ul>
             </Section>
           )}
+
+          <Section title="审核 Trace（已脱敏）" count={(data.review_decisions ?? []).length}>
+            <ReviewAudit decisions={data.review_decisions ?? []} />
+          </Section>
 
           <Section title="已知局限 Known Limitations">
             <ul className="space-y-1 text-xs leading-relaxed text-fg-3">
@@ -348,6 +426,15 @@ export default function ReportPanel({ runId }: { runId: string }) {
                   <span className="label block text-[9px]!">{label}</span>
                   <span className="mt-0.5 block break-all font-mono text-fg-2">{value}</span>
                 </div>
+              ))}
+            </div>
+            <div className="space-y-1 break-all text-xs">
+              <p className="label">审核事件 ID</p>
+              {(data.references.review_trace_ids ?? []).map((id) => (
+                <a key={id} href={`#review-${id}`} className="block font-mono text-info underline" onClick={() => {
+                  const target = document.getElementById(`review-${id}`);
+                  if (target instanceof HTMLDetailsElement) target.open = true;
+                }}>{id}</a>
               ))}
             </div>
           </Section>

@@ -6,6 +6,8 @@ deterministic planning engine, so plan content is genuine.
 """
 
 import json
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
 from uuid import uuid4
 
 import httpx
@@ -16,7 +18,13 @@ from reproagent_agent.planning import build_plan
 from reproagent_api.clients.supabase import make_service_client
 from reproagent_api.config import ApiSettings
 from reproagent_api.main import create_app
-from reproagent_schemas import PlanResponse, ReproductionCard
+from reproagent_schemas import (
+    FieldRecommendation,
+    PlanResponse,
+    RecommendResponse,
+    ReproductionCard,
+    ReviewRequest,
+)
 
 from supabase import ClientOptions, create_client
 
@@ -91,6 +99,21 @@ def build_pdf() -> bytes:
 def mock_plan_transport() -> httpx.MockTransport:
     def handler(request: httpx.Request) -> httpx.Response:
         body = json.loads(request.content)
+        if request.url.path == "/v1/recommend":
+            context = ReviewRequest.model_validate(body)
+            result = RecommendResponse(
+                context_hash=context.context_hash(),
+                recommendations=[
+                    FieldRecommendation(
+                        id=f"{context.context_hash()}:{field.field_path}",
+                        field_path=field.field_path, action="accept", suggested_value=field.value,
+                        confidence=0.95, reasoning="测试建议：保留待确认的 MVP 提案",
+                        risk="非论文原文，可能与论文设置存在偏差",
+                    )
+                    for field in context.review_fields()
+                ],
+            )
+            return httpx.Response(200, json=result.model_dump(mode="json"))
         card = ReproductionCard.model_validate(body["card"])
         plan = build_plan(card)
         return httpx.Response(200, json=PlanResponse(plan=plan).model_dump(mode="json"))
@@ -123,6 +146,13 @@ def two_users(admin):
         users.append(created.user)
     yield users
     for user in users:
+        papers = (
+            admin.table("papers").select("pdf_path,projects!inner(user_id)")
+            .eq("projects.user_id", str(user.id)).execute().data
+        )
+        paths = [paper["pdf_path"] for paper in papers if paper["pdf_path"]]
+        if paths:
+            admin.storage.from_("papers").remove(paths)
         admin.auth.admin.delete_user(user.id)
 
 
@@ -137,7 +167,11 @@ def token_for(settings, email: str) -> str:
 def alice_client(settings, two_users):
     alice, _ = two_users
     app = create_app(settings)
-    with TestClient(app) as client:
+    queue = SimpleNamespace(enqueue_job=AsyncMock(), aclose=AsyncMock())
+    with (
+        patch("reproagent_api.main.create_pool", AsyncMock(return_value=queue)),
+        TestClient(app) as client,
+    ):
         client.app.state.agent_transport = mock_plan_transport()
         client.headers["Authorization"] = f"Bearer {token_for(settings, alice.email)}"
         yield client
@@ -259,6 +293,133 @@ class TestPlannerFlow:
         admin.table("experiment_plans").update({"approved_at": "2026-01-01T00:00:00+00:00"}).eq(
             "id", row["id"]
         ).execute()
+
+
+class TestAssistedApproval:
+    def test_two_decisions_persist_audited_new_version(
+        self, alice_client, admin, two_users, bob_headers,
+    ):
+        experiment_id = seed_experiment(alice_client, admin)
+        base_url = f"/v1/experiments/{experiment_id}/plans"
+        original = alice_client.get(f"{base_url}/1").json()
+        denied = alice_client.post(f"{base_url}/1/recommend", headers=bob_headers)
+        assert denied.status_code == 404
+        response = alice_client.post(f"{base_url}/1/recommend")
+        assert response.status_code == 200, response.text
+        advice = response.json()
+        assert alice_client.get(f"{base_url}/1").json() == original
+        assert alice_client.post(f"{base_url}/1/approve").status_code == 409
+        payload = {
+            "context_hash": advice["context_hash"],
+            "recommendation_ids": [r["id"] for r in advice["recommendations"]],
+            "review_mode": "assisted",
+        }
+        adoption = alice_client.post(f"{base_url}/1/adopt", json=payload)
+        assert adoption.status_code == 201, adoption.text
+        adopted = adoption.json()
+        assert adopted["version"] == 2
+        assert adopted["parent_version_id"] == original["id"]
+        optimizer = adopted["plan"]["training_config"]["optimizer"]
+        assert optimizer["source"] == "inferred"
+        assert optimizer["confirmed_by"] == "ai_assisted"
+        assert optimizer["evidence_quote"] == CARD["optimizer"]["evidence_quote"]
+        for record in adopted["changes"]:
+            assert record["actor"] == str(two_users[0].id)
+            assert record["timestamp"]
+            assert record["confirmed_by"] == "ai_assisted"
+            assert record["preselection_threshold"] == 0.9
+            assert record["recommendation_id"]
+        approved = alice_client.post(f"{base_url}/2/approve", json={"review_mode": "assisted"})
+        assert approved.status_code == 200, approved.text
+        assert approved.json()["approved_at"] is not None
+        assert alice_client.get(f"{base_url}/1").json() == original
+        assert alice_client.post(f"{base_url}/1/adopt", json=payload).status_code == 409
+        assert len(alice_client.get(base_url).json()) == 2
+        with pytest.raises(Exception, match="immutable"):
+            admin.table("experiment_plans").update({"config_json": {}}).eq(
+                "id", adopted["id"]
+            ).execute()
+
+    def test_expert_approval_records_mode_without_overwriting_config(self, alice_client, admin):
+        experiment_id = seed_experiment(alice_client, admin)
+        base_url = f"/v1/experiments/{experiment_id}/plans"
+        confirmed = alice_client.post(base_url, json={
+            "base_version": 1,
+            "changes": [
+                {"field_path": "training_config.optimizer", "value": "sgd"},
+                {"field_path": "training_config.loss_function", "value": "cross_entropy"},
+            ],
+            "change_reason": "逐项确认关键提案",
+        })
+        assert confirmed.status_code == 201
+        approved = alice_client.post(f"{base_url}/2/approve", json={"review_mode": "expert"})
+        assert approved.status_code == 200, approved.text
+        assert approved.json()["version"] == 3
+        assert approved.json()["plan"]["review_mode"] == "expert"
+        previous = alice_client.get(f"{base_url}/2").json()
+        assert previous["plan"]["review_mode"] == "assisted"
+        assert previous["approved_at"] is None
+
+
+class TestDelegatedApproval:
+    def test_authorization_persists_honest_immutable_version(
+        self, alice_client, admin, two_users, bob_headers,
+    ):
+        experiment_id = seed_experiment(alice_client, admin)
+        path = f"/v1/experiments/{experiment_id}/plans"
+        original = alice_client.get(f"{path}/1").json()
+        denied = alice_client.post(
+            f"{path}/1/delegate", headers=bob_headers,
+            json={"base_version": 1, "consent": True},
+        )
+        assert denied.status_code == 404
+        delegated = alice_client.post(
+            f"{path}/1/delegate", json={"base_version": 1, "consent": True},
+        )
+        assert delegated.status_code == 201, delegated.text
+        version = delegated.json()
+        assert version["version"] == 2
+        assert version["parent_version_id"] == original["id"]
+        assert version["approved_at"]
+        assert version["plan"]["delegated_by"] == str(two_users[0].id)
+        for assumption in version["plan"]["assumptions"]:
+            if assumption["requires_confirmation"]:
+                assert assumption["confirmed_by"] == "auto"
+                assert assumption["human_confirmed"] is False
+        assert all(event["id"] and event["timestamp"] for event in version["changes"])
+        assert alice_client.get(f"{path}/1").json() == original
+        assert alice_client.post(
+            f"{path}/1/delegate", json={"base_version": 1, "consent": True},
+        ).status_code == 409
+        assert alice_client.post(
+            f"{path}/2/approve", json={"review_mode": "expert"},
+        ).status_code == 409
+        with pytest.raises(Exception, match="immutable"):
+            admin.table("experiment_plans").update({
+                "config_json": {**version["plan"], "delegated_by": str(two_users[1].id)},
+            }).eq("id", version["id"]).execute()
+
+    def test_card_authorization_flows_into_plan_and_trace(self, alice_client, admin):
+        experiment_id = seed_experiment(alice_client, admin)
+        detail = alice_client.get(f"/v1/experiments/{experiment_id}").json()
+        paper_id = detail["paper_id"]
+        delegated = alice_client.post(
+            f"/v1/papers/{paper_id}/card/delegate", json={"base_version": 1, "consent": True},
+        )
+        assert delegated.status_code == 201, delegated.text
+        card = delegated.json()
+        assert card["card"]["loss_function"]["status"] == "missing"
+        created = alice_client.post(f"/v1/papers/{paper_id}/experiments", json={})
+        assert created.status_code == 201, created.text
+        assert created.json()["plan"]["approved_at"]
+        workflow = alice_client.get(f"/v1/papers/{paper_id}/workflow").json()
+        admin.table("workflows").update({
+            "status": "awaiting_spec_review", "spec_version_id": card["parent_version_id"],
+        }).eq("id", workflow["id"]).execute()
+        traces = alice_client.get(f"/v1/workflows/{workflow['id']}/traces")
+        assert traces.status_code == 200, traces.text
+        ids = {trace["id"] for trace in traces.json()}
+        assert {event["id"] for event in card["card"]["review_decisions"]} <= ids
 
 
 class TestOwnershipIsolation:

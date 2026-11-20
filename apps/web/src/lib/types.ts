@@ -1,3 +1,41 @@
+export type ReviewMode = "assisted" | "expert" | "delegated";
+export type OrdinaryReviewMode = Exclude<ReviewMode, "delegated">;
+export type ConfirmationSource = "human" | "ai_assisted" | "auto";
+
+export interface FieldExplanation {
+  field_path: string;
+  what: string;
+  why: string;
+  consequence: string;
+  risk: string;
+}
+
+export interface FieldRecommendation {
+  id: string;
+  field_path: string;
+  action: "accept" | "modify";
+  suggested_value: string | number | boolean | null;
+  confidence: number;
+  reasoning: string;
+  risk: string;
+}
+
+export interface ExplainResponse {
+  context_hash: string;
+  explanations: FieldExplanation[];
+  preselected_paths: string[];
+  selection_threshold: number;
+  usages: Record<string, unknown>[];
+}
+
+export interface RecommendResponse {
+  context_hash: string;
+  recommendations: FieldRecommendation[];
+  preselected_paths: string[];
+  selection_threshold: number;
+  usages: Record<string, unknown>[];
+}
+
 export type EvidenceStatus = "paper_explicit" | "paper_described" | "inferred" | "missing";
 
 export interface EvidenceField {
@@ -8,6 +46,7 @@ export interface EvidenceField {
   evidence_quote: string | null;
   confidence: number;
   human_confirmed: boolean;
+  confirmed_by?: ConfirmationSource | null;
 }
 
 export interface ReportedResult extends EvidenceField {
@@ -20,6 +59,10 @@ export interface Baseline extends EvidenceField {
 }
 
 export interface ReproductionCard {
+  review_mode?: ReviewMode;
+  delegated_at: string | null;
+  delegated_by: string | null;
+  review_decisions: ReviewDecision[];
   method: EvidenceField;
   model_architecture: EvidenceField;
   dataset: EvidenceField;
@@ -109,6 +152,7 @@ export type AssumptionKind = "inferred" | "missing_proposal" | "mvp_scaling" | "
 export type RiskTier = "critical" | "routine" | "info";
 
 export interface PlanParam {
+  confidence?: number;
   value: string | number | boolean | null;
   source: ParamSource;
   paper_value?: string | number | boolean | null;
@@ -117,15 +161,18 @@ export interface PlanParam {
   rationale?: string | null;
   requires_confirmation: boolean;
   human_confirmed: boolean;
+  confirmed_by?: ConfirmationSource | null;
 }
 
 export interface Assumption {
+  confidence?: number;
   field_path: string;
   kind: AssumptionKind;
   value: unknown;
   rationale: string;
   requires_confirmation: boolean;
   human_confirmed: boolean;
+  confirmed_by?: ConfirmationSource | null;
   risk_tier?: RiskTier;
   auto_acceptable?: boolean;
   card_status?: EvidenceStatus | null;
@@ -209,6 +256,9 @@ export interface ResourceEstimates {
 }
 
 export interface ExperimentPlan {
+  review_mode?: ReviewMode;
+  delegated_at: string | null;
+  delegated_by: string | null;
   scaling_profile: string;
   rationale: string;
   dataset_config: DatasetConfig;
@@ -223,11 +273,23 @@ export interface ExperimentPlan {
   deviations_from_paper: Deviation[];
 }
 
-export interface PlanChangeRecord {
+export interface ReviewDecision {
+  id: string;
   field_path: string;
   before: unknown;
   after: unknown;
+  confirmed_by?: ConfirmationSource | null;
+  review_mode?: ReviewMode | null;
+  actor?: string | null;
+  timestamp?: string;
+  recommendation_id?: string | null;
+  recommendation_confidence?: number | null;
+  recommendation_reasoning?: string | null;
+  recommendation_risk?: string | null;
+  preselection_threshold?: number | null;
 }
+
+export type PlanChangeRecord = ReviewDecision;
 
 export interface PlanVersion {
   id: string;
@@ -421,9 +483,15 @@ export interface ReportReferences {
   code_hash: string | null;
   run_id: string;
   generated_file_ids: string[];
+  review_trace_ids?: string[];
 }
 
 export interface EvaluationReport {
+  review_mode?: ReviewMode | null;
+  delegated_at?: string | null;
+  delegated_by?: string | null;
+  review_decisions?: ReviewDecision[];
+  review_disclaimer?: string | null;
   references: ReportReferences;
   final_status: FinalStatus;
   summary: string;

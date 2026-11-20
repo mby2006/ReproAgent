@@ -8,7 +8,7 @@ No credential material may ever appear in a NodeTrace.
 
 from datetime import datetime
 from enum import StrEnum
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from pydantic import Field
 
@@ -91,6 +91,7 @@ class BudgetState(SchemaModel):
 class NodeTrace(SchemaModel):
     """Append-only per-node observability record. Credentials must be redacted."""
 
+    id: UUID = Field(default_factory=uuid4)
     node_name: str = Field(min_length=1)
     workflow_id: UUID | None = None
     experiment_id: UUID | None = None

@@ -6,7 +6,8 @@ from .config import AgentSettings, get_settings
 from .graph.build import build_graph, build_planning_graph, build_understanding_graph
 from .llm.base import LLMAdapter
 from .llm.factory import get_llm_adapter
-from .routers import codegen, evaluation, health, plans, reproductions, understand
+from .review import ReviewService
+from .routers import codegen, evaluation, health, plans, reproductions, review, understand
 
 
 def create_app(settings: AgentSettings | None = None, llm: LLMAdapter | None = None) -> FastAPI:
@@ -16,6 +17,7 @@ def create_app(settings: AgentSettings | None = None, llm: LLMAdapter | None = N
     async def lifespan(app: FastAPI):
         adapter = llm if llm is not None else get_llm_adapter(settings)
         app.state.llm = adapter
+        app.state.review_service = ReviewService(adapter, settings)
         app.state.graph = build_graph(adapter)
         app.state.understanding_graph = build_understanding_graph(adapter)
         app.state.planning_graph = build_planning_graph()
@@ -29,6 +31,7 @@ def create_app(settings: AgentSettings | None = None, llm: LLMAdapter | None = N
     app.include_router(plans.router)
     app.include_router(codegen.router)
     app.include_router(evaluation.router)
+    app.include_router(review.router)
     return app
 
 

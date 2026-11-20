@@ -285,6 +285,191 @@ class TestUnderstandingFlow:
         assert wf["error"]
 
 
+class TestPaperDeletion:
+    async def test_delete_removes_pdf_and_all_related_records(self, settings, alice_client, admin):
+        ids = upload(alice_client, build_pdf())
+        await run_worker(settings, ids["workflow_id"])
+        paper_id = ids["paper_id"]
+        paper = admin.table("papers").select("*").eq("id", paper_id).execute().data[0]
+        card = alice_client.get(f"/v1/papers/{paper_id}/card").json()
+        assert alice_client.post(f"/v1/papers/{paper_id}/card/confirm").status_code == 201
+        experiment = admin.table("experiments").insert({
+            "project_id": paper["project_id"], "paper_id": paper_id,
+            "spec_id": card["id"], "name": "Deletion test", "status": "succeeded",
+        }).execute().data[0]
+        plan = admin.table("experiment_plans").insert({
+            "experiment_id": experiment["id"], "version": 1,
+            "config_json": {}, "budget_json": {},
+        }).execute().data[0]
+        generated = admin.table("generated_files").insert({
+            "experiment_id": experiment["id"], "version": 1, "path": "train.py",
+            "content": "pass", "sha256": "test-hash",
+        }).execute().data[0]
+        run = admin.table("execution_runs").insert({
+            "experiment_id": experiment["id"], "plan_id": plan["id"],
+            "code_version": 1, "status": "succeeded",
+        }).execute().data[0]
+        admin.table("execution_run_files").insert({
+            "run_id": run["id"], "generated_file_id": generated["id"],
+        }).execute()
+        admin.table("reproduction_reports").insert({
+            "run_id": run["id"], "report_json": {}, "markdown": "Test report",
+        }).execute()
+        admin.table("workflows").update({
+            "experiment_id": experiment["id"], "run_id": run["id"], "plan_id": plan["id"],
+        }).eq("id", ids["workflow_id"]).execute()
+        paths = [f"{run['id']}/attempt-{n}/stdout.txt" for n in (0, 1)]
+        for path in paths:
+            admin.storage.from_("runs").upload(path, b"test log")
+        admin.table("execution_artifacts").insert({
+            "run_id": run["id"], "artifact_type": "log", "storage_path": paths[1],
+        }).execute()
+
+        response = alice_client.delete(f"/v1/papers/{paper_id}")
+        assert response.status_code == 200, response.text
+        assert response.json() == {"paper_id": paper_id, "status": "deleted"}
+        for table, key, value in (
+            ("papers", "id", paper_id),
+            ("reproduction_specs", "paper_id", paper_id),
+            ("workflows", "paper_id", paper_id),
+            ("agent_traces", "workflow_id", ids["workflow_id"]),
+            ("experiments", "id", experiment["id"]),
+            ("experiment_plans", "experiment_id", experiment["id"]),
+            ("generated_files", "experiment_id", experiment["id"]),
+            ("execution_runs", "experiment_id", experiment["id"]),
+            ("execution_run_files", "run_id", run["id"]),
+            ("execution_artifacts", "run_id", run["id"]),
+            ("reproduction_reports", "run_id", run["id"]),
+        ):
+            assert admin.table(table).select("*").eq(key, value).execute().data == [], table
+        assert admin.table("projects").select("id").eq("id", paper["project_id"]).execute().data
+        assert alice_client.get(f"/v1/papers/{paper_id}").status_code == 404
+        assert alice_client.get(f"/v1/papers/{paper_id}/pdf").status_code == 404
+        assert paper_id not in [p["id"] for p in alice_client.get("/v1/papers").json()]
+        assert alice_client.delete(f"/v1/papers/{paper_id}").status_code == 404
+        from storage3.exceptions import StorageApiError
+
+        for bucket, path in [("papers", paper["pdf_path"]), *[("runs", p) for p in paths]]:
+            with pytest.raises(StorageApiError):
+                admin.storage.from_(bucket).download(path)
+
+    def test_delete_cleans_workflow_checkpoints(self, settings, alice_client, admin):
+        import psycopg
+        from langgraph.checkpoint.base import empty_checkpoint
+        from langgraph.checkpoint.postgres import PostgresSaver
+        from psycopg import sql
+
+        ids = upload(alice_client, build_pdf())
+        admin.table("workflows").update({"status": "failed"}).eq("id", ids["workflow_id"]).execute()
+        with PostgresSaver.from_conn_string(settings.supabase_db_url) as saver:
+            saver.setup()
+            checkpoint = empty_checkpoint()
+            checkpoint["channel_values"] = {"paper": ids["paper_id"]}
+            checkpoint["channel_versions"] = {"paper": "1"}
+            config = saver.put(
+                {"configurable": {"thread_id": ids["thread_id"], "checkpoint_ns": ""}},
+                checkpoint, {}, {"paper": "1"},
+            )
+            saver.put_writes(config, [("paper", ids["paper_id"])], "test-task")
+            assert saver.get(config) is not None
+            response = alice_client.delete(f"/v1/papers/{ids['paper_id']}")
+            assert response.status_code == 200, response.text
+            assert saver.get(config) is None
+        with psycopg.connect(settings.supabase_db_url) as conn:
+            for table in ("checkpoint_writes", "checkpoint_blobs", "checkpoints"):
+                cursor = conn.execute(
+                    sql.SQL("select count(*) from {} where thread_id = %s").format(
+                        sql.Identifier(table)
+                    ),
+                    (ids["thread_id"],),
+                )
+                assert cursor.fetchone()[0] == 0
+
+    @pytest.mark.parametrize("state", [
+        "uploaded", "parsing", "planning", "generating_code", "validating_code",
+        "executing", "repairing", "evaluating",
+    ])
+    def test_active_workflow_blocks_delete(self, alice_client, admin, state):
+        ids = upload(alice_client, build_pdf())
+        admin.table("workflows").update({"status": state}).eq("id", ids["workflow_id"]).execute()
+        response = alice_client.delete(f"/v1/papers/{ids['paper_id']}")
+        assert response.status_code == 409
+        assert alice_client.get(f"/v1/papers/{ids['paper_id']}").status_code == 200
+        admin.table("workflows").update({"status": "failed"}).eq("id", ids["workflow_id"]).execute()
+        assert alice_client.delete(f"/v1/papers/{ids['paper_id']}").status_code == 200
+
+    @pytest.mark.parametrize(
+        "state", ["awaiting_spec_review", "awaiting_plan_approval", "completed"]
+    )
+    def test_inactive_workflow_allows_delete(self, alice_client, admin, state):
+        ids = upload(alice_client, build_pdf())
+        admin.table("workflows").update({"status": state}).eq("id", ids["workflow_id"]).execute()
+        assert alice_client.delete(f"/v1/papers/{ids['paper_id']}").status_code == 200
+
+    def test_delete_is_scoped_to_owner(self, alice_client, bob_headers, admin):
+        ids = upload(alice_client, build_pdf())
+        admin.table("workflows").update({"status": "failed"}).eq("id", ids["workflow_id"]).execute()
+        response = alice_client.delete(f"/v1/papers/{ids['paper_id']}", headers=bob_headers)
+        assert response.status_code == 404
+        assert alice_client.get(f"/v1/papers/{ids['paper_id']}/pdf").status_code == 200
+        assert alice_client.delete(f"/v1/papers/{ids['paper_id']}").status_code == 200
+
+    @pytest.mark.parametrize("resource", ["job", "experiment", "run"])
+    def test_active_legacy_work_blocks_delete(self, alice_client, admin, resource):
+        ids = upload(alice_client, build_pdf())
+        paper_id = ids["paper_id"]
+        admin.table("workflows").update({"status": "failed"}).eq("id", ids["workflow_id"]).execute()
+        if resource == "job":
+            table = "understanding_jobs"
+            row = (
+                admin.table(table).insert({"paper_id": paper_id, "status": "queued"})
+                .execute().data[0]
+            )
+        else:
+            paper = admin.table("papers").select("project_id").eq("id", paper_id).execute().data[0]
+            table = "experiments"
+            row = admin.table(table).insert({
+                "paper_id": paper_id, "project_id": paper["project_id"], "name": "Active test",
+                "status": "running" if resource == "experiment" else "pending",
+            }).execute().data[0]
+            if resource == "run":
+                plan = admin.table("experiment_plans").insert({
+                    "experiment_id": row["id"], "version": 1, "config_json": {}, "budget_json": {},
+                }).execute().data[0]
+                table = "execution_runs"
+                row = admin.table(table).insert({
+                    "experiment_id": row["id"], "plan_id": plan["id"],
+                    "code_version": 1, "status": "queued",
+                }).execute().data[0]
+        assert alice_client.delete(f"/v1/papers/{paper_id}").status_code == 409
+        admin.table(table).update({"status": "failed"}).eq("id", row["id"]).execute()
+        assert alice_client.delete(f"/v1/papers/{paper_id}").status_code == 200
+
+    def test_storage_failure_preserves_records(self, alice_client, admin, monkeypatch):
+        from types import SimpleNamespace
+
+        from reproagent_api.routers import papers
+        from storage3.exceptions import StorageApiError
+
+        ids = upload(alice_client, build_pdf())
+        admin.table("workflows").update({"status": "failed"}).eq("id", ids["workflow_id"]).execute()
+
+        def fail_remove(paths):
+            raise StorageApiError("unavailable", "Storage error", 503)
+
+        fake = SimpleNamespace(
+            table=admin.table,
+            storage=SimpleNamespace(from_=lambda bucket: SimpleNamespace(remove=fail_remove)),
+        )
+        with monkeypatch.context() as patch:
+            patch.setattr(papers, "_admin", lambda request: fake)
+            response = alice_client.delete(f"/v1/papers/{ids['paper_id']}")
+        assert response.status_code == 502, response.text
+        assert alice_client.get(f"/v1/papers/{ids['paper_id']}").status_code == 200
+        assert workflow(alice_client, ids["workflow_id"])["status"] == "failed"
+        assert alice_client.delete(f"/v1/papers/{ids['paper_id']}").status_code == 200
+
+
 class TestOwnershipIsolation:
     async def test_bob_cannot_see_alice_resources(self, settings, alice_client, bob_headers):
         ids = upload(alice_client, build_pdf())

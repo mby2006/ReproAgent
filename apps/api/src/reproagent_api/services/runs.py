@@ -12,20 +12,89 @@ from datetime import UTC, datetime
 from uuid import UUID
 
 from reproagent_schemas import (
+    Assumption,
+    AssumptionKind,
+    BudgetConfig,
     CodeBundle,
+    ConfirmationSource,
     ExperimentPlan,
-    PlanChange,
-    PlanEditRequest,
+    ParamSource,
+    PlanChangeRecord,
     PlanOrigin,
+    ReproductionCard,
     ResourceBudget,
+    ReviewMode,
+    RiskTier,
     RunRequest,
     RunResult,
 )
 
-from .plan_edits import apply_plan_edits
 from .versions import insert_versioned
 
 LOGS_BUCKET = "runs"
+
+
+def project_actor(admin, project_id: str) -> UUID:
+    """Resolve authority from the database, never workflow/queue-supplied user data."""
+    rows = admin.table("projects").select("user_id").eq("id", project_id).execute().data
+    if not rows or not rows[0].get("user_id"):
+        raise ValueError("Project owner is unavailable")
+    return UUID(rows[0]["user_id"])
+
+
+def load_confirmed_card(
+    admin, project_id: str, paper_id: str, spec_id: str | None = None,
+) -> tuple[dict, ReproductionCard, UUID]:
+    actor = project_actor(admin, project_id)
+    papers = (
+        admin.table("papers").select("id").eq("id", paper_id)
+        .eq("project_id", project_id).execute().data
+    )
+    if not papers:
+        raise ValueError("Paper does not belong to the project")
+    query = admin.table("reproduction_specs").select("*").eq("paper_id", paper_id)
+    if spec_id is not None:
+        query = query.eq("id", spec_id)
+    rows = query.order("version", desc=True).limit(1).execute().data
+    if not rows or rows[0].get("status") != "confirmed":
+        raise ValueError("Latest selected Card must be confirmed before planning or execution")
+    row = rows[0]
+    card = ReproductionCard.model_validate(row["spec_json"])
+    if card.review_mode is ReviewMode.DELEGATED and card.delegated_by != actor:
+        raise ValueError("Card delegation does not belong to the project owner")
+    return row, card, actor
+
+
+def load_execution_plan(
+    admin, experiment_id: str, plan_id: str | None = None, *,
+    project_id: str | None = None, paper_id: str | None = None, spec_id: str | None = None,
+) -> tuple[dict, dict, ExperimentPlan, dict, ReproductionCard, UUID]:
+    """Verify ownership and the latest approved plan without replacing an execution pin."""
+    rows = admin.table("experiments").select("*").eq("id", experiment_id).execute().data
+    if not rows:
+        raise ValueError("Experiment is unavailable")
+    experiment = rows[0]
+    for key, expected in (("project_id", project_id), ("paper_id", paper_id), ("spec_id", spec_id)):
+        if expected is not None and experiment.get(key) != expected:
+            raise ValueError("Experiment does not match the selected workflow context")
+    if not experiment.get("spec_id"):
+        raise ValueError("Experiment has no confirmed Card")
+    spec, card, actor = load_confirmed_card(
+        admin, experiment["project_id"], experiment["paper_id"], experiment["spec_id"],
+    )
+    plans = (
+        admin.table("experiment_plans").select("*").eq("experiment_id", experiment_id)
+        .order("version", desc=True).limit(1).execute().data
+    )
+    if not plans or (plan_id is not None and plans[0]["id"] != plan_id):
+        raise ValueError("Selected plan is not the latest experiment plan")
+    row = plans[0]
+    if not row.get("approved_at"):
+        raise ValueError("Latest experiment plan has not been approved")
+    plan = ExperimentPlan.model_validate(row["config_json"])
+    if not plan.approval_ready(actor):
+        raise ValueError("Plan approval or delegated authorization is invalid")
+    return experiment, row, plan, spec, card, actor
 
 
 def insert_code_version(
@@ -164,36 +233,76 @@ async def async_persist_result(
 
 
 def create_oom_plan(
-    admin, experiment_id: str, base_row: dict, run_id: UUID, error: str
+    admin, experiment_id: str, base_row: dict, run_id: UUID, error: str, *,
+    max_replans: int | None = None,
 ) -> dict:
-    plan = ExperimentPlan.model_validate(base_row["config_json"])
-    current_batch = plan.training_config.batch_size.value
-    new_batch = max(1, current_batch // 2)
-    edit = PlanEditRequest(
-        base_version=base_row["version"],
-        changes=[
-            PlanChange(
-                field_path="training_config.batch_size", value=new_batch, human_confirmed=True
-            )
-        ],
-        change_reason=f"OOM retry: reduce batch size {current_batch} -> {new_batch}",
-        origin=PlanOrigin.OOM_RETRY,
-        related_error=error[:2000],
-        related_run_id=run_id,
+    # Lazy import avoids the workflow package's graph/services import cycle.
+    from ..workflow.harness import redact
+
+    _, base_row, plan, _, _, actor = load_execution_plan(admin, experiment_id, base_row["id"])
+    runs = (
+        admin.table("execution_runs").select("id,plan_id").eq("id", str(run_id))
+        .eq("experiment_id", experiment_id).execute().data
     )
-    new_plan, records = apply_plan_edits(plan, edit)
+    if not runs or runs[0]["plan_id"] != base_row["id"]:
+        raise ValueError("OOM repair must use the run's selected plan")
+    previous = (
+        admin.table("experiment_plans").select("id").eq("experiment_id", experiment_id)
+        .eq("related_run_id", str(run_id)).eq("origin", PlanOrigin.OOM_RETRY.value).execute().data
+    )
+    ceiling = BudgetConfig().max_replans
+    if max_replans is not None:
+        ceiling = min(ceiling, max_replans)
+    if len(previous) >= ceiling:
+        raise ValueError("OOM replan budget exhausted")
+    current_batch = plan.training_config.batch_size.value
+    if current_batch <= 1:
+        raise ValueError("OOM batch size cannot be reduced further")
+    new_batch = max(1, current_batch // 2)
+    reason = f"System OOM scaling: reduce batch size {current_batch} -> {new_batch}"
+    delegated = plan.review_mode is ReviewMode.DELEGATED
+    provenance = ConfirmationSource.AUTO if delegated else None
+    data = plan.model_dump(mode="json")
+    data["training_config"]["batch_size"].update(
+        value=new_batch, human_confirmed=False, confirmed_by=provenance,
+        source=ParamSource.INFERRED if delegated else ParamSource.MVP_SCALING,
+        rationale=reason, requires_confirmation=delegated,
+    )
+    path = "training_config.batch_size"
+    prior = next((a for a in plan.assumptions if a.field_path == path), None)
+    # Ordinary system scaling cannot replace a human decision on a critical assumption.
+    if not delegated and prior is not None and prior.risk_tier is RiskTier.CRITICAL:
+        raise ValueError("Critical batch size changes require a new human approval")
+    data["assumptions"] = [a for a in data["assumptions"] if a["field_path"] != path]
+    data["assumptions"].append(Assumption(
+        field_path=path, kind=AssumptionKind.MVP_SCALING, value=new_batch, rationale=reason,
+        requires_confirmation=delegated, human_confirmed=False, confirmed_by=provenance,
+        risk_tier=prior.risk_tier if prior else RiskTier.ROUTINE,
+    ).model_dump(mode="json"))
+    new_plan = ExperimentPlan.model_validate(data)
+    if not new_plan.approval_ready(actor):
+        raise ValueError("OOM scaling cannot bypass remaining approval requirements")
+    records = [PlanChangeRecord(
+        field_path=path, before=current_batch, after=new_batch, confirmed_by=provenance,
+        review_mode=plan.review_mode, actor=None, recommendation_reasoning=reason,
+        recommendation_risk="Bounded batch reduction only; other parameters and scope unchanged",
+    )]
+    if delegated:
+        records.insert(0, PlanChangeRecord(
+            field_path="delegated_authorization",
+            before={"delegated_by": str(plan.delegated_by),
+                    "delegated_at": plan.delegated_at.isoformat()},
+            after={"delegated_by": str(new_plan.delegated_by),
+                   "delegated_at": new_plan.delegated_at.isoformat()},
+            review_mode=plan.review_mode, actor=None,
+            recommendation_reasoning="Inherited existing authorization for bounded OOM scaling",
+        ))
+    safe_error = redact(error)
 
     def next_version() -> int:
-        latest = (
-            admin.table("experiment_plans")
-            .select("version")
-            .eq("experiment_id", experiment_id)
-            .order("version", desc=True)
-            .limit(1)
-            .execute()
-            .data
-        )
-        return latest[0]["version"] + 1 if latest else 1
+        # A concurrent new version must invalidate this repair's approval.
+        load_execution_plan(admin, experiment_id, base_row["id"])
+        return base_row["version"] + 1
 
     def insert(v: int) -> dict:
         row = {
@@ -203,8 +312,8 @@ def create_oom_plan(
             "budget_json": new_plan.runtime_budget.model_dump(mode="json"),
             "origin": PlanOrigin.OOM_RETRY.value,
             "parent_version_id": base_row["id"],
-            "change_reason": edit.change_reason,
-            "related_error": error[:2000],
+            "change_reason": reason,
+            "related_error": safe_error,
             "related_run_id": str(run_id),
             "changes_json": [r.model_dump(mode="json") for r in records],
             "approved_at": datetime.now(UTC).isoformat(),

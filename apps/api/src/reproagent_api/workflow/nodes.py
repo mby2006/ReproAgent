@@ -13,6 +13,7 @@ from uuid import UUID, uuid4
 from reproagent_schemas import (
     ClassifyRequest,
     CodegenRequest,
+    ConfirmationSource,
     ErrorCategory,
     ErrorClassification,
     ExperimentPlan,
@@ -22,24 +23,27 @@ from reproagent_schemas import (
     PlanOrigin,
     PlanRequest,
     RepairRequest,
-    ReproductionCard,
+    ReviewMode,
+    ReviewRequest,
     RunResult,
     RunStatus,
     StaticValidateRequest,
     WorkflowStatus,
 )
 
-from ..services import (
+from ..services.review import validate_review_response
+from ..services.runs import (
     async_persist_result,
-    build_evaluate_request,
     build_run_request,
     create_oom_plan,
     insert_code_version,
-    insert_versioned,
+    load_confirmed_card,
+    load_execution_plan,
     pin_run_files,
 )
+from ..services.versions import insert_versioned
 from .context import WorkflowContext
-from .harness import ensure_llm_budget, record_usages, time_budget_exhausted
+from .harness import BudgetExceeded, ensure_llm_budget, record_usages, redact, time_budget_exhausted
 
 POLL_INTERVAL_SECONDS = 1.0
 TERMINAL_RUN = {RunStatus.SUCCEEDED, RunStatus.FAILED, RunStatus.TIMEOUT, RunStatus.CANCELLED}
@@ -52,7 +56,7 @@ def _now() -> str:
 def _finalize_run(admin, run_id: str, status: str, error: str | None = None) -> None:
     update = {"status": status, "finished_at": _now()}
     if error is not None:
-        update["error"] = error[:2000]
+        update["error"] = redact(error)
     admin.table("execution_runs").update(update).eq("id", run_id).execute()
 
 
@@ -148,16 +152,7 @@ async def human_review(state: dict, ctx: WorkflowContext) -> dict:
 
     updates = ctx.set_status(state, WorkflowStatus.AWAITING_SPEC_REVIEW, "human_review")
     interrupt({"stage": "spec", "spec_version_id": state.get("spec_version_id")})
-    latest = (
-        ctx.admin.table("reproduction_specs")
-        .select("id,version,spec_json")
-        .eq("paper_id", state["paper_id"])
-        .order("version", desc=True)
-        .limit(1)
-        .execute()
-        .data[0]
-    )
-    card = ReproductionCard.model_validate(latest["spec_json"])
+    latest, card, _ = load_confirmed_card(ctx.admin, state["project_id"], state["paper_id"])
     return {
         **updates,
         "card": card,
@@ -169,8 +164,45 @@ async def human_review(state: dict, ctx: WorkflowContext) -> dict:
 
 async def plan_experiment(state: dict, ctx: WorkflowContext) -> dict:
     updates = ctx.set_status(state, WorkflowStatus.PLANNING, "plan_experiment")
-    response = await ctx.agent.plan(PlanRequest(card=state["card"]))
-    plan = response.plan
+    _, card, actor = load_confirmed_card(
+        ctx.admin, state["project_id"], state["paper_id"], state["spec_version_id"],
+    )
+    response = await ctx.agent.plan(PlanRequest(card=card))
+    # Only the persisted Card can authorize review; planner output cannot.
+    data = response.plan.model_dump(mode="json")
+    delegated = card.review_mode is ReviewMode.DELEGATED
+    data.update(review_mode=ReviewMode.ASSISTED if delegated else card.review_mode,
+                delegated_at=None, delegated_by=None)
+    for assumption in data["assumptions"]:
+        if assumption.get("confirmed_by") == ConfirmationSource.AUTO:
+            assumption.update(confirmed_by=None, human_confirmed=False, requires_confirmation=True)
+    for param in data["training_config"].values():
+        if isinstance(param, dict) and param.get("confirmed_by") == ConfirmationSource.AUTO:
+            param.update(confirmed_by=None, human_confirmed=False, requires_confirmation=True)
+    plan = ExperimentPlan.model_validate(data)
+    records = []
+    usages = []
+    budget = state["budget"]
+    if delegated:
+        from ..services.plan_edits import apply_delegated_review
+
+        ensure_llm_budget(state, ctx.budget_config)
+        context = ReviewRequest(card=card, plan=plan, scope=str(actor))
+        try:
+            recommendation = await ctx.agent.recommend(context)
+            usages = recommendation.usages
+            budget = record_usages(state, ctx.budget_config, usages)
+            validate_review_response(context, recommendation, recommend=True)
+            plan, records = apply_delegated_review(
+                plan, recommendation.recommendations, actor=actor, delegated_at=card.delegated_at,
+            )
+        except BudgetExceeded:
+            raise
+        except Exception:
+            # Provider errors may contain credentials; never expose their payloads.
+            raise ValueError("Delegated review failed; retry or switch to manual review") from None
+        if not plan.approval_ready(actor):
+            raise ValueError("Delegated recommendations did not satisfy approval requirements")
     paper = (
         ctx.admin.table("papers")
         .select("title")
@@ -199,17 +231,27 @@ async def plan_experiment(state: dict, ctx: WorkflowContext) -> dict:
                 "config_json": plan.model_dump(mode="json"),
                 "budget_json": plan.runtime_budget.model_dump(mode="json"),
                 "origin": PlanOrigin.GENERATED.value,
+                "changes_json": [record.model_dump(mode="json") for record in records],
+                "approved_at": _now() if delegated else None,
             }
         )
         .execute()
         .data[0]
     )
+    if delegated:
+        ctx.admin.table("experiments").update({"status": "approved"}).eq(
+            "id", str(experiment_id),
+        ).execute()
     return {
         **updates,
         "experiment_id": str(experiment_id),
+        "card": card,
         "plan": plan,
         "plan_id": plan_row["id"],
         "plan_version": 1,
+        "plan_approved": delegated,
+        "budget": budget,
+        "usages": usages,
     }
 
 
@@ -217,19 +259,24 @@ async def human_approve_plan(state: dict, ctx: WorkflowContext) -> dict:
     from langgraph.types import interrupt
 
     updates = ctx.set_status(state, WorkflowStatus.AWAITING_PLAN_APPROVAL, "human_approve_plan")
-    interrupt({"stage": "plan", "experiment_id": state.get("experiment_id")})
-    latest = (
-        ctx.admin.table("experiment_plans")
-        .select("id,version,config_json")
-        .eq("experiment_id", state["experiment_id"])
-        .order("version", desc=True)
-        .limit(1)
-        .execute()
-        .data[0]
-    )
-    plan = ExperimentPlan.model_validate(latest["config_json"])
+    try:
+        _, latest, plan, _, card, _ = load_execution_plan(
+            ctx.admin, state["experiment_id"], project_id=state["project_id"],
+            paper_id=state["paper_id"], spec_id=state["spec_version_id"],
+        )
+        delegated_ready = plan.review_mode is ReviewMode.DELEGATED
+    except ValueError:
+        delegated_ready = False
+    if not delegated_ready:
+        interrupt({"stage": "plan", "experiment_id": state.get("experiment_id")})
+        # A queue resume is merely a wake-up signal, not approval authority.
+        _, latest, plan, _, card, _ = load_execution_plan(
+            ctx.admin, state["experiment_id"], project_id=state["project_id"],
+            paper_id=state["paper_id"], spec_id=state["spec_version_id"],
+        )
     return {
         **updates,
+        "card": card,
         "plan": plan,
         "plan_id": latest["id"],
         "plan_version": latest["version"],
@@ -237,9 +284,31 @@ async def human_approve_plan(state: dict, ctx: WorkflowContext) -> dict:
     }
 
 
+def _selected_execution(state: dict, ctx: WorkflowContext):
+    selected = load_execution_plan(
+        ctx.admin, state["experiment_id"], state["plan_id"],
+        project_id=state["project_id"], paper_id=state["paper_id"],
+        spec_id=state["spec_version_id"],
+    )
+    _, row, plan, spec, card, _ = selected
+    if row["version"] != state["plan_version"] or spec["version"] != state["spec_version"]:
+        raise ValueError("Selected execution versions do not match the checkpoint")
+    if plan != state["plan"] or card != state["card"]:
+        raise ValueError("Selected execution content changed since approval/code generation")
+    if state.get("run_id"):
+        runs = (
+            ctx.admin.table("execution_runs").select("experiment_id")
+            .eq("id", state["run_id"]).execute().data
+        )
+        if not runs or runs[0]["experiment_id"] != state["experiment_id"]:
+            raise ValueError("Run does not belong to the selected experiment")
+    return selected
+
+
 async def generate_code(state: dict, ctx: WorkflowContext) -> dict:
     updates = ctx.set_status(state, WorkflowStatus.GENERATING_CODE, "generate_code")
-    response = await ctx.agent.codegen(CodegenRequest(card=state["card"], plan=state["plan"]))
+    _, _, plan, _, card, _ = _selected_execution(state, ctx)
+    response = await ctx.agent.codegen(CodegenRequest(card=card, plan=plan))
     bundle = response.bundle
     run_id = state.get("run_id")
     if not run_id:
@@ -310,6 +379,8 @@ async def execute_code(state: dict, ctx: WorkflowContext) -> dict:
         result = RunResult(run_id=UUID(run_id), status=RunStatus.CANCELLED, error=error)
         return {**updates, "execution_result": result}
 
+    # A newer draft must stop dispatch, never replace the plan under generated code.
+    _, _, plan, _, _, _ = _selected_execution(state, ctx)
     attempt = state.get("repair_attempt", 0)
     bundle = state["code_bundle"]
     change_reason = (
@@ -346,7 +417,7 @@ async def execute_code(state: dict, ctx: WorkflowContext) -> dict:
         UUID(state["experiment_id"]),
         UUID(state["plan_id"]),
         bundle,
-        state["plan"],
+        plan,
         code_version,
         state["plan_version"],
     )
@@ -392,6 +463,9 @@ async def repair_code(state: dict, ctx: WorkflowContext) -> dict:
     updates = ctx.set_status(state, WorkflowStatus.REPAIRING, "repair_code")
     classification = state["classification"]
     result = state.get("execution_result")
+    _selected_execution(state, ctx)
+    if state["budget"].repair_count >= ctx.budget_config.max_repairs:
+        raise BudgetExceeded("Repair budget exhausted")
     repair = await ctx.agent.repair_code(
         RepairRequest(
             bundle=state["code_bundle"], classification=classification, plan=state["plan"]
@@ -404,6 +478,10 @@ async def repair_code(state: dict, ctx: WorkflowContext) -> dict:
     plan_version = state["plan_version"]
     bundle = repair.bundle
     if repair.replan_required:
+        if classification.category is not ErrorCategory.OUT_OF_MEMORY:
+            raise ValueError("Only bounded OOM scaling can replan automatically")
+        if budget.replan_count >= ctx.budget_config.max_replans:
+            raise BudgetExceeded("OOM replan budget exhausted")
         plan_row = (
             ctx.admin.table("experiment_plans")
             .select("*")
@@ -418,17 +496,23 @@ async def repair_code(state: dict, ctx: WorkflowContext) -> dict:
             plan_row,
             UUID(state["run_id"]),
             (result.error if result is not None else None) or classification.reason,
+            max_replans=ctx.budget_config.max_replans,
         )
         plan = ExperimentPlan.model_validate(new_row["config_json"])
         plan_id = new_row["id"]
         plan_version = new_row["version"]
         budget.replan_count += 1
-        bundle = (await ctx.agent.codegen(CodegenRequest(card=state["card"], plan=plan))).bundle
+        _, _, plan, _, card, _ = load_execution_plan(
+            ctx.admin, state["experiment_id"], plan_id, project_id=state["project_id"],
+            paper_id=state["paper_id"], spec_id=state["spec_version_id"],
+        )
+        bundle = (await ctx.agent.codegen(CodegenRequest(card=card, plan=plan))).bundle
     return {
         **updates,
         "code_bundle": bundle,
         "code_version": state["code_version"] + 1,
         "repair_attempt": state.get("repair_attempt", 0) + 1,
+        "replan_count": budget.replan_count,
         "plan": plan,
         "plan_id": plan_id,
         "plan_version": plan_version,
@@ -437,6 +521,8 @@ async def repair_code(state: dict, ctx: WorkflowContext) -> dict:
 
 
 async def evaluate_result(state: dict, ctx: WorkflowContext) -> dict:
+    from ..services.reports import build_evaluate_request
+
     updates = ctx.set_status(state, WorkflowStatus.EVALUATING, "evaluate_result")
     request = build_evaluate_request(ctx.admin, state["run_id"])
     response = await ctx.agent.evaluate(request)

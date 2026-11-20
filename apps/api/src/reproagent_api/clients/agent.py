@@ -6,6 +6,7 @@ from reproagent_schemas import (
     ErrorClassification,
     EvaluateRequest,
     EvaluateResponse,
+    ExplainResponse,
     ExtractRequest,
     ExtractResponse,
     GroundRequest,
@@ -15,9 +16,11 @@ from reproagent_schemas import (
     ParseResponse,
     PlanRequest,
     PlanResponse,
+    RecommendResponse,
     RepairRequest,
     RepairResponse,
     ReproductionRequest,
+    ReviewRequest,
     StaticValidateRequest,
     UnderstandRequest,
     UnderstandResponse,
@@ -74,6 +77,20 @@ class AgentClient:
         )
         response.raise_for_status()
         return GroundResponse.model_validate(response.json())
+
+    async def explain(self, request: ReviewRequest) -> ExplainResponse:
+        response = await self._client.post(
+            "/v1/explain", json=request.model_dump(mode="json", by_alias=True), timeout=120.0
+        )
+        response.raise_for_status()
+        return ExplainResponse.model_validate(response.json())
+
+    async def recommend(self, request: ReviewRequest) -> RecommendResponse:
+        response = await self._client.post(
+            "/v1/recommend", json=request.model_dump(mode="json", by_alias=True), timeout=120.0
+        )
+        response.raise_for_status()
+        return RecommendResponse.model_validate(response.json())
 
     async def plan(self, request: PlanRequest) -> PlanResponse:
         response = await self._client.post(

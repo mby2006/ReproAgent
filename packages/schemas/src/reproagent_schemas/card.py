@@ -1,8 +1,11 @@
 """Reproduction Card: human-facing structured understanding of a paper."""
 
-from pydantic import Field
+from datetime import datetime
+from uuid import UUID
 
-from .common import SchemaModel
+from pydantic import Field, model_validator
+
+from .common import ReviewDecision, ReviewMode, SchemaModel, check_delegation
 from .evidence import EvidenceField
 
 
@@ -16,6 +19,17 @@ class Baseline(EvidenceField[str]):
 
 
 class ReproductionCard(SchemaModel):
+    review_mode: ReviewMode = ReviewMode.ASSISTED
+    delegated_at: datetime | None = None
+    delegated_by: UUID | None = None
+    review_decisions: list[ReviewDecision] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def check_authorization(self) -> "ReproductionCard":
+        check_delegation(self.review_mode, self.delegated_at, self.delegated_by)
+        return self
+
+    review_selection_threshold: float | None = Field(default=None, ge=0, le=1)
     method: EvidenceField[str]
     model_architecture: EvidenceField[str]
     dataset: EvidenceField[str]

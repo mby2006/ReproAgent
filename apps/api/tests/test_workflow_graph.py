@@ -7,6 +7,7 @@ Real PDF parse / grounding / MNIST execution are covered by the integration E2E.
 """
 
 import json
+from datetime import UTC, datetime
 from uuid import uuid4
 
 import httpx
@@ -32,9 +33,14 @@ from reproagent_schemas import (
     BudgetState,
     ErrorCategory,
     ErrorClassification,
+    ExperimentPlan,
+    FieldRecommendation,
     LLMUsage,
     ParsedDocument,
+    RecommendResponse,
     ReproductionCard,
+    ReviewMode,
+    ReviewRequest,
     RunStatus,
     TextBlock,
     WorkflowStatus,
@@ -116,6 +122,7 @@ def workflow_agent_transport(
 
 def seed_workflow() -> dict:
     return {
+        "projects": [{"id": str(PROJECT_ID), "user_id": str(USER_ID)}],
         "papers": [
             {
                 "id": str(PAPER_ID),
@@ -178,8 +185,10 @@ async def _run_full_flow(ctx, admin, saver):
     state = _state(admin)
     await start_workflow(ctx, saver, state)
     assert _workflow(admin)["status"] == WorkflowStatus.AWAITING_SPEC_REVIEW.value
+    admin.tables["reproduction_specs"][-1]["status"] = "confirmed"
     await resume_workflow(ctx, saver, THREAD_ID, {"stage": "spec"}, state)
     assert _workflow(admin)["status"] == WorkflowStatus.AWAITING_PLAN_APPROVAL.value
+    admin.tables["experiment_plans"][-1]["approved_at"] = "2026-01-01T00:00:00+00:00"
     await resume_workflow(ctx, saver, THREAD_ID, {"stage": "plan"}, state)
 
 
@@ -564,3 +573,233 @@ async def test_execute_code_skips_run_cancelled_while_queued():
     assert result["execution_result"].status is RunStatus.CANCELLED
     assert admin.tables["execution_runs"][0]["status"] == "cancelled"
     assert admin.tables["generated_files"] == []
+
+
+def _confirm_delegated_card(admin, *, actor=USER_ID):
+    from reproagent_api.services.card_edits import delegate_card
+
+    base = admin.tables["reproduction_specs"][-1]
+    card = ReproductionCard.model_validate(base["spec_json"])
+    # Missing learning rate remains missing in the authorized Card; only the
+    # later validated Plan recommendation may propose an executable value.
+    card.hyperparameters.pop("learning_rate", None)
+    card.optimizer = card.optimizer.model_validate({"status": "missing", "value": None})
+    card = delegate_card(card, actor=actor)
+    row = {**base, "id": str(uuid4()), "version": base["version"] + 1,
+           "status": "confirmed", "spec_json": card.model_dump(mode="json")}
+    admin.tables["reproduction_specs"].append(row)
+    return row
+
+
+def _recommend_transport(seen, failure=None):
+    base = workflow_agent_transport()
+
+    def handler(request):
+        if request.url.path != "/v1/recommend":
+            return base.handle_request(request)
+        context = ReviewRequest.model_validate(json.loads(request.content))
+        seen.append(context)
+        if failure == "provider":
+            raise RuntimeError("provider leaked sk-abcdefghijklmnopqrstuvwx")
+        fields = context.review_fields()
+        recommendations = [FieldRecommendation(
+            id=str(uuid4()), field_path=f.field_path, action="accept", suggested_value=f.value,
+            confidence=0.95, reasoning="Validated bounded proposal", risk="Check convergence",
+        ) for f in fields]
+        response = RecommendResponse(
+            context_hash=context.context_hash(), recommendations=recommendations,
+            usages=[LLMUsage(model_name="review-stub", prompt_tokens=20,
+                             completion_tokens=10, total_tokens=30)],
+        )
+        if failure == "context":
+            response.context_hash = "0" * 64
+        elif failure == "missing":
+            response.recommendations = []
+        elif failure == "accept_value":
+            response.recommendations[0].suggested_value = 999
+        elif failure == "duplicate_id":
+            for recommendation in response.recommendations:
+                recommendation.id = "duplicate"
+        elif failure == "preselection":
+            response.preselected_paths = ["training_config.learning_rate"]
+        return httpx.Response(200, json=response.model_dump(mode="json"))
+
+    return httpx.MockTransport(handler)
+
+
+@pytest.mark.asyncio
+async def test_delegated_card_recommends_approves_skips_plan_gate_and_executes():
+    admin = FakeAdmin(seed_workflow(), {str(PROJECT_ID): str(USER_ID)})
+    ctx = make_context(admin, [make_result(RunStatus.SUCCEEDED, 0, metrics={"metric_value": 0.9})])
+    saver = make_memory_checkpointer()
+    seen = []
+    try:
+        await start_workflow(ctx, saver, _state(admin))
+        card_row = _confirm_delegated_card(admin)
+        await ctx.agent.aclose()
+        ctx.agent = AgentClient(ctx.settings, transport=_recommend_transport(seen))
+        await resume_workflow(ctx, saver, THREAD_ID, {"stage": "spec"}, _state(admin))
+    finally:
+        await ctx.agent.aclose()
+        await ctx.runner.aclose()
+    assert _workflow(admin)["status"] == "completed"
+    assert len(seen) == 1 and seen[0].scope == str(USER_ID)
+    assert seen[0].card.model_dump(mode="json") == card_row["spec_json"]
+    row = admin.tables["experiment_plans"][0]
+    assert row["version"] == 1 and row["approved_at"]
+    plan = ExperimentPlan.model_validate(row["config_json"])
+    assert plan.delegated_by == USER_ID
+    assert plan.delegated_at == seen[0].card.delegated_at
+    assert plan.approval_ready(USER_ID) and plan.unconfirmed_critical()
+    param = plan.training_config.learning_rate
+    assert param.confirmed_by.value == "auto" and not param.human_confirmed
+    assert param.source.value == "inferred" and param.requires_confirmation
+    assert {r["field_path"] for r in row["changes_json"]} >= {
+        "review_mode", "training_config.learning_rate",
+    }
+    assert len(admin.tables["execution_runs"]) == 1
+    assert _workflow(admin)["budget_json"]["llm_calls"] == 2
+    assert _workflow(admin)["budget_json"]["total_tokens"] == 180
+    review_trace = next(t for t in admin.tables["agent_traces"]
+                        if t["node_name"] == "plan_experiment")
+    assert review_trace["token_usage"]["total_tokens"] == 30
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", [
+    "provider", "context", "missing", "accept_value", "duplicate_id", "preselection",
+])
+async def test_delegated_recommendation_failure_never_approves_or_executes(failure):
+    admin = FakeAdmin(seed_workflow(), {str(PROJECT_ID): str(USER_ID)})
+    ctx = make_context(admin, [])
+    saver = make_memory_checkpointer()
+    try:
+        await start_workflow(ctx, saver, _state(admin))
+        _confirm_delegated_card(admin)
+        await ctx.agent.aclose()
+        ctx.agent = AgentClient(ctx.settings, transport=_recommend_transport([], failure))
+        await resume_workflow(ctx, saver, THREAD_ID, {"stage": "spec"}, _state(admin))
+    finally:
+        await ctx.agent.aclose()
+        await ctx.runner.aclose()
+    assert _workflow(admin)["status"] == "failed"
+    assert admin.tables["experiment_plans"] == []
+    assert admin.tables["experiments"] == []
+    assert admin.tables["execution_runs"] == []
+    assert "sk-" not in json.dumps(admin.tables)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("problem", ["draft", "wrong_owner", "wrong_project"])
+async def test_spec_resume_rechecks_database_authority(problem):
+    admin = FakeAdmin(seed_workflow(), {str(PROJECT_ID): str(USER_ID)})
+    ctx = make_context(admin, [])
+    saver = make_memory_checkpointer()
+    try:
+        await start_workflow(ctx, saver, _state(admin))
+        if problem == "wrong_owner":
+            _confirm_delegated_card(admin, actor=uuid4())
+        elif problem == "wrong_project":
+            admin.tables["reproduction_specs"][-1]["status"] = "confirmed"
+            admin.tables["papers"][0]["project_id"] = str(uuid4())
+        await resume_workflow(ctx, saver, THREAD_ID, {"stage": "spec"}, _state(admin))
+    finally:
+        await ctx.agent.aclose()
+        await ctx.runner.aclose()
+    assert _workflow(admin)["status"] == "failed"
+    assert admin.tables["experiment_plans"] == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", [ReviewMode.EXPERT, ReviewMode.ASSISTED])
+async def test_ordinary_modes_interrupt_and_recheck_plan_approval(mode):
+    admin = FakeAdmin(seed_workflow(), {str(PROJECT_ID): str(USER_ID)})
+    ctx = make_context(admin, [])
+    saver = make_memory_checkpointer()
+    try:
+        await start_workflow(ctx, saver, _state(admin))
+        spec = admin.tables["reproduction_specs"][-1]
+        spec["status"] = "confirmed"
+        spec["spec_json"]["review_mode"] = mode.value
+        await resume_workflow(ctx, saver, THREAD_ID, {"stage": "spec"}, _state(admin))
+        assert _workflow(admin)["status"] == "awaiting_plan_approval"
+        assert admin.tables["experiment_plans"][0]["config_json"]["review_mode"] == mode.value
+        # An untrusted resume does not substitute for approval persisted by API.
+        await resume_workflow(ctx, saver, THREAD_ID, {"stage": "plan"}, _state(admin))
+    finally:
+        await ctx.agent.aclose()
+        await ctx.runner.aclose()
+    assert _workflow(admin)["status"] == "failed"
+    assert admin.tables["execution_runs"] == []
+
+
+@pytest.mark.asyncio
+async def test_agent_cannot_delegate_an_ordinary_card():
+    admin = FakeAdmin(seed_workflow(), {str(PROJECT_ID): str(USER_ID)})
+    ctx = make_context(admin, [])
+    saver = make_memory_checkpointer()
+    base = workflow_agent_transport()
+
+    def forged(request):
+        response = base.handle_request(request)
+        if request.url.path == "/v1/plan":
+            body = response.json()
+            body["plan"].update(review_mode="delegated", delegated_by=str(USER_ID),
+                                delegated_at=datetime.now(UTC).isoformat())
+            return httpx.Response(200, json=body)
+        return response
+
+    try:
+        await start_workflow(ctx, saver, _state(admin))
+        admin.tables["reproduction_specs"][-1]["status"] = "confirmed"
+        await ctx.agent.aclose()
+        ctx.agent = AgentClient(ctx.settings, transport=httpx.MockTransport(forged))
+        await resume_workflow(ctx, saver, THREAD_ID, {"stage": "spec"}, _state(admin))
+    finally:
+        await ctx.agent.aclose()
+        await ctx.runner.aclose()
+    assert _workflow(admin)["status"] == "awaiting_plan_approval"
+    row = admin.tables["experiment_plans"][0]
+    assert row["approved_at"] is None
+    assert row["config_json"]["review_mode"] == "assisted"
+    assert row["config_json"]["delegated_by"] is None
+    assert admin.tables["execution_runs"] == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("config,expected_calls", [
+    (BudgetConfig(max_llm_calls=1), 0),
+    (BudgetConfig(max_total_tokens=160), 1),
+])
+async def test_delegated_review_respects_call_and_token_budgets(config, expected_calls):
+    admin = FakeAdmin(seed_workflow(), {str(PROJECT_ID): str(USER_ID)})
+    ctx = make_context(admin, [], budget_config=config)
+    saver = make_memory_checkpointer()
+    seen = []
+    try:
+        await start_workflow(ctx, saver, _state(admin))
+        _confirm_delegated_card(admin)
+        await ctx.agent.aclose()
+        ctx.agent = AgentClient(ctx.settings, transport=_recommend_transport(seen))
+        await resume_workflow(ctx, saver, THREAD_ID, {"stage": "spec"}, _state(admin))
+    finally:
+        await ctx.agent.aclose()
+        await ctx.runner.aclose()
+    assert _workflow(admin)["status"] == "failed"
+    assert "budget exhausted" in _workflow(admin)["error"]
+    assert len(seen) == expected_calls
+    assert admin.tables["experiments"] == []
+    assert admin.tables["experiment_plans"] == []
+    assert admin.tables["execution_runs"] == []
+
+
+def test_trace_and_workflow_errors_are_redacted():
+    admin = FakeAdmin(seed_workflow(), {str(PROJECT_ID): str(USER_ID)})
+    ctx = WorkflowContext(admin, None, None, None)
+    secret = "provider sk-abcdefghijklmnopqrstuvwx sb_secret_abcdef"
+    ctx.write_trace(_state(admin), "plan_experiment", {"error": secret}, {"error": secret},
+                    1, None, None, secret, 0)
+    ctx.persist_workflow(_state(admin), {"error": secret}, "plan_experiment")
+    ctx.finalize_workflow(_state(admin), WorkflowStatus.FAILED, secret)
+    assert "sk-" not in json.dumps(admin.tables)
+    assert "sb_secret_" not in json.dumps(admin.tables)

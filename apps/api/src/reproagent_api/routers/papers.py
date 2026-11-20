@@ -7,20 +7,36 @@ from urllib.parse import urlparse
 from uuid import UUID, uuid4
 
 import httpx
+import psycopg
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile, status
+from psycopg import sql
+from psycopg.rows import dict_row
 from reproagent_schemas import (
+    CardConfirmBatchRequest,
     CardEditRequest,
+    CardExplainRequest,
     CardVersion,
+    ConfirmationSource,
+    DelegateReviewRequest,
+    ExplainResponse,
+    FieldEdit,
     PaperSource,
     PaperStatus,
     ReproductionCard,
+    ReviewDecision,
+    ReviewMode,
+    ReviewModeRequest,
+    ReviewRequest,
     SchemaModel,
     SpecOrigin,
 )
+from storage3.exceptions import StorageApiError
 
 from ..auth import get_current_user_id
 from ..clients.supabase import make_service_client
 from ..services import EditError, apply_edits, insert_versioned
+from ..services.card_edits import delegate_card
+from ..services.review import generate_review
 
 router = APIRouter(prefix="/v1", tags=["papers"])
 
@@ -313,6 +329,86 @@ async def get_paper(
     return PaperSummary.model_validate(rows[0])
 
 
+@router.delete("/papers/{paper_id}")
+def delete_paper(
+    request: Request, paper_id: UUID, user_id: Annotated[UUID, Depends(get_current_user_id)]
+) -> dict[str, str]:
+    admin = _admin(request)
+    _get_paper(admin, paper_id, user_id)
+    settings = request.app.state.settings
+    try:
+        with psycopg.connect(settings.supabase_db_url, row_factory=dict_row) as conn:
+            # Keep new work and status transitions blocked until deletion commits.
+            paper = conn.execute(
+                "select pa.* from public.papers pa "
+                "join public.projects pr on pr.id = pa.project_id "
+                "where pa.id = %s and pr.user_id = %s for update of pa",
+                (paper_id, user_id),
+            ).fetchone()
+            if paper is None:
+                raise HTTPException(status.HTTP_404_NOT_FOUND, "Paper not found")
+            workflows = conn.execute(
+                "select status, thread_id from public.workflows where paper_id = %s for update",
+                (paper_id,),
+            ).fetchall()
+            inactive = {"awaiting_spec_review", "awaiting_plan_approval", "completed", "failed"}
+            if any(w["status"] not in inactive for w in workflows):
+                raise HTTPException(status.HTTP_409_CONFLICT, "论文工作流正在运行，请完成后再删除")
+            jobs = conn.execute(
+                "select status from public.understanding_jobs where paper_id = %s for update",
+                (paper_id,),
+            ).fetchall()
+            if any(j["status"] in {"queued", "running"} for j in jobs):
+                raise HTTPException(status.HTTP_409_CONFLICT, "PDF 正在解析，请完成后再删除")
+            experiments = conn.execute(
+                "select id, status from public.experiments where paper_id = %s for update",
+                (paper_id,),
+            ).fetchall()
+            if any(e["status"] in {"planning", "running"} for e in experiments):
+                raise HTTPException(status.HTTP_409_CONFLICT, "关联实验正在运行，请完成后再删除")
+            runs = conn.execute(
+                "select id, status from public.execution_runs "
+                "where experiment_id = any(%s) for update",
+                ([e["id"] for e in experiments],),
+            ).fetchall()
+            if any(r["status"] in {"queued", "running"} for r in runs):
+                raise HTTPException(status.HTTP_409_CONFLICT, "关联实验正在运行，请完成后再删除")
+            objects = conn.execute(
+                "select name from storage.objects "
+                "where bucket_id = 'runs' and split_part(name, '/', 1) = any(%s)",
+                ([str(r["id"]) for r in runs],),
+            ).fetchall()
+            thread_ids = [w["thread_id"] for w in workflows]
+            if thread_ids:
+                for table in ("checkpoint_writes", "checkpoint_blobs", "checkpoints"):
+                    exists = conn.execute(
+                        "select to_regclass(%s) as name", (f"public.{table}",)
+                    ).fetchone()["name"]
+                    if exists:
+                        conn.execute(
+                            sql.SQL("delete from {} where thread_id = any(%s)").format(
+                                sql.Identifier("public", table)
+                            ),
+                            (thread_ids,),
+                        )
+            # Check FK cascades before touching files; storage errors roll back database changes.
+            conn.execute("delete from public.papers where id = %s", (paper_id,))
+            paths = [obj["name"] for obj in objects]
+            for offset in range(0, len(paths), 100):
+                admin.storage.from_("runs").remove(paths[offset : offset + 100])
+            if paper["pdf_path"]:
+                admin.storage.from_("papers").remove([paper["pdf_path"]])
+    except psycopg.errors.ForeignKeyViolation as exc:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT, "论文仍被其他记录引用，无法删除"
+        ) from exc
+    except (StorageApiError, httpx.HTTPError) as exc:
+        raise HTTPException(
+            status.HTTP_502_BAD_GATEWAY, "删除存储文件失败，请重试"
+        ) from exc
+    return {"paper_id": str(paper_id), "status": "deleted"}
+
+
 @router.get("/papers/{paper_id}/pdf", response_model=SignedPdfUrl)
 async def get_pdf_url(
     request: Request, paper_id: UUID, user_id: Annotated[UUID, Depends(get_current_user_id)]
@@ -396,7 +492,9 @@ async def edit_card(
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Base version not found")
     base = base_rows[0]
     try:
-        edited = apply_edits(ReproductionCard.model_validate(base["spec_json"]), body)
+        edited = apply_edits(
+            ReproductionCard.model_validate(base["spec_json"]), body, actor=user_id,
+        )
     except EditError as exc:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)) from exc
 
@@ -433,6 +531,112 @@ async def edit_card(
     return _to_card_version(inserted[0])
 
 
+def _card_review_context(admin, paper_id: UUID, version: int, user_id: UUID):
+    _get_paper(admin, paper_id, user_id)
+    rows = (
+        admin.table("reproduction_specs").select(VERSION_COLUMNS)
+        .eq("paper_id", str(paper_id)).eq("version", version).execute().data
+    )
+    if not rows:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Card version not found")
+    return rows[0], ReviewRequest(
+        card=ReproductionCard.model_validate(rows[0]["spec_json"]), scope=str(user_id),
+    )
+
+
+@router.post("/papers/{paper_id}/card/explain", response_model=ExplainResponse)
+async def explain_card(
+    request: Request, paper_id: UUID, body: CardExplainRequest,
+    user_id: Annotated[UUID, Depends(get_current_user_id)],
+) -> ExplainResponse:
+    _, context = _card_review_context(_admin(request), paper_id, body.base_version, user_id)
+    context.field_paths = body.field_paths
+    return await generate_review(request, context)
+
+
+@router.post(
+    "/papers/{paper_id}/card/confirm-batch", response_model=CardVersion,
+    status_code=status.HTTP_201_CREATED,
+)
+async def confirm_card_batch(
+    request: Request, paper_id: UUID, body: CardConfirmBatchRequest,
+    user_id: Annotated[UUID, Depends(get_current_user_id)],
+) -> CardVersion:
+    admin = _admin(request)
+    base, context = _card_review_context(admin, paper_id, body.base_version, user_id)
+
+    def next_version() -> int:
+        rows = (
+            admin.table("reproduction_specs").select("id,version")
+            .eq("paper_id", str(paper_id)).order("version", desc=True).limit(1).execute().data
+        )
+        if not rows or rows[0]["id"] != base["id"]:
+            raise HTTPException(status.HTTP_409_CONFLICT, "理解卡版本已变化，请刷新后重新审核")
+        return rows[0]["version"] + 1
+
+    next_version()
+    if context.context_hash() != body.context_hash:
+        raise HTTPException(status.HTTP_409_CONFLICT, "解释上下文已变化，请重新获取")
+    response = await generate_review(request, context)
+    if (
+        len(set(body.field_paths)) != len(body.field_paths)
+        or set(body.field_paths) - set(response.preselected_paths)
+    ):
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "只能批量确认高置信常规推断项")
+    fields = {field.field_path: field for field in context.review_fields()}
+    edited = apply_edits(
+        context.card, CardEditRequest(
+            base_version=body.base_version, review_mode=body.review_mode,
+            edits=[
+                FieldEdit(field_path=path, value=fields[path].value) for path in body.field_paths
+            ],
+        ), confirmed_by=ConfirmationSource.AI_ASSISTED, actor=user_id,
+    )
+    edited.review_selection_threshold = response.selection_threshold
+
+    def insert(v: int) -> dict:
+        return admin.table("reproduction_specs").insert({
+            "paper_id": str(paper_id), "version": v, "origin": SpecOrigin.USER_EDIT.value,
+            "parent_version_id": base["id"], "spec_json": edited.model_dump(mode="json"),
+            "status": base["status"],
+        }).execute().data[0]
+
+    return _to_card_version(insert_versioned(next_version, insert))
+
+
+@router.post(
+    "/papers/{paper_id}/card/delegate", response_model=CardVersion,
+    status_code=status.HTTP_201_CREATED,
+)
+async def delegate_card_review(
+    request: Request, paper_id: UUID, body: DelegateReviewRequest,
+    user_id: Annotated[UUID, Depends(get_current_user_id)],
+) -> CardVersion:
+    admin = _admin(request)
+    base, context = _card_review_context(admin, paper_id, body.base_version, user_id)
+
+    def next_version() -> int:
+        rows = (
+            admin.table("reproduction_specs").select("id,version")
+            .eq("paper_id", str(paper_id)).order("version", desc=True).limit(1).execute().data
+        )
+        if not rows or rows[0]["id"] != base["id"]:
+            raise HTTPException(status.HTTP_409_CONFLICT, "理解卡版本已变化，请刷新后重新授权")
+        return rows[0]["version"] + 1
+
+    next_version()
+    card = delegate_card(context.card, actor=user_id)
+    row = insert_versioned(
+        next_version,
+        lambda v: admin.table("reproduction_specs").insert({
+            "paper_id": str(paper_id), "version": v, "origin": SpecOrigin.USER_EDIT.value,
+            "parent_version_id": base["id"], "spec_json": card.model_dump(mode="json"),
+            "status": "confirmed",
+        }).execute().data[0],
+    )
+    return _to_card_version(row)
+
+
 @router.post(
     "/papers/{paper_id}/reparse",
     response_model=PaperUploadResponse,
@@ -461,6 +665,7 @@ async def confirm_card(
     request: Request,
     paper_id: UUID,
     user_id: Annotated[UUID, Depends(get_current_user_id)],
+    body: ReviewModeRequest | None = None,
 ) -> CardVersion:
     """Confirm the latest card as-is (no edits), creating a confirmed version."""
     admin = _admin(request)
@@ -478,18 +683,35 @@ async def confirm_card(
         raise HTTPException(status.HTTP_404_NOT_FOUND, "No reproduction card to confirm")
     base = latest[0]
     card = ReproductionCard.model_validate(base["spec_json"])
+    previous_mode = card.review_mode
+    card.review_mode = body.review_mode if body else (
+        ReviewMode.ASSISTED if previous_mode is ReviewMode.DELEGATED else previous_mode
+    )
+    card.delegated_at = None
+    card.delegated_by = None
+    card.review_decisions = [ReviewDecision(
+        field_path="card.status", before=base["status"], after="confirmed",
+        confirmed_by=ConfirmationSource.HUMAN, review_mode=card.review_mode, actor=user_id,
+    )]
+    if previous_mode != card.review_mode:
+        card.review_decisions.append(ReviewDecision(
+            field_path="review_mode", before=previous_mode, after=card.review_mode,
+            review_mode=card.review_mode, actor=user_id,
+        ))
 
     def next_version() -> int:
         rows = (
             admin.table("reproduction_specs")
-            .select("version")
+            .select("id,version")
             .eq("paper_id", str(paper_id))
             .order("version", desc=True)
             .limit(1)
             .execute()
             .data
         )
-        return rows[0]["version"] + 1 if rows else 1
+        if not rows or rows[0]["id"] != base["id"]:
+            raise HTTPException(status.HTTP_409_CONFLICT, "理解卡版本已变化，请刷新后重新确认")
+        return rows[0]["version"] + 1
 
     def insert(v: int) -> list:
         return (

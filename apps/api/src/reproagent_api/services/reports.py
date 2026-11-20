@@ -17,6 +17,8 @@ from reproagent_schemas import (
     RunStatus,
 )
 
+from .review_audit import collect_review_decisions
+
 
 def build_evaluate_request(admin, run_id: str) -> EvaluateRequest:
     run = admin.table("execution_runs").select("*").eq("id", run_id).single().execute().data
@@ -32,6 +34,7 @@ def build_evaluate_request(admin, run_id: str) -> EvaluateRequest:
         admin.table("experiment_plans")
         .select("*")
         .eq("id", run["plan_id"])
+        .eq("experiment_id", experiment["id"])
         .single()
         .execute()
         .data
@@ -40,6 +43,7 @@ def build_evaluate_request(admin, run_id: str) -> EvaluateRequest:
         admin.table("reproduction_specs")
         .select("id,version,spec_json")
         .eq("id", experiment["spec_id"])
+        .eq("paper_id", experiment["paper_id"])
         .single()
         .execute()
         .data
@@ -81,6 +85,13 @@ def build_evaluate_request(admin, run_id: str) -> EvaluateRequest:
         .data
     ]
     audit = RunAudit.model_validate(run["audit_json"]) if run.get("audit_json") else None
+    review_decisions = collect_review_decisions(
+        admin,
+        paper_id=str(experiment["paper_id"]),
+        experiment_id=str(experiment["id"]),
+        spec_id=str(spec_row["id"]),
+        plan_id=str(plan_row["id"]),
+    )
     references = ReportReferences(
         paper_id=experiment["paper_id"],
         spec_version_id=spec_row["id"],
@@ -92,9 +103,11 @@ def build_evaluate_request(admin, run_id: str) -> EvaluateRequest:
         code_hash=run.get("code_hash"),
         run_id=run_id,
         generated_file_ids=file_ids,
+        review_trace_ids=[decision.id for decision in review_decisions],
     )
     return EvaluateRequest(
         references=references,
+        review_decisions=review_decisions,
         card=ReproductionCard.model_validate(spec_row["spec_json"]),
         plan=ExperimentPlan.model_validate(plan_row["config_json"]),
         paper_title=paper["title"],

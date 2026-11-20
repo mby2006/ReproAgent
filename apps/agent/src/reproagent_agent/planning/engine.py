@@ -29,7 +29,14 @@ from reproagent_schemas import (
     TrainingConfig,
 )
 
-from .assumptions import as_float, as_int, normalize_optimizer, param_from_evidence
+from .assumptions import (
+    as_float,
+    as_int,
+    confirmation_source,
+    inferred_source,
+    normalize_optimizer,
+    param_from_evidence,
+)
 from .scaling import (
     MNIST_FULL_TEST,
     MNIST_FULL_TRAIN,
@@ -74,6 +81,8 @@ def _build_optimizer(card: ReproductionCard, assumptions: list[Assumption]) -> P
             evidence_quote=field.evidence_quote,
             source_page=field.source_page,
             human_confirmed=field.human_confirmed,
+            confirmed_by=confirmation_source(field),
+            confidence=field.confidence,
         )
     if (
         field.status in (EvidenceStatus.PAPER_EXPLICIT, EvidenceStatus.PAPER_DESCRIBED)
@@ -186,24 +195,14 @@ def _preprocessing(card: ReproductionCard, assumptions: list[Assumption]) -> Pre
     for key, field in card.data_preprocessing.items():
         if field.status is EvidenceStatus.MISSING or field.value is None:
             continue
-        # Prose-described preprocessing is paper-backed: either the new
-        # paper_described status, or a legacy inferred field whose quote was
-        # located in the paper (grounding assigns quote + page). Both carry real
-        # evidence, so they are shown with their quote and need no confirmation.
         paper_backed = field.status in (
             EvidenceStatus.PAPER_EXPLICIT,
             EvidenceStatus.PAPER_DESCRIBED,
-        ) or (
-            field.status is EvidenceStatus.INFERRED
-            and field.evidence_quote
-            and field.source_page is not None
         )
         if paper_backed:
             source = ParamSource.PAPER_EXPLICIT
-        elif field.human_confirmed:
-            source = ParamSource.HUMAN_CONFIRMED
         else:
-            source = ParamSource.INFERRED
+            source = inferred_source(field)
         steps.append(
             PreprocessingStep(
                 name=key,
@@ -212,17 +211,23 @@ def _preprocessing(card: ReproductionCard, assumptions: list[Assumption]) -> Pre
                 rationale=None if source is ParamSource.PAPER_EXPLICIT else "理解阶段推断/确认",
             )
         )
-        if source is ParamSource.INFERRED:
+        if not paper_backed:
+            # Step confirmation provenance lives on its corresponding assumption.
             assumptions.append(
                 Assumption(
                     field_path=f"preprocessing_config.{key}",
                     kind=AssumptionKind.INFERRED,
                     value=str(field.value),
                     rationale="预处理步骤为推断值，论文未直接说明",
-                    requires_confirmation=True,
+                    requires_confirmation=not field.human_confirmed,
+                    human_confirmed=field.human_confirmed,
+                    confirmed_by=confirmation_source(field),
+                    confidence=field.confidence,
                     risk_tier=RiskTier.ROUTINE,
                     auto_acceptable=True,
                     card_status=field.status,
+                    evidence_quote=field.evidence_quote,
+                    source_page=field.source_page,
                 )
             )
     if not steps:
@@ -409,6 +414,9 @@ def build_plan(card: ReproductionCard, scaling: ScalingConfig | None = None) -> 
     )
 
     return ExperimentPlan(
+        review_mode=card.review_mode,
+        delegated_at=card.delegated_at,
+        delegated_by=card.delegated_by,
         scaling_profile=SCALING_PROFILE,
         rationale=rationale,
         dataset_config=dataset_config,

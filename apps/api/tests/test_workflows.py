@@ -9,7 +9,7 @@ from reproagent_api.main import create_app
 from reproagent_api.routers import papers
 from test_papers import USER_ID, FakeAuth
 from test_plan_edits import make_plan
-from test_runs import PROJECT_ID, FakeAdmin, FakeArq, seed_tables
+from test_runs import PROJECT_ID, FakeAdmin, FakeArq, make_card, seed_tables
 
 PAPER_ID = uuid4()
 WORKFLOW_ID = uuid4()
@@ -143,7 +143,7 @@ def _spec(status, version=1):
         "version": version,
         "origin": "extraction",
         "parent_version_id": None,
-        "spec_json": {},
+        "spec_json": make_card().model_dump(mode="json"),
         "status": status,
         "created_at": "2026-01-01T00:00:00+00:00",
     }

@@ -15,7 +15,7 @@ from langgraph.types import Command
 from reproagent_schemas import ErrorCategory, RunStatus, WorkflowStatus
 
 from .context import WorkflowContext
-from .harness import BudgetExceeded, trace_input, trace_output
+from .harness import BudgetExceeded, redact, trace_input, trace_output
 from .nodes import (
     build_reproduction_spec,
     classify_error,
@@ -195,7 +195,7 @@ async def _invoke(graph, payload, config: dict, ctx: WorkflowContext, fallback: 
     except Exception as exc:
         current = (await graph.aget_state(config)).values or fallback
         ctx.finalize_workflow(current, WorkflowStatus.FAILED, str(exc))
-        logger.exception("workflow %s failed", fallback.get("workflow_id"))
+        logger.error("workflow %s failed: %s", fallback.get("workflow_id"), redact(str(exc)))
 
 
 async def start_workflow(ctx: WorkflowContext, checkpointer, state: WorkflowState) -> None:

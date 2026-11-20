@@ -3,7 +3,13 @@ from typing import Annotated, Literal
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
-from reproagent_schemas import ExperimentPlan, SchemaModel, WorkflowStatus
+from reproagent_schemas import (
+    ExperimentPlan,
+    ReproductionCard,
+    ReviewMode,
+    SchemaModel,
+    WorkflowStatus,
+)
 
 from ..auth import get_current_user_id
 from .papers import _admin, _get_paper
@@ -132,7 +138,7 @@ async def list_traces(
     request: Request, workflow_id: UUID, user_id: Annotated[UUID, Depends(get_current_user_id)]
 ) -> list[NodeTrace]:
     admin = _admin(request)
-    _get_workflow(admin, workflow_id, user_id)
+    workflow = _get_workflow(admin, workflow_id, user_id)
     rows = (
         admin.table("agent_traces")
         .select(TRACE_COLUMNS)
@@ -141,7 +147,26 @@ async def list_traces(
         .execute()
         .data
     )
-    return [NodeTrace.model_validate(row) for row in rows]
+    from ..services.review_audit import collect_review_decisions, decision_traces
+
+    decisions = collect_review_decisions(
+        admin, paper_id=workflow["paper_id"], experiment_id=workflow.get("experiment_id"),
+        spec_id=(
+            None if workflow["status"] == WorkflowStatus.AWAITING_SPEC_REVIEW.value
+            else workflow.get("spec_version_id")
+        ),
+        plan_id=(
+            None if workflow["status"] == WorkflowStatus.AWAITING_PLAN_APPROVAL.value
+            else workflow.get("plan_id")
+        ),
+    )
+    traces = [NodeTrace.model_validate(row) for row in rows]
+    traces.extend(NodeTrace.model_validate(
+        trace.model_dump(mode="json", include=set(NodeTrace.model_fields)),
+    ) for trace in decision_traces(
+        decisions, workflow_id=str(workflow_id), experiment_id=workflow.get("experiment_id"),
+    ))
+    return sorted(traces, key=lambda trace: trace.created_at)
 
 
 @router.get("/papers/{paper_id}/workflow", response_model=WorkflowDetail)
@@ -164,12 +189,12 @@ async def get_paper_workflow(
     return WorkflowDetail.model_validate(rows[0])
 
 
-def _check_spec_gate(admin, workflow: dict) -> None:
+def _check_spec_gate(admin, workflow: dict, user_id: UUID) -> None:
     if workflow["status"] != WorkflowStatus.AWAITING_SPEC_REVIEW.value:
         raise HTTPException(status.HTTP_409_CONFLICT, "Workflow is not awaiting spec review")
     latest = (
         admin.table("reproduction_specs")
-        .select("status")
+        .select("status,spec_json")
         .eq("paper_id", workflow["paper_id"])
         .order("version", desc=True)
         .limit(1)
@@ -180,9 +205,12 @@ def _check_spec_gate(admin, workflow: dict) -> None:
         raise HTTPException(
             status.HTTP_409_CONFLICT, "Confirm the reproduction card before continuing"
         )
+    card = ReproductionCard.model_validate(latest[0]["spec_json"])
+    if card.review_mode is ReviewMode.DELEGATED and card.delegated_by != user_id:
+        raise HTTPException(status.HTTP_409_CONFLICT, "理解卡托管授权不属于当前用户")
 
 
-def _check_plan_gate(admin, workflow: dict) -> None:
+def _check_plan_gate(admin, workflow: dict, user_id: UUID) -> None:
     if workflow["status"] != WorkflowStatus.AWAITING_PLAN_APPROVAL.value:
         raise HTTPException(status.HTTP_409_CONFLICT, "Workflow is not awaiting plan approval")
     if not workflow.get("experiment_id"):
@@ -201,7 +229,7 @@ def _check_plan_gate(admin, workflow: dict) -> None:
             status.HTTP_409_CONFLICT, "Approve the experiment plan before continuing"
         )
     plan = ExperimentPlan.model_validate(latest[0]["config_json"])
-    if plan.unconfirmed_critical():
+    if not plan.approval_ready(user_id):
         raise HTTPException(
             status.HTTP_409_CONFLICT, "Confirm all critical plan assumptions before continuing"
         )
@@ -217,9 +245,9 @@ async def resume_workflow(
     admin = _admin(request)
     workflow = _get_workflow(admin, workflow_id, user_id)
     if body.stage == "spec":
-        _check_spec_gate(admin, workflow)
+        _check_spec_gate(admin, workflow, user_id)
     else:
-        _check_plan_gate(admin, workflow)
+        _check_plan_gate(admin, workflow, user_id)
     await _enqueue_resume(request, workflow_id, body.stage)
     return ResumeResponse(workflow_id=workflow_id, stage=body.stage)
 

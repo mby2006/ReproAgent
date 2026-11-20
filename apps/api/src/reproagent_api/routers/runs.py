@@ -24,6 +24,7 @@ from ..clients.agent import AgentClient
 from ..clients.runner import RunnerClient
 from ..clients.supabase import make_service_client
 from ..services import generate_and_store_report
+from ..services.runs import load_execution_plan
 
 router = APIRouter(prefix="/v1", tags=["runs"])
 
@@ -130,20 +131,6 @@ def _get_run(admin, run_id: UUID, user_id: UUID) -> dict:
     return {col.strip(): row.get(col.strip()) for col in RUN_COLUMNS.split(",")}
 
 
-def _latest_approved_plan(admin, experiment_id: str) -> dict | None:
-    rows = (
-        admin.table("experiment_plans")
-        .select("id,version,config_json,approved_at")
-        .eq("experiment_id", experiment_id)
-        .not_.is_("approved_at", "null")
-        .order("version", desc=True)
-        .limit(1)
-        .execute()
-        .data
-    )
-    return rows[0] if rows else None
-
-
 async def _enqueue(request: Request, run_id: UUID) -> None:
     arq = getattr(request.app.state, "arq", None)
     if arq is None:
@@ -168,11 +155,17 @@ async def start_run(
 ) -> RunAccepted:
     admin = _admin(request)
     experiment = _get_experiment(admin, experiment_id, user_id)
-    plan = _latest_approved_plan(admin, str(experiment_id))
-    if plan is None:
-        raise HTTPException(status.HTTP_409_CONFLICT, "请先审批实验计划后再执行")
     if not experiment.get("spec_id"):
         raise HTTPException(status.HTTP_409_CONFLICT, "实验缺少 Reproduction Card")
+    try:
+        _, plan, _, _, _, actor = load_execution_plan(admin, str(experiment_id))
+    except ValueError:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "请先确认 Card 并审批最新实验计划，托管授权必须属于项目所有者",
+        ) from None
+    if actor != user_id:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Experiment not found")
 
     run_id = uuid4()
     admin.table("execution_runs").insert(

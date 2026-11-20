@@ -33,9 +33,12 @@ from reproagent_schemas import (
     EvaluateRequest,
     EvidenceField,
     EvidenceStatus,
+    ExperimentPlan,
+    FieldRecommendation,
     RepairRequest,
     ReportedResult,
     ReproductionCard,
+    ReviewRequest,
     RunAudit,
     RunResult,
     RunStatus,
@@ -381,6 +384,7 @@ def seed_tables(*, approved=True, with_spec=True):
     card = make_card()
     plan = build_plan(card)
     return {
+        "projects": [{"id": str(PROJECT_ID), "user_id": str(USER_ID)}],
         "papers": [
             {
                 "id": str(PAPER_ID),
@@ -396,6 +400,7 @@ def seed_tables(*, approved=True, with_spec=True):
                 "paper_id": str(PAPER_ID),
                 "version": 1,
                 "spec_json": card.model_dump(mode="json"),
+                "status": "confirmed",
             }
         ],
         "experiments": [
@@ -952,3 +957,185 @@ def test_regenerate_report_non_terminal_conflicts(env):
     run_id = _seed_run(admin, status="running")
     response = client.post(f"/v1/runs/{run_id}/report", headers=AUTH)
     assert response.status_code == 409
+
+
+def _delegate_plan(admin, actor=USER_ID):
+    from reproagent_api.services.plan_edits import apply_delegated_review
+
+    row = admin.tables["experiment_plans"][0]
+    plan = ExperimentPlan.model_validate(row["config_json"])
+    context = ReviewRequest(card=make_card(), plan=plan, scope=str(actor))
+    plan, records = apply_delegated_review(plan, [FieldRecommendation(
+        id=str(uuid4()), field_path=f.field_path, action="accept", suggested_value=f.value,
+        confidence=0.95, reasoning="Bounded proposal", risk="Monitor training",
+    ) for f in context.review_fields()], actor=actor)
+    row["config_json"] = plan.model_dump(mode="json")
+    row["changes_json"] = [r.model_dump(mode="json") for r in records]
+    return row
+
+
+def _invalidate_authority(admin, problem):
+    row = admin.tables["experiment_plans"][0]
+    if problem == "missing_approval":
+        row["approved_at"] = None
+    elif problem == "wrong_owner":
+        _delegate_plan(admin, BOB_ID)
+    elif problem == "new_draft":
+        admin.tables["experiment_plans"].append({
+            **row, "id": str(uuid4()), "version": 2, "approved_at": None,
+        })
+    elif problem == "new_approved":
+        admin.tables["experiment_plans"].append({**row, "id": str(uuid4()), "version": 2})
+    elif problem == "wrong_experiment":
+        row["experiment_id"] = str(uuid4())
+    elif problem == "wrong_spec":
+        admin.tables["reproduction_specs"][0]["paper_id"] = str(uuid4())
+    elif problem == "draft_card":
+        admin.tables["reproduction_specs"][0]["status"] = "draft"
+    elif problem == "missing_owner":
+        admin.tables["projects"] = []
+    elif problem == "mutated_plan":
+        row["config_json"]["training_config"]["learning_rate"]["value"] = 0.5
+    elif problem == "critical_pending":
+        row["config_json"]["assumptions"].append({
+            "field_path": "training_config.learning_rate", "kind": "inferred", "value": 0.01,
+            "rationale": "Not yet reviewed", "requires_confirmation": True,
+            "human_confirmed": False, "risk_tier": "critical",
+        })
+
+
+@pytest.mark.parametrize("problem", [
+    "missing_approval", "wrong_owner", "new_draft", "new_approved", "wrong_experiment",
+    "wrong_spec", "draft_card", "missing_owner", "critical_pending",
+])
+def test_worker_rechecks_approval_owner_and_latest_pinned_version(monkeypatch, problem):
+    admin = FakeAdmin(seed_tables(), {str(PROJECT_ID): str(USER_ID)})
+    _invalidate_authority(admin, problem)
+    run_worker(admin, [], monkeypatch)
+    assert admin.tables["execution_runs"][0]["status"] == "failed"
+    assert admin.tables["generated_files"] == []
+    assert admin.tables.get("workflows", []) == []
+
+
+@pytest.mark.parametrize("problem", [
+    "missing_approval", "wrong_owner", "new_draft", "wrong_spec", "draft_card",
+    "missing_owner", "critical_pending",
+])
+def test_runs_api_rechecks_approval_and_authority(env, problem):
+    client, admin, app = env
+    _invalidate_authority(admin, problem)
+    response = client.post(f"/v1/experiments/{EXPERIMENT_ID}/runs", headers=AUTH)
+    assert response.status_code == 409
+    assert admin.tables["execution_runs"] == []
+    assert app.state.arq.jobs == []
+
+
+def test_runs_api_uses_latest_approved_and_allows_valid_delegation(env):
+    client, admin, _ = env
+    row = _delegate_plan(admin)
+    newest = {**row, "id": str(uuid4()), "version": 2}
+    admin.tables["experiment_plans"].append(newest)
+    response = client.post(f"/v1/experiments/{EXPERIMENT_ID}/runs", headers=AUTH)
+    assert response.status_code == 202
+    assert admin.tables["execution_runs"][0]["plan_id"] == newest["id"]
+
+
+@pytest.mark.parametrize("problem", [
+    "new_draft", "new_approved", "missing_approval", "wrong_owner", "mutated_plan",
+])
+def test_execution_rechecks_after_codegen_without_switching_plans(monkeypatch, problem):
+    admin = FakeAdmin(seed_tables(), {str(PROJECT_ID): str(USER_ID)})
+    base = agent_transport()
+
+    def handler(request):
+        response = base.handle_request(request)
+        if request.url.path == "/v1/codegen/validate":
+            _invalidate_authority(admin, problem)
+        return response
+
+    run_worker(admin, [], monkeypatch, agent_tr=httpx.MockTransport(handler))
+    assert admin.tables["execution_runs"][0]["status"] == "failed"
+    assert admin.tables["execution_runs"][0]["plan_id"] == str(PLAN_ID)
+    assert admin.tables["generated_files"] == []
+    assert admin.tables["execution_run_files"] == []
+
+
+def test_oom_normal_scaling_never_claims_human_confirmation(monkeypatch):
+    admin = FakeAdmin(seed_tables(), {str(PROJECT_ID): str(USER_ID)})
+    before = json.dumps(admin.tables["experiment_plans"][0], sort_keys=True)
+    oom = make_result(RunStatus.FAILED, 137, stderr="CUDA out of memory")
+    run_worker(admin, [oom, make_result(RunStatus.SUCCEEDED, 0)], monkeypatch)
+    assert json.dumps(admin.tables["experiment_plans"][0], sort_keys=True) == before
+    row = admin.tables["experiment_plans"][1]
+    param = row["config_json"]["training_config"]["batch_size"]
+    assert param["source"] == "mvp_scaling"
+    assert param["human_confirmed"] is False and param["confirmed_by"] is None
+    decision = row["changes_json"][0]
+    assert decision["actor"] is None and decision["confirmed_by"] is None
+    assert "System OOM scaling" in decision["recommendation_reasoning"]
+    assert row["approved_at"]
+
+
+def test_oom_delegated_preserves_only_existing_authority_and_system_audit(monkeypatch):
+    admin = FakeAdmin(seed_tables(), {str(PROJECT_ID): str(USER_ID)})
+    original = _delegate_plan(admin)
+    before = json.dumps(original, sort_keys=True)
+    oom = make_result(RunStatus.FAILED, 137, stderr="CUDA out of memory")
+    run_worker(admin, [oom, make_result(RunStatus.SUCCEEDED, 0)], monkeypatch)
+    assert admin.tables["execution_runs"][0]["status"] == "succeeded"
+    assert json.dumps(original, sort_keys=True) == before
+    row = admin.tables["experiment_plans"][1]
+    plan = ExperimentPlan.model_validate(row["config_json"])
+    assert plan.approval_ready(USER_ID)
+    assert row["config_json"]["delegated_at"] == original["config_json"]["delegated_at"]
+    assert row["config_json"]["delegated_by"] == original["config_json"]["delegated_by"]
+    param = plan.training_config.batch_size
+    assert param.source.value == "inferred" and param.confirmed_by.value == "auto"
+    assert not param.human_confirmed and param.requires_confirmation
+    assert len(row["changes_json"]) == 2
+    assert all(r["actor"] is None for r in row["changes_json"])
+    assert row["changes_json"][1]["confirmed_by"] == "auto"
+    assert row["changes_json"][0]["before"] == row["changes_json"][0]["after"]
+
+
+@pytest.mark.parametrize("delegated", [False, True])
+def test_oom_stops_at_existing_replan_budget(monkeypatch, delegated):
+    admin = FakeAdmin(seed_tables(), {str(PROJECT_ID): str(USER_ID)})
+    if delegated:
+        _delegate_plan(admin)
+    oom = make_result(RunStatus.FAILED, 137, stderr="CUDA out of memory")
+    run_worker(admin, [oom, oom, oom], monkeypatch)
+    assert len(admin.tables["experiment_plans"]) == 3  # initial + at most two replans
+    assert admin.tables["execution_runs"][0]["status"] == "failed"
+    assert admin.tables["workflows"][0]["budget_json"]["replan_count"] == 2
+
+
+@pytest.mark.parametrize("problem", ["wrong_owner", "missing_approval", "new_draft", "minimum"])
+def test_oom_cannot_create_new_authority_or_exceed_scaling_scope(problem):
+    from reproagent_api.services.runs import create_oom_plan
+
+    admin = FakeAdmin(seed_tables(), {str(PROJECT_ID): str(USER_ID)})
+    row = _delegate_plan(admin)
+    run_id = UUID(_seed_run(admin, status="running"))
+    if problem == "minimum":
+        row["config_json"]["training_config"]["batch_size"]["value"] = 1
+    elif problem == "wrong_owner":
+        row["config_json"]["delegated_by"] = str(BOB_ID)
+    else:
+        _invalidate_authority(admin, problem)
+    count = len(admin.tables["experiment_plans"])
+    with pytest.raises(ValueError):
+        create_oom_plan(admin, str(EXPERIMENT_ID), row, run_id, "CUDA out of memory")
+    assert len(admin.tables["experiment_plans"]) == count
+
+
+def test_recovery_cannot_fall_back_to_historical_approval():
+    from reproagent_schemas import BudgetConfig
+
+    admin = FakeAdmin(seed_tables(), {str(PROJECT_ID): str(USER_ID)})
+    _invalidate_authority(admin, "new_draft")
+    with pytest.raises(ValueError, match="not been approved"):
+        worker._recovery_execution_state(admin, {
+            "experiment_id": str(EXPERIMENT_ID), "project_id": str(PROJECT_ID),
+            "paper_id": str(PAPER_ID), "spec_version_id": str(SPEC_ID),
+        }, BudgetConfig())

@@ -70,8 +70,10 @@ async def test_resume_tasks_complete_the_workflow(monkeypatch):
         monkeypatch,
     )
     await worker.run_workflow_task(ctx, str(WORKFLOW_ID))
+    admin.tables["reproduction_specs"][-1]["status"] = "confirmed"
     await worker.resume_workflow_task(ctx, str(WORKFLOW_ID), "spec")
     assert admin.tables["workflows"][0]["status"] == WorkflowStatus.AWAITING_PLAN_APPROVAL.value
+    admin.tables["experiment_plans"][-1]["approved_at"] = "2026-01-01T00:00:00+00:00"
     await worker.resume_workflow_task(ctx, str(WORKFLOW_ID), "plan")
     assert admin.tables["workflows"][0]["status"] == WorkflowStatus.COMPLETED.value
     assert admin.tables["execution_runs"][0]["status"] == "succeeded"
@@ -178,6 +180,7 @@ async def test_recovery_continues_midflight_from_checkpoint(monkeypatch):
             "id": spec_id,
             "paper_id": str(PAPER_ID),
             "version": 1,
+            "status": "confirmed",
             "spec_json": card.model_dump(mode="json"),
         }
     )
@@ -202,7 +205,10 @@ async def test_recovery_continues_midflight_from_checkpoint(monkeypatch):
     )
     state = _state(admin)
     state["status"] = WorkflowStatus.GENERATING_CODE.value
-    state.update(card=card, plan=plan, experiment_id=experiment_id, plan_id=plan_id, plan_version=1)
+    state.update(
+        card=card, plan=plan, experiment_id=experiment_id, plan_id=plan_id, plan_version=1,
+        spec_version_id=spec_id, spec_version=1,
+    )
 
     from reproagent_api.clients.agent import AgentClient
     from reproagent_api.clients.runner import RunnerClient
@@ -239,6 +245,7 @@ async def test_recovery_redrives_persisted_failure(monkeypatch):
         m.setattr(worker, "BudgetConfig", lambda: BudgetConfig(max_experiment_seconds=1))
         ctx = _ctx(admin, [failed], saver, m)
         await worker.run_workflow_task(ctx, str(WORKFLOW_ID))
+        admin.tables["reproduction_specs"][-1]["status"] = "confirmed"
         await worker.resume_workflow_task(ctx, str(WORKFLOW_ID), "spec")
         admin.tables["experiment_plans"][-1]["approved_at"] = "2026-01-01T00:00:00+00:00"
         await worker.resume_workflow_task(ctx, str(WORKFLOW_ID), "plan")

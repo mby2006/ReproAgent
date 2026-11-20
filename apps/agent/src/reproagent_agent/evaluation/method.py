@@ -42,7 +42,10 @@ _ACTIVATION_KEYWORDS = {
 
 
 def _paper_ref(field: EvidenceField | None) -> EvidenceRef | None:
-    if field is None or field.status is EvidenceStatus.MISSING or field.value is None:
+    if (
+        field is None or field.value is None
+        or field.status not in (EvidenceStatus.PAPER_EXPLICIT, EvidenceStatus.PAPER_DESCRIBED)
+    ):
         return None
     return EvidenceRef(
         kind="paper",
@@ -63,6 +66,8 @@ def _code_ref(facts: ImplementationFacts, detail: str) -> EvidenceRef | None:
 def _evidence_text(card: ReproductionCard) -> str:
     parts: list[str] = []
     for field in (card.model_architecture, card.method):
+        if _paper_ref(field) is None:
+            continue
         if field.value is not None:
             parts.append(str(field.value))
         if field.evidence_quote:
@@ -102,7 +107,7 @@ def _check_architecture(card: ReproductionCard, facts: ImplementationFacts) -> M
     return MethodCheck(
         item=MethodItem.ARCHITECTURE,
         status=status,
-        paper_value=str(card.model_architecture.value) if card.model_architecture.value else None,
+        paper_value=ref.detail if ref else None,
         implementation_value=impl,
         paper_evidence=ref,
         implementation_evidence=_code_ref(facts, summary),
@@ -241,7 +246,7 @@ def _check_output_layer(card: ReproductionCard, facts: ImplementationFacts) -> M
 def _check_loss(card: ReproductionCard, facts: ImplementationFacts) -> MethodCheck:
     field = card.loss_function
     impl = facts.loss_function
-    paper_raw = str(field.value).strip().lower() if field.value is not None else None
+    paper_raw = str(field.value).strip().lower() if _paper_ref(field) else None
     paper = _LOSS_ALIASES.get(paper_raw, paper_raw) if paper_raw else None
     if impl is None:
         status, note = CheckStatus.UNKNOWN, "无法从已固定代码提取损失函数"
@@ -273,7 +278,7 @@ def _check_preprocessing(card: ReproductionCard, facts: ImplementationFacts) -> 
     entries = {
         key: field
         for key, field in card.data_preprocessing.items()
-        if field.status is not EvidenceStatus.MISSING and field.value is not None
+        if _paper_ref(field) is not None
     }
     if not facts.preprocessing:
         status, note = CheckStatus.UNKNOWN, "无法从已固定代码提取预处理事实"
@@ -315,7 +320,7 @@ def _check_preprocessing(card: ReproductionCard, facts: ImplementationFacts) -> 
 
 def _check_dataset(card: ReproductionCard, facts: ImplementationFacts) -> MethodCheck:
     field = card.dataset
-    paper = str(field.value).lower() if field.value is not None else ""
+    paper = str(field.value).lower() if _paper_ref(field) else ""
     impl = facts.dataset
     if impl is None:
         status, note = CheckStatus.UNKNOWN, "无法从已固定代码提取数据集事实"
@@ -330,7 +335,7 @@ def _check_dataset(card: ReproductionCard, facts: ImplementationFacts) -> Method
     return MethodCheck(
         item=MethodItem.DATASET,
         status=status,
-        paper_value=str(field.value) if field.value is not None else None,
+        paper_value=str(field.value) if _paper_ref(field) else None,
         implementation_value=impl,
         paper_evidence=_paper_ref(field),
         implementation_evidence=_code_ref(facts, f"dataset={impl}"),

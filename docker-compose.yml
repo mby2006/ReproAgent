@@ -48,6 +48,7 @@ services:
       ENVIRONMENT: ${ENVIRONMENT:-development}
       SUPABASE_URL: http://host.docker.internal:54321
       SUPABASE_PUBLIC_URL: ${SUPABASE_PUBLIC_URL:-http://localhost:54321}
+      SUPABASE_DB_URL: ${SUPABASE_DB_URL_CONTAINER:-postgresql://postgres:postgres@host.docker.internal:54322/postgres}
       SUPABASE_ANON_KEY: ${SUPABASE_ANON_KEY}
       SUPABASE_SERVICE_ROLE_KEY: ${SUPABASE_SERVICE_ROLE_KEY}
       AGENT_BASE_URL: http://agent:8001

@@ -1,5 +1,5 @@
-from .card_edits import EditError, apply_edits
-from .plan_edits import PlanEditError, apply_plan_edits
+from .card_edits import EditError, apply_edits, delegate_card
+from .plan_edits import PlanEditError, apply_delegated_review, apply_plan_edits
 from .reports import build_evaluate_request, generate_and_store_report
 from .runs import (
     async_persist_result,
@@ -13,7 +13,9 @@ from .versions import insert_versioned
 __all__ = [
     "EditError",
     "PlanEditError",
+    "apply_delegated_review",
     "apply_edits",
+    "delegate_card",
     "apply_plan_edits",
     "async_persist_result",
     "build_evaluate_request",

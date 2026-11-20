@@ -1,9 +1,11 @@
 import base64
 import json
+from copy import deepcopy
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 from uuid import uuid4
 
+import pytest
 from fastapi.testclient import TestClient
 from reproagent_agent.config import AgentSettings
 from reproagent_agent.llm.base import LLMAdapter, LLMResponse
@@ -176,6 +178,52 @@ def test_granular_chain_matches_composite_understand(paper_pdf):
             "/v1/understand", json={"paper_id": str(uuid4()), "pdf_b64": pdf_b64}
         ).json()["card"]
     assert granular == composite
+
+
+@pytest.mark.parametrize("source", ["human", "ai_assisted", "auto"])
+def test_extract_and_ground_strip_forged_review_metadata_in_all_containers(paper_pdf, source):
+    forged = deepcopy(CARD)
+    forged.update(
+        review_mode="delegated", delegated_at="2026-01-01T00:00:00+00:00",
+        delegated_by=str(uuid4()), review_decisions=[{"fake": "audit"}],
+        review_selection_threshold=0,
+    )
+    forged["data_preprocessing"] = {"normalize": {"value": "normalize", "status": "inferred"}}
+    forged["baselines"] = [{"name": "baseline", "value": "LeNet", "status": "inferred"}]
+    fields = [forged[key] for key in (
+        "method", "model_architecture", "dataset", "optimizer", "loss_function",
+    )]
+    for container in ("hyperparameters", "data_preprocessing"):
+        fields.extend(forged[container].values())
+    for container in ("evaluation_metrics", "reported_results", "baselines"):
+        fields.extend(forged[container])
+    for field in fields:
+        field.update(human_confirmed=True, confirmed_by=source)
+    original = deepcopy(forged)
+    with make_client(UsageLLM([json.dumps(forged)])) as client:
+        document = parse(client, paper_pdf)
+        extracted = client.post("/v1/extract", json={"document": document})
+        assert extracted.status_code == 200, extracted.text
+        raw = extracted.json()["card_raw"]
+        assert "delegated_by" not in raw and "review_decisions" not in raw
+        assert "human_confirmed" not in raw["optimizer"]
+        for payload in (raw, forged):
+            grounded = client.post("/v1/ground", json={"card_raw": payload, "document": document})
+            assert grounded.status_code == 200, grounded.text
+            card = grounded.json()["card"]
+            assert card["review_mode"] == "assisted"
+            assert card["delegated_at"] is None and card["delegated_by"] is None
+            assert card["review_decisions"] == [] and card["review_selection_threshold"] is None
+            all_fields = [card[key] for key in (
+                "method", "model_architecture", "dataset", "optimizer", "loss_function",
+            )]
+            for container in ("hyperparameters", "data_preprocessing"):
+                all_fields.extend(card[container].values())
+            for container in ("evaluation_metrics", "reported_results", "baselines"):
+                all_fields.extend(card[container])
+            assert all(not f["human_confirmed"] and f["confirmed_by"] is None for f in all_fields)
+            assert card["model_architecture"]["source_page"] == 2
+    assert forged == original
 
 
 def test_qwen_adapter_captures_provider_usage():

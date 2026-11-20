@@ -9,6 +9,7 @@ A within-tolerance match is a trend observation, never a full-reproduction claim
 from reproagent_schemas import (
     CheckStatus,
     EvidenceRef,
+    EvidenceStatus,
     MetricComparison,
     ReproductionCard,
     RunStatus,
@@ -73,7 +74,9 @@ def compare_results(
     ambiguous_errors: list[tuple[float, EvidenceRef]] = []
     paper_other: dict[str, tuple[float, EvidenceRef]] = {}
     for result in card.reported_results:
-        if result.value is None:
+        if result.value is None or result.status not in (
+            EvidenceStatus.PAPER_EXPLICIT, EvidenceStatus.PAPER_DESCRIBED,
+        ):
             continue
         ref = EvidenceRef(
             kind="paper",
@@ -233,7 +236,10 @@ def compare_results(
     known = {"accuracy", "error_rate", "test_loss", "runtime_seconds"}
     for result in card.reported_results:
         kind = _classify_metric(result.metric)
-        if kind is None or kind in known or result.value is None:
+        if (
+            kind is None or kind in known or result.value is None
+            or result.status not in (EvidenceStatus.PAPER_EXPLICIT, EvidenceStatus.PAPER_DESCRIBED)
+        ):
             continue
         known.add(kind)
         comparisons.append(

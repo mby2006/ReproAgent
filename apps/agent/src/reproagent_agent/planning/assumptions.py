@@ -10,6 +10,7 @@ import re
 from reproagent_schemas import (
     Assumption,
     AssumptionKind,
+    ConfirmationSource,
     EvidenceField,
     EvidenceStatus,
     ParamSource,
@@ -79,6 +80,19 @@ def normalize_loss(raw: object) -> str | None:
     return _LOSS_ALIASES.get(raw.strip().lower())
 
 
+def confirmation_source(field: EvidenceField) -> ConfirmationSource | None:
+    """Card AUTO requires fresh recommendations for the executable plan."""
+    if field.confirmed_by is ConfirmationSource.AUTO:
+        return None
+    return field.confirmed_by or (ConfirmationSource.HUMAN if field.human_confirmed else None)
+
+
+def inferred_source(field: EvidenceField) -> ParamSource:
+    if field.human_confirmed and confirmation_source(field) is ConfirmationSource.HUMAN:
+        return ParamSource.HUMAN_CONFIRMED
+    return ParamSource.INFERRED
+
+
 def param_from_evidence(
     field: EvidenceField,
     field_path: str,
@@ -107,6 +121,8 @@ def param_from_evidence(
                 evidence_quote=quote,
                 source_page=page,
                 human_confirmed=field.human_confirmed,
+                confirmed_by=confirmation_source(field),
+                confidence=field.confidence,
             )
 
     if field.status is EvidenceStatus.INFERRED and field.value is not None:
@@ -122,6 +138,8 @@ def param_from_evidence(
                     rationale=rationale,
                     requires_confirmation=not confirmed,
                     human_confirmed=confirmed,
+                    confirmed_by=confirmation_source(field),
+                    confidence=field.confidence,
                     risk_tier=risk_tier,
                     auto_acceptable=auto_acceptable,
                     card_status=EvidenceStatus.INFERRED,
@@ -131,13 +149,15 @@ def param_from_evidence(
             )
             return PlanParam(
                 value=value,
-                source=ParamSource.HUMAN_CONFIRMED if confirmed else ParamSource.INFERRED,
+                source=inferred_source(field),
                 paper_value=value,
                 evidence_quote=quote,
                 source_page=page,
                 rationale=rationale,
                 requires_confirmation=not confirmed,
                 human_confirmed=confirmed,
+                confirmed_by=confirmation_source(field),
+                confidence=field.confidence,
             )
 
     # missing (or unparseable) -> flagged proposal, never a silent default

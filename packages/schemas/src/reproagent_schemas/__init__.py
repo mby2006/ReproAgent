@@ -12,7 +12,15 @@ from .codegen import (
     ValidationReport,
     compute_code_hash,
 )
-from .common import IdentifiedModel, OwnedModel, SchemaModel, utcnow
+from .common import (
+    ConfirmationSource,
+    IdentifiedModel,
+    OwnedModel,
+    ReviewDecision,
+    ReviewMode,
+    SchemaModel,
+    utcnow,
+)
 from .evidence import EvidenceField, EvidenceStatus
 from .execution import (
     DEPENDENCY_WHITELIST,
@@ -77,6 +85,22 @@ from .report import (
     ReportReferences,
 )
 from .reproduction import ReproductionRequest
+from .review import (
+    AdoptRecommendationsRequest,
+    CardConfirmBatchRequest,
+    CardExplainRequest,
+    DelegateReviewRequest,
+    ExplainFieldsRequest,
+    ExplainResponse,
+    FieldExplanation,
+    FieldRecommendation,
+    Recommendation,
+    RecommendResponse,
+    ReviewField,
+    ReviewModeRequest,
+    ReviewRequest,
+    preselected_paths,
+)
 from .spec import (
     DatasetSpec,
     EvaluationSpec,
@@ -116,6 +140,23 @@ from .workflow import (
 )
 
 __all__ = [
+    "AdoptRecommendationsRequest",
+    "CardConfirmBatchRequest",
+    "CardExplainRequest",
+    "ConfirmationSource",
+    "DelegateReviewRequest",
+    "ReviewDecision",
+    "ExplainFieldsRequest",
+    "ExplainResponse",
+    "FieldExplanation",
+    "FieldRecommendation",
+    "Recommendation",
+    "RecommendResponse",
+    "ReviewField",
+    "ReviewMode",
+    "ReviewModeRequest",
+    "ReviewRequest",
+    "preselected_paths",
     "Assumption",
     "AssumptionKind",
     "Baseline",

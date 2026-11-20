@@ -1,14 +1,20 @@
+from uuid import uuid4
+
 import pytest
 from reproagent_agent.graph.build import build_planning_graph
 from reproagent_agent.planning import ScalingConfig, UnsupportedPaperError, build_plan
 from reproagent_agent.planning.assumptions import as_float, as_int, normalize_optimizer
 from reproagent_schemas import (
     AssumptionKind,
+    ConfirmationSource,
     EvidenceField,
     EvidenceStatus,
     ParamSource,
     ReproductionCard,
+    ReviewMode,
+    ReviewRequest,
     RiskTier,
+    utcnow,
 )
 
 
@@ -131,7 +137,7 @@ class TestProvenance:
 
 
 class TestAssistedReviewPhase1:
-    def test_prose_preprocessing_not_flagged(self):
+    def test_prose_and_quoted_inferences_keep_distinct_provenance(self):
         card = make_card(
             data_preprocessing={
                 "centering": EvidenceField(
@@ -150,10 +156,12 @@ class TestAssistedReviewPhase1:
             }
         )
         plan = build_plan(card)
-        assert all(s.source is ParamSource.PAPER_EXPLICIT for s in plan.preprocessing_config.steps)
-        assert not any(
-            a.field_path.startswith("preprocessing_config.") for a in plan.assumptions
-        )
+        assert plan.preprocessing_config.steps[0].source is ParamSource.PAPER_EXPLICIT
+        assert plan.preprocessing_config.steps[1].source is ParamSource.INFERRED
+        inferred = [a for a in plan.assumptions if a.field_path.startswith("preprocessing_config.")]
+        assert len(inferred) == 1
+        assert inferred[0].field_path == "preprocessing_config.size_normalization"
+        assert inferred[0].requires_confirmation
 
     def test_true_inferred_preprocessing_is_routine(self):
         card = make_card(
@@ -185,20 +193,199 @@ class TestAssistedReviewPhase1:
             }
         )
         plan = build_plan(card)
-        wd = next(
-            a for a in plan.assumptions if a.field_path == "training_config.weight_decay"
-        )
+        wd = next(a for a in plan.assumptions if a.field_path == "training_config.weight_decay")
         assert wd.risk_tier is RiskTier.ROUTINE
         assert wd.auto_acceptable is True
         assert wd not in plan.unconfirmed_critical()
 
     def test_missing_loss_is_critical(self):
         plan = build_plan(make_card(loss_function=EvidenceField(status=EvidenceStatus.MISSING)))
-        loss = next(
-            a for a in plan.assumptions if a.field_path == "training_config.loss_function"
-        )
+        loss = next(a for a in plan.assumptions if a.field_path == "training_config.loss_function")
         assert loss.risk_tier is RiskTier.CRITICAL
         assert loss in plan.unconfirmed_critical()
+
+
+class TestAssistedReviewPhase2:
+    @pytest.mark.parametrize(
+        "confirmed,confirmed_by,source",
+        [
+            (False, None, ParamSource.INFERRED),
+            (True, None, ParamSource.HUMAN_CONFIRMED),  # legacy expert confirmation
+            (True, ConfirmationSource.HUMAN, ParamSource.HUMAN_CONFIRMED),
+            (True, ConfirmationSource.AI_ASSISTED, ParamSource.INFERRED),
+        ],
+    )
+    def test_inferred_training_provenance(self, confirmed, confirmed_by, source):
+        def inferred(value):
+            return EvidenceField(
+                value=value,
+                status=EvidenceStatus.INFERRED,
+                confidence=0.96,
+                human_confirmed=confirmed,
+                confirmed_by=confirmed_by,
+                evidence_quote="context only, not a stated parameter",
+                source_page=4,
+            )
+
+        card = make_card(
+            optimizer=inferred("sgd"),
+            loss_function=inferred("cross_entropy"),
+            hyperparameters={"learning_rate": inferred(0.01), "weight_decay": inferred(0.0)},
+        )
+        original = card.model_dump()
+        plan = build_plan(card)
+        expected_by = confirmed_by or (ConfirmationSource.HUMAN if confirmed else None)
+        for name in ("optimizer", "loss_function", "learning_rate", "weight_decay"):
+            param = getattr(plan.training_config, name)
+            assumption = next(
+                a for a in plan.assumptions if a.field_path == f"training_config.{name}"
+            )
+            assert param.source is source
+            assert assumption.kind is AssumptionKind.INFERRED
+            for item in (param, assumption):
+                assert item.confidence == 0.96
+                assert item.confirmed_by is expected_by
+                assert item.human_confirmed is confirmed
+                assert item.requires_confirmation is not confirmed
+                assert item.source_page == 4
+                assert item.evidence_quote == "context only, not a stated parameter"
+        assert card.model_dump() == original
+
+    @pytest.mark.parametrize("has_quote", [False, True])
+    def test_assisted_preprocessing_never_promoted_by_prose_grounding(self, has_quote):
+        field = EvidenceField(
+            value="center images",
+            status=EvidenceStatus.INFERRED,
+            confidence=0.97,
+            human_confirmed=True,
+            confirmed_by=ConfirmationSource.AI_ASSISTED,
+            evidence_quote="images were centered" if has_quote else None,
+            source_page=4 if has_quote else None,
+        )
+        card = make_card(data_preprocessing={"centering": field})
+        original = card.model_dump()
+        plan = build_plan(card)
+        assert plan.preprocessing_config.steps[0].source is ParamSource.INFERRED
+        assumption = next(
+            a for a in plan.assumptions if a.field_path == "preprocessing_config.centering"
+        )
+        assert assumption.kind is AssumptionKind.INFERRED
+        assert assumption.card_status is EvidenceStatus.INFERRED
+        assert assumption.confirmed_by is ConfirmationSource.AI_ASSISTED
+        assert assumption.confidence == 0.97
+        assert assumption.human_confirmed
+        assert not assumption.requires_confirmation
+        assert assumption.evidence_quote == field.evidence_quote
+        assert assumption.source_page == field.source_page
+        assert assumption not in plan.unconfirmed_required()
+        assert card.model_dump() == original
+
+    @pytest.mark.parametrize("confirmed", [False, True])
+    def test_pending_and_manual_preprocessing_confidence(self, confirmed):
+        card = make_card(
+            data_preprocessing={
+                "normalize": EvidenceField(
+                    value="normalize inputs",
+                    status=EvidenceStatus.INFERRED,
+                    confidence=0.93,
+                    human_confirmed=confirmed,
+                )
+            }
+        )
+        plan = build_plan(card)
+        expected_source = ParamSource.HUMAN_CONFIRMED if confirmed else ParamSource.INFERRED
+        assert plan.preprocessing_config.steps[0].source is expected_source
+        assumption = next(
+            a for a in plan.assumptions if a.field_path == "preprocessing_config.normalize"
+        )
+        assert assumption.confidence == 0.93
+        assert assumption.human_confirmed is confirmed
+        assert assumption.requires_confirmation is not confirmed
+        expected_by = ConfirmationSource.HUMAN if confirmed else None
+        assert assumption.confirmed_by is expected_by
+
+    @pytest.mark.parametrize("mode", [ReviewMode.EXPERT, ReviewMode.ASSISTED])
+    def test_review_mode_propagates(self, mode):
+        assert build_plan(make_card(review_mode=mode)).review_mode is mode
+
+    def test_replacement_proposals_do_not_inherit_confirmation_or_confidence(self):
+        def inferred(value):
+            return EvidenceField(
+                value=value,
+                status=EvidenceStatus.INFERRED,
+                confidence=0.99,
+                human_confirmed=True,
+                confirmed_by=ConfirmationSource.AI_ASSISTED,
+            )
+
+        plan = build_plan(
+            make_card(
+                optimizer=inferred("unsupported optimizer"),
+                hyperparameters={"learning_rate": inferred("unknown")},
+            )
+        )
+        for name in ("optimizer", "learning_rate"):
+            param = getattr(plan.training_config, name)
+            assumption = next(
+                a for a in plan.assumptions if a.field_path == f"training_config.{name}"
+            )
+            for item in (param, assumption):
+                assert item.confidence == 0
+                assert item.confirmed_by is None
+                assert not item.human_confirmed
+                assert item.requires_confirmation
+
+
+class TestDelegatedReview:
+    def test_card_authority_carries_over_but_auto_requires_fresh_plan_recommendations(self):
+        def auto(value):
+            return EvidenceField(
+                value=value, status="inferred", confirmed_by="auto", confidence=0.98,
+                evidence_quote="context only", source_page=4,
+            )
+
+        actor, at = uuid4(), utcnow()
+        card = make_card(
+            review_mode="delegated", delegated_by=actor, delegated_at=at,
+            optimizer=auto("sgd"), loss_function=auto("cross_entropy"),
+            hyperparameters={"learning_rate": auto(0.01), "weight_decay": auto(0.0)},
+            data_preprocessing={"normalize": auto("normalize inputs")},
+        )
+        before = card.model_dump(mode="json")
+        plan = build_plan(card)
+        assert plan.review_mode is ReviewMode.DELEGATED
+        assert plan.delegated_at == at and plan.delegated_by == actor
+        assert not plan.approval_ready(actor)
+        assert not plan.approval_ready(uuid4())
+        expected = {"training_config.optimizer", "training_config.loss_function",
+                    "training_config.learning_rate", "training_config.weight_decay",
+                    "preprocessing_config.normalize"}
+        pending = ReviewRequest(card=card, plan=plan, scope="actor").review_fields()
+        assert {f.field_path for f in pending} == expected
+        for assumption in plan.unconfirmed_required():
+            assert assumption.confirmed_by is None
+            assert not assumption.human_confirmed
+            assert assumption.evidence_quote == "context only"
+        assert plan.preprocessing_config.steps[0].source is ParamSource.INFERRED
+        for name in ("optimizer", "loss_function", "learning_rate", "weight_decay"):
+            param = getattr(plan.training_config, name)
+            assert param.confirmed_by is None and not param.human_confirmed
+            assert param.requires_confirmation and param.source is ParamSource.INFERRED
+        assert card.model_dump(mode="json") == before
+
+    def test_auto_missing_still_generates_an_unaccepted_proposal(self):
+        actor = uuid4()
+        card = make_card(
+            review_mode="delegated", delegated_by=actor, delegated_at=utcnow(),
+            loss_function=EvidenceField(status="missing", confirmed_by="auto"),
+        )
+        plan = build_plan(card)
+        loss = plan.training_config.loss_function
+        assert loss.value == "cross_entropy"
+        assert loss.confirmed_by is None and not loss.human_confirmed
+        assert loss.requires_confirmation
+        assert loss.evidence_quote is None and loss.paper_value is None
+        assert not plan.approval_ready(actor)
 
 
 class TestScaling:

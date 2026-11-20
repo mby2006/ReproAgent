@@ -13,7 +13,7 @@ from reproagent_schemas import BudgetConfig, LLMUsage, WorkflowStatus
 from ..clients.agent import AgentClient
 from ..clients.runner import RunnerClient
 from ..config import ApiSettings
-from .harness import WORKFLOW_PERSIST_KEYS
+from .harness import WORKFLOW_PERSIST_KEYS, redact
 
 
 def _now() -> str:
@@ -37,6 +37,8 @@ class WorkflowContext:
 
     def persist_workflow(self, state: dict, updates: dict, node: str) -> None:
         row = {key: updates[key] for key in WORKFLOW_PERSIST_KEYS if key in updates}
+        if row.get("error") is not None:
+            row["error"] = redact(row["error"])
         row["current_node"] = node
         row["updated_at"] = _now()
         if "budget" in updates:
@@ -61,12 +63,12 @@ class WorkflowContext:
                 "experiment_id": state.get("experiment_id"),
                 "run_id": state.get("run_id"),
                 "node_name": node,
-                "input_json": input_json,
-                "output_json": output_json,
+                "input_json": redact(input_json),
+                "output_json": redact(output_json),
                 "duration_ms": duration_ms,
                 "model_name": model_name,
                 "token_usage": usage.model_dump(mode="json") if usage else None,
-                "error": error[:2000] if error else None,
+                "error": redact(error) if error else None,
                 "retry_count": retry_count,
             }
         ).execute()
@@ -76,7 +78,11 @@ class WorkflowContext:
     ) -> None:
         row = {"status": status.value, "updated_at": _now()}
         if error is not None:
-            row["error"] = error[:2000]
+            row["error"] = redact(error)
         if "budget" in state:
             row["budget_json"] = state["budget"].model_dump(mode="json")
         self.admin.table("workflows").update(row).eq("id", state["workflow_id"]).execute()
+        if status is WorkflowStatus.FAILED and state.get("run_id"):
+            self.admin.table("execution_runs").update({
+                "status": "failed", "error": redact(error), "finished_at": _now(),
+            }).eq("id", state["run_id"]).in_("status", ["queued", "running"]).execute()

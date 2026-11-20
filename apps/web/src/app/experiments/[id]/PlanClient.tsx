@@ -9,10 +9,16 @@ import WorkflowInsights from "@/components/WorkflowInsights";
 import WorkflowStepper from "@/components/WorkflowStepper";
 import { IconArrowLeft, IconCheck, IconWarn } from "@/components/icons";
 import RunPanel from "./RunPanel";
-import { apiFetch, resumeWorkflow, retryWorkflow } from "@/lib/api";
+import { adoptPlanRecommendations, apiFetch, delegatePlan, explainPlan, recommendPlan, resumeWorkflow, retryWorkflow } from "@/lib/api";
+import { ConfirmationBadge, DelegationDialog, DelegationNotice, ExplanationCard, PreselectionHint, RecommendationCard, ReviewModeSelector, ReviewRequestStatus } from "@/components/ReviewControls";
+import { hasDelegation, isReviewHandled, ordinaryReviewMode, useReviewMode, useReviewRequest, useReviewSelection } from "@/lib/useReview";
 import { useWorkflow } from "@/lib/useWorkflow";
 import type {
   Assumption,
+  ConfirmationSource,
+  FieldExplanation,
+  FieldRecommendation,
+  ReviewMode,
   ExperimentDetail,
   ExperimentPlan,
   PlanParam,
@@ -20,7 +26,7 @@ import type {
   PlanVersionMeta,
   RiskTier,
 } from "@/lib/types";
-import { RISK_META, SOURCE_META, TONE_BADGE, TONE_TEXT, tierOf } from "@/lib/ui";
+import { RISK_META, SOURCE_META, TONE_BADGE, tierOf } from "@/lib/ui";
 
 const KIND_LABEL: Record<string, string> = {
   inferred: "推断",
@@ -35,7 +41,8 @@ const ORIGIN_LABEL: Record<string, string> = {
   oom_retry: "OOM 降批",
 };
 
-function SourceBadge({ source, confirmed }: { source: string; confirmed?: boolean }) {
+function SourceBadge({ source, confirmed, by }: { source: string; confirmed?: boolean; by?: ConfirmationSource | null }) {
+  if (by === "ai_assisted" || by === "auto") return <ConfirmationBadge by={by} />;
   const meta = SOURCE_META[source as keyof typeof SOURCE_META];
   const tone = meta?.tone ?? "mute";
   return (
@@ -74,7 +81,7 @@ function buildEditables(plan: ExperimentPlan): Editable[] {
   return list;
 }
 
-function EditRow({ item, active, onClick }: { item: Editable; active: boolean; onClick: () => void }) {
+function EditRow({ item, active, onClick, delegated }: { item: Editable; active: boolean; onClick: () => void; delegated: boolean }) {
   const p = item.param;
   return (
     <button onClick={onClick} className={`field-row ${active ? "field-row-active" : ""}`}>
@@ -88,8 +95,8 @@ function EditRow({ item, active, onClick }: { item: Editable; active: boolean; o
         {p?.source === "mvp_scaling" && p.paper_value != null && (
           <span className="font-mono text-[10.5px] text-fg-3">原文 {String(p.paper_value)}</span>
         )}
-        {p && <SourceBadge source={p.source} confirmed={p.human_confirmed} />}
-        {p?.requires_confirmation && !p.human_confirmed && (
+        {p && <SourceBadge source={p.source} confirmed={p.human_confirmed} by={p.confirmed_by} />}
+        {p?.requires_confirmation && !isReviewHandled(p, delegated) && (
           <IconWarn className="h-3.5 w-3.5 text-warn" />
         )}
       </span>
@@ -116,14 +123,30 @@ function AssumptionCard({
   a,
   saving,
   onConfirm,
+  explanation,
+  recommendation,
+  mode,
+  checked,
+  adviceDisabled,
+  delegated,
+  onCheck,
+  onAdopt,
 }: {
   a: Assumption;
   saving: boolean;
   onConfirm: (a: Assumption) => void;
+  explanation?: FieldExplanation;
+  recommendation?: FieldRecommendation;
+  mode: ReviewMode;
+  checked: boolean;
+  adviceDisabled: boolean;
+  delegated: boolean;
+  onCheck: (checked: boolean) => void;
+  onAdopt: () => void;
 }) {
   const tier = tierOf(a);
   const meta = RISK_META[tier];
-  const pending = a.requires_confirmation && !a.human_confirmed;
+  const pending = a.requires_confirmation && !isReviewHandled(a, delegated);
   return (
     <div className={`card space-y-1.5 border-l-2 p-3 text-sm ${TIER_BORDER[tier]}`}>
       <div className="flex items-center justify-between gap-2">
@@ -143,13 +166,19 @@ function AssumptionCard({
           )}
         </blockquote>
       )}
+      {explanation && <ExplanationCard explanation={explanation} mode={mode} />}
+      {pending && recommendation && (
+        <RecommendationCard recommendation={recommendation} currentValue={a.value} checked={checked}
+          disabled={adviceDisabled} onCheck={onCheck} onAdopt={onAdopt} />
+      )}
+      <ConfirmationBadge by={a.confirmed_by} />
       {pending ? (
         <button onClick={() => onConfirm(a)} disabled={saving} className="btn btn-info btn-sm">
           <IconCheck className="h-3 w-3" /> 确认此假设
         </button>
       ) : (
         <span className={`text-xs ${a.human_confirmed ? "text-ok" : "text-fg-3"}`}>
-          {a.human_confirmed ? "✓ 已确认" : "无需确认（MVP 缩放/说明）"}
+          {a.confirmed_by === "auto" ? "已自动处理，未经人工逐项核验" : a.human_confirmed ? "已人工确认" : "无需确认（MVP 缩放/说明）"}
         </span>
       )}
     </div>
@@ -165,25 +194,67 @@ function PlanInner({ experimentId }: { experimentId: string }) {
   const [error, setError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
   const [approving, setApproving] = useState(false);
+  const [delegationTarget, setDelegationTarget] = useState<PlanVersion | null>(null);
+  const [delegating, setDelegating] = useState(false);
   const [continuing, setContinuing] = useState(false);
   const [retrying, setRetrying] = useState(false);
+  const [loading, setLoading] = useState(true);
+  const loadSequence = useRef(0);
   const valueInput = useRef<HTMLInputElement>(null);
   const reasonInput = useRef<HTMLInputElement>(null);
   const confirmCheck = useRef<HTMLInputElement>(null);
-  const { workflowId, workflow, refresh } = useWorkflow(search.get("workflow"));
+  const { workflowId, workflow, error: wfError, refresh } = useWorkflow(search.get("workflow"));
   const wfStatus = workflow?.status;
   const workflowDriven = workflowId != null;
+  const reviewKey = current ? `${experimentId}:${current.id}` : "";
+  const { mode, setMode } = useReviewMode(reviewKey, current?.plan.review_mode);
+  const normalMode = ordinaryReviewMode(mode);
+  const storedDelegated = hasDelegation(current?.plan);
+  const delegated = storedDelegated && mode === "delegated";
+  const reviewingDelegatedNormally = current?.plan.review_mode === "delegated" && mode !== "delegated";
+  const versionNumber = current?.version;
+  const operationBusy = saving || approving || delegating || continuing || retrying || loading;
+  const latestVersion = Math.max(experiment?.plan?.version ?? 0, ...versions.map((v) => v.version));
+  const isLatest = current != null && current.version === latestVersion;
+  const writeDisabled = operationBusy || !isLatest;
+  const hasPending = current?.plan.assumptions.some((a) => a.requires_confirmation && !isReviewHandled(a, delegated) && tierOf(a) !== "info") ?? false;
+  const requestExplanations = useCallback((signal: AbortSignal) => explainPlan(experimentId, versionNumber!, signal), [experimentId, versionNumber]);
+  const requestRecommendations = useCallback((signal: AbortSignal) => recommendPlan(experimentId, versionNumber!, signal), [experimentId, versionNumber]);
+  const autoReview = mode === "assisted" && hasPending && !operationBusy && !delegationTarget;
+  const explanations = useReviewRequest(reviewKey, autoReview, requestExplanations);
+  const advice = useReviewRequest(reviewKey, autoReview, requestRecommendations);
+  const recommendations = (advice.data?.recommendations ?? []).filter((r) =>
+    current?.plan.assumptions.some((a) => a.field_path === r.field_path && a.requires_confirmation && !isReviewHandled(a, delegated) && tierOf(a) !== "info"),
+  );
+  const preselected = recommendations.filter((r) => {
+    const a = current?.plan.assumptions.find((item) => item.field_path === r.field_path);
+    const threshold = advice.data?.selection_threshold ?? 0.9;
+    return advice.data?.preselected_paths.includes(r.field_path) && a && tierOf(a) === "routine" &&
+      a.auto_acceptable && a.kind === "inferred" && (a.confidence ?? 0) >= threshold &&
+      r.action === "accept" && r.confidence >= threshold;
+  }).map((r) => r.field_path);
+  const { selectedPaths, toggle } = useReviewSelection(reviewKey, recommendations.map((r) => r.field_path), preselected);
+  const adviceDisabled = writeDisabled || advice.loading || !!advice.error;
 
   const loadVersions = useCallback(async () => {
     const list = await apiFetch<PlanVersionMeta[]>(`/v1/experiments/${experimentId}/plans`);
     setVersions(list);
   }, [experimentId]);
 
-  const loadExperiment = useCallback(async () => {
-    const exp = await apiFetch<ExperimentDetail>(`/v1/experiments/${experimentId}`);
-    setExperiment(exp);
-    setCurrent(exp.plan);
-    setSelected(null);
+  const loadExperiment = useCallback(async (preserveCurrent = false) => {
+    const sequence = ++loadSequence.current;
+    setLoading(true);
+    try {
+      const exp = await apiFetch<ExperimentDetail>(`/v1/experiments/${experimentId}`);
+      if (sequence !== loadSequence.current) return;
+      setExperiment(exp);
+      if (!preserveCurrent) {
+        setCurrent(exp.plan);
+        setSelected(null);
+      }
+    } finally {
+      if (sequence === loadSequence.current) setLoading(false);
+    }
   }, [experimentId]);
 
   useEffect(() => {
@@ -198,13 +269,51 @@ function PlanInner({ experimentId }: { experimentId: string }) {
   }, [wfStatus, loadExperiment, loadVersions]);
 
   async function switchVersion(v: number) {
+    if (operationBusy) return;
+    const sequence = ++loadSequence.current;
+    setLoading(true);
     setError(null);
     try {
       const pv = await apiFetch<PlanVersion>(`/v1/experiments/${experimentId}/plans/${v}`);
+      if (sequence !== loadSequence.current) return;
       setCurrent(pv);
       setSelected(null);
     } catch (err) {
-      setError(err instanceof Error ? err.message : "加载版本失败");
+      if (sequence === loadSequence.current) setError(err instanceof Error ? err.message : "加载版本失败");
+    } finally {
+      if (sequence === loadSequence.current) setLoading(false);
+    }
+  }
+
+  function showSavedVersion(next: PlanVersion) {
+    // A completed write supersedes any older workflow-triggered read.
+    ++loadSequence.current;
+    setLoading(false);
+    setCurrent(next);
+    setSelected(null);
+    setExperiment((previous) => previous ? { ...previous, plan: next } : previous);
+    setVersions((previous) => previous.some((v) => v.id === next.id) ? previous : [next, ...previous]);
+  }
+
+  async function authorizeDelegation() {
+    if (!delegationTarget || !current || writeDisabled || current.id !== delegationTarget.id) {
+      throw new Error("版本已变化或暂不可授权，请取消后加载最新版本。");
+    }
+    setDelegating(true);
+    setError(null);
+    try {
+      // Only this endpoint grants consent. Later failures must never retry the write.
+      const next = await delegatePlan(experimentId, delegationTarget.version);
+      showSavedVersion(next);
+      setDelegationTarget(null);
+      try {
+        await Promise.all([loadVersions(), loadExperiment(true)]);
+      } catch (err) {
+        setError(`托管版本 v${next.version} 已保存，但刷新失败：${err instanceof Error ? err.message : "请加载最新版本"}`);
+      }
+      if (workflowId && wfStatus === "awaiting_plan_approval") await continueWorkflow();
+    } finally {
+      setDelegating(false);
     }
   }
 
@@ -214,20 +323,22 @@ function PlanInner({ experimentId }: { experimentId: string }) {
     humanConfirmed: boolean,
     reason: string,
   ) {
-    if (!current) return;
+    if (!current || operationBusy) return;
     setSaving(true);
     setError(null);
     try {
-      await apiFetch<PlanVersion>(`/v1/experiments/${experimentId}/plans`, {
+      const next = await apiFetch<PlanVersion>(`/v1/experiments/${experimentId}/plans`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           base_version: current.version,
+          review_mode: normalMode,
           changes: [{ field_path: path, value, human_confirmed: humanConfirmed }],
           change_reason: reason,
           origin: "user_edit",
         }),
       });
+      showSavedVersion(next);
       await loadVersions();
       await loadExperiment();
     } catch (err) {
@@ -252,7 +363,7 @@ function PlanInner({ experimentId }: { experimentId: string }) {
     } else if (typeof selected.value === "boolean") value = raw === "true";
     else value = raw;
     const reason = reasonInput.current?.value.trim() || "用户修改计划参数";
-    persistEdit(selected.path, value, confirmCheck.current?.checked ?? true, reason);
+    persistEdit(selected.path, value, confirmCheck.current?.checked ?? (mode === "expert"), reason);
   }
 
   function confirmAssumption(a: Assumption) {
@@ -266,23 +377,24 @@ function PlanInner({ experimentId }: { experimentId: string }) {
 
   async function acceptRoutine() {
     const p = current?.plan;
-    if (!current || !p) return;
+    if (!current || !p || operationBusy) return;
     const targets = p.assumptions.filter(
       (a) =>
         tierOf(a) === "routine" &&
         a.requires_confirmation &&
-        !a.human_confirmed &&
+        !isReviewHandled(a, delegated) &&
         a.auto_acceptable,
     );
     if (targets.length === 0) return;
     setSaving(true);
     setError(null);
     try {
-      await apiFetch<PlanVersion>(`/v1/experiments/${experimentId}/plans`, {
+      const next = await apiFetch<PlanVersion>(`/v1/experiments/${experimentId}/plans`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           base_version: current.version,
+          review_mode: normalMode,
           changes: targets.map((a) => ({
             field_path: a.field_path,
             value: a.value,
@@ -292,6 +404,7 @@ function PlanInner({ experimentId }: { experimentId: string }) {
           origin: "user_edit",
         }),
       });
+      showSavedVersion(next);
       await loadVersions();
       await loadExperiment();
     } catch (err) {
@@ -301,15 +414,32 @@ function PlanInner({ experimentId }: { experimentId: string }) {
     }
   }
 
+  async function adoptRecommendations(targets: FieldRecommendation[]) {
+    if (!current || !advice.data || adviceDisabled || targets.length === 0) return;
+    setSaving(true);
+    setError(null);
+    try {
+      const next = await adoptPlanRecommendations(experimentId, current.version, targets.map((r) => r.id), advice.data.context_hash, normalMode);
+      showSavedVersion(next);
+      await loadVersions();
+      await loadExperiment();
+    } catch (err) {
+      setError(`${err instanceof Error ? err.message : "采纳失败"}。若版本已更新，请加载最新版本后重新获取推荐。`);
+    } finally {
+      setSaving(false);
+    }
+  }
+
   async function approve() {
-    if (!current) return;
+    if (!current || writeDisabled) return;
     setApproving(true);
     setError(null);
     try {
-      await apiFetch<PlanVersion>(
+      const next = await apiFetch<PlanVersion>(
         `/v1/experiments/${experimentId}/plans/${current.version}/approve`,
-        { method: "POST" },
+        { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ review_mode: normalMode }) },
       );
+      showSavedVersion(next);
       await loadExperiment();
       await loadVersions();
     } catch (err) {
@@ -331,7 +461,7 @@ function PlanInner({ experimentId }: { experimentId: string }) {
       await resumeWorkflow(workflowId, "plan");
       await refresh();
     } catch (err) {
-      setError(err instanceof Error ? err.message : "继续执行失败");
+      setError(`计划版本已保存，继续执行失败：${err instanceof Error ? err.message : "请重试"}。请点击「继续执行」，无需重复授权或批准。`);
     } finally {
       setContinuing(false);
     }
@@ -354,7 +484,7 @@ function PlanInner({ experimentId }: { experimentId: string }) {
   const plan = current?.plan;
   const editables = plan ? buildEditables(plan) : [];
   const assumptions = plan?.assumptions ?? [];
-  const isPending = (a: Assumption) => a.requires_confirmation && !a.human_confirmed;
+  const isPending = (a: Assumption) => a.requires_confirmation && !isReviewHandled(a, delegated);
   const criticalPending = assumptions.filter((a) => isPending(a) && tierOf(a) === "critical");
   const routinePending = assumptions.filter(
     (a) => isPending(a) && tierOf(a) === "routine" && a.auto_acceptable,
@@ -364,8 +494,22 @@ function PlanInner({ experimentId }: { experimentId: string }) {
     routine: assumptions.filter((a) => tierOf(a) === "routine"),
     info: assumptions.filter((a) => tierOf(a) === "info"),
   };
-  const approved = current?.approved_at != null;
-  const canApprove = criticalPending.length === 0 && !approved && !!current;
+  const savedApproved = current?.approved_at != null;
+  // An existing delegated approval must not masquerade as an expert/assisted approval.
+  const approved = savedApproved && !reviewingDelegatedNormally &&
+    (current?.plan.review_mode !== "delegated" || storedDelegated);
+  const canApprove = (criticalPending.length === 0 || reviewingDelegatedNormally) &&
+    !approved && !!current && !writeDisabled && mode !== "delegated";
+  const shownError = error ?? wfError;
+  const criticalRecommendations = recommendations.filter((r) => groups.critical.some((a) => a.field_path === r.field_path)).length;
+  function renderAssumption(a: Assumption) {
+    const recommendation = recommendations.find((r) => r.field_path === a.field_path);
+    return <AssumptionCard key={`${reviewKey}:${a.field_path}`} a={a} delegated={delegated} saving={operationBusy} onConfirm={confirmAssumption}
+      mode={mode} explanation={explanations.data?.explanations.find((e) => e.field_path === a.field_path)}
+      recommendation={recommendation} checked={selectedPaths.includes(a.field_path)} adviceDisabled={adviceDisabled}
+      onCheck={(checked) => toggle(a.field_path, checked)}
+      onAdopt={() => recommendation && adoptRecommendations([recommendation])} />;
+  }
 
   return (
     <main className="mx-auto w-full max-w-7xl space-y-4 px-5 py-6">
@@ -391,6 +535,7 @@ function PlanInner({ experimentId }: { experimentId: string }) {
         {versions.length > 0 && (
           <select
             value={current?.version ?? ""}
+            disabled={operationBusy}
             onChange={(e) => switchVersion(Number(e.target.value))}
             className="select w-48!"
             aria-label="计划版本"
@@ -411,18 +556,38 @@ function PlanInner({ experimentId }: { experimentId: string }) {
           <IconCheck className="h-3.5 w-3.5" />
           {approving
             ? "提交中…"
-            : approved
-              ? "已批准"
-              : workflowDriven && wfStatus === "awaiting_plan_approval"
-                ? "批准并执行"
-                : "批准计划"}
+            : reviewingDelegatedNormally
+              ? `按${mode === "expert" ? "专家" : "辅助"}模式重新校验并批准`
+              : approved
+                ? storedDelegated ? "已托管批准 · 未人工核验" : "已批准"
+                : workflowDriven && wfStatus === "awaiting_plan_approval"
+                  ? "批准并执行"
+                  : "批准计划"}
         </button>
         {workflowDriven && wfStatus === "awaiting_plan_approval" && approved && (
-          <button onClick={continueWorkflow} disabled={continuing} className="btn btn-info btn-sm">
+          <button onClick={continueWorkflow} disabled={operationBusy || !isLatest} className="btn btn-info btn-sm">
             {continuing ? "提交中…" : "继续执行"}
           </button>
         )}
       </header>
+
+      <ReviewModeSelector mode={mode} onChange={setMode} disabled={operationBusy || !current}
+        delegationDisabled={writeDisabled} onDelegate={() => { if (!writeDisabled) setDelegationTarget(current); }} />
+      {delegationTarget && <DelegationDialog version={delegationTarget.version} workflowDriven={workflowDriven}
+        budget={`${delegationTarget.plan.runtime_budget.max_seconds} 秒 · ${delegationTarget.plan.runtime_budget.device}`}
+        onConfirm={authorizeDelegation} onCancel={() => setDelegationTarget(null)}
+        onExpert={() => { setDelegationTarget(null); setMode("expert"); }} />}
+      {plan?.review_mode === "delegated" && <DelegationNotice delegatedAt={plan.delegated_at} delegatedBy={plan.delegated_by} />}
+      {reviewingDelegatedNormally && <p role="status" className="rounded-lg border border-warn/40 bg-warn/10 px-4 py-3 text-sm text-warn">
+        仅切换了本地审核模式，尚未保存。原版本{savedApproved ? `已于 ${current?.approved_at} 按托管批准` : "的托管记录保留"}，不代表专家或辅助模式已批准。
+        按所选模式重新批准将校验关键假设并撤销新版本授权；也可人工编辑创建新版本。
+      </p>}
+      {current && !isLatest && <p className="text-sm text-warn">正在查看历史版本，仍可人工编辑产生分支；授权、AI 采纳或批准前请加载最新版本。</p>}
+      {loading && <p role="status" className="text-xs text-fg-3">正在加载计划版本…</p>}
+      <button className="btn btn-ghost btn-sm" disabled={operationBusy} onClick={() => {
+        setError(null);
+        Promise.all([loadExperiment(), loadVersions()]).catch((err) => setError(err.message));
+      }}>加载最新版本</button>
 
       {workflow && (
         <WorkflowStepper
@@ -436,8 +601,8 @@ function PlanInner({ experimentId }: { experimentId: string }) {
       {workflow && <WorkflowInsights workflow={workflow} />}
 
       {approved && (
-        <p className="rise rounded-lg border border-ok/40 bg-ok/10 px-4 py-2 text-sm text-ok">
-          该计划版本已批准（{current?.approved_at}），可进入代码生成阶段。
+        <p className={`rise rounded-lg border px-4 py-2 text-sm ${storedDelegated ? "border-warn/40 bg-warn/10 text-warn" : "border-ok/40 bg-ok/10 text-ok"}`}>
+          该计划版本已{storedDelegated ? "托管" : ""}批准（{current?.approved_at}），{storedDelegated ? "关键假设未经人工逐项核验，结果仅供趋势参考。" : "可进入代码生成阶段。"}
         </p>
       )}
       {!approved && criticalPending.length > 0 && (
@@ -447,10 +612,11 @@ function PlanInner({ experimentId }: { experimentId: string }) {
           <span className="font-mono text-xs">{criticalPending.map((a) => a.field_path).join("、")}</span>
         </p>
       )}
-      {error && (
-        <p className="rise rounded-lg border border-bad/40 bg-bad/10 px-4 py-2 text-sm text-bad">
-          {error}
-        </p>
+      {shownError && (
+        <div role="alert" className="rise space-y-2 rounded-lg border border-bad/40 bg-bad/10 px-4 py-2 text-sm text-bad">
+          <p>{shownError}</p>
+          {storedDelegated && <button className="btn btn-ghost btn-sm" disabled={operationBusy} onClick={() => setMode("expert")}>切换专家模式，人工审核</button>}
+        </div>
       )}
 
       {plan && (
@@ -468,6 +634,7 @@ function PlanInner({ experimentId }: { experimentId: string }) {
                   <EditRow
                     key={item.path}
                     item={item}
+                    delegated={delegated}
                     active={selected?.path === item.path}
                     onClick={() => setSelected(item)}
                   />
@@ -484,6 +651,7 @@ function PlanInner({ experimentId }: { experimentId: string }) {
                   <EditRow
                     key={item.path}
                     item={item}
+                    delegated={delegated}
                     active={selected?.path === item.path}
                     onClick={() => setSelected(item)}
                   />
@@ -510,7 +678,7 @@ function PlanInner({ experimentId }: { experimentId: string }) {
                 <div key={s.name} className="card px-3 py-2 text-sm">
                   <div className="flex items-center justify-between gap-2">
                     <span className="text-fg">{s.name}</span>
-                    <SourceBadge source={s.source} />
+                    <SourceBadge source={s.source} by={assumptions.find((a) => a.field_path === `preprocessing_config.${s.name}`)?.confirmed_by} />
                   </div>
                   <span className="mt-0.5 block text-xs text-fg-3">{s.detail}</span>
                 </div>
@@ -542,6 +710,7 @@ function PlanInner({ experimentId }: { experimentId: string }) {
                   <EditRow
                     key={item.path}
                     item={item}
+                    delegated={delegated}
                     active={selected?.path === item.path}
                     onClick={() => setSelected(item)}
                   />
@@ -555,6 +724,7 @@ function PlanInner({ experimentId }: { experimentId: string }) {
                   <EditRow
                     key={item.path}
                     item={item}
+                    delegated={delegated}
                     active={selected?.path === item.path}
                     onClick={() => setSelected(item)}
                   />
@@ -577,7 +747,7 @@ function PlanInner({ experimentId }: { experimentId: string }) {
                 <div className="flex items-center justify-between gap-2">
                   <h3 className="display min-w-0 truncate text-sm font-semibold">{selected.label}</h3>
                   {selected.param && (
-                    <SourceBadge source={selected.param.source} confirmed={selected.param.human_confirmed} />
+                    <SourceBadge source={selected.param.source} confirmed={selected.param.human_confirmed} by={selected.param.confirmed_by} />
                   )}
                 </div>
                 {selected.param?.evidence_quote && (
@@ -596,20 +766,23 @@ function PlanInner({ experimentId }: { experimentId: string }) {
                 <input
                   key={`${selected.path}-${current?.version}`}
                   ref={valueInput}
+                  disabled={operationBusy}
                   defaultValue={selected.value === null ? "" : String(selected.value)}
                   className="input"
                   aria-label="参数值"
                 />
                 <input
                   ref={reasonInput}
+                  disabled={operationBusy}
+                  aria-label="修改原因"
                   placeholder="修改原因（必填，记入版本历史）"
                   className="input"
                 />
                 <label className="flex items-center gap-2 text-sm text-fg-2">
-                  <input ref={confirmCheck} type="checkbox" defaultChecked className="h-3.5 w-3.5 accent-[var(--color-brand)]" />
+                  <input key={`${selected.path}:${mode}`} ref={confirmCheck} type="checkbox" defaultChecked={mode === "expert"} disabled={operationBusy} className="h-3.5 w-3.5 accent-[var(--color-brand)]" />
                   标记为已人工确认
                 </label>
-                <button onClick={saveSelected} disabled={saving} className="btn btn-primary w-full">
+                <button onClick={saveSelected} disabled={operationBusy} className="btn btn-primary w-full">
                   {saving ? "保存中…" : "保存为新版本"}
                 </button>
               </div>
@@ -619,32 +792,50 @@ function PlanInner({ experimentId }: { experimentId: string }) {
               </p>
             )}
 
+            <div className="card space-y-3 p-4">
+              <h2 className="label text-info!">AI 辅助审核 · 当前版本</h2>
+              <ReviewRequestStatus label="通俗解读" loading={explanations.loading} error={explanations.error}
+                loaded={!!explanations.data} disabled={operationBusy || !hasPending} onLoad={explanations.load} onExpert={() => setMode("expert")} />
+              <ReviewRequestStatus label="AI 推荐" loading={advice.loading} error={advice.error}
+                loaded={!!advice.data} disabled={operationBusy || !hasPending} onLoad={advice.load} onExpert={() => setMode("expert")} />
+              {advice.data && <>
+                <PreselectionHint threshold={advice.data.selection_threshold} />
+                <p className="text-xs text-fg-2">下方关键及常规卡片展示全部 {recommendations.length} 项推荐；采纳会创建新版本，不会自动批准。</p>
+                <div className="flex flex-wrap gap-2">
+                  <button className="btn btn-info btn-sm" disabled={adviceDisabled || selectedPaths.length === 0}
+                    onClick={() => adoptRecommendations(recommendations.filter((r) => selectedPaths.includes(r.field_path)))}>
+                    采纳已选推荐（{selectedPaths.length}）
+                  </button>
+                  <button className="btn btn-primary btn-sm" disabled={adviceDisabled || recommendations.length === 0}
+                    onClick={() => adoptRecommendations(recommendations)}>
+                    采纳全部 AI 推荐（含 {criticalRecommendations} 项关键假设）
+                  </button>
+                </div>
+              </>}
+              {!hasPending && <p className="text-xs text-fg-3">本版本没有待审核假设。</p>}
+            </div>
+
             <div className="space-y-4">
               <Section title={`关键假设 Critical（${groups.critical.length}）`}>
                 {groups.critical.length === 0 && <p className="text-sm text-fg-3">（无）</p>}
-                {groups.critical.map((a) => (
-                  <AssumptionCard key={a.field_path} a={a} saving={saving} onConfirm={confirmAssumption} />
-                ))}
+                {groups.critical.map(renderAssumption)}
               </Section>
 
               <Section title={`常规假设 Routine（${groups.routine.length}）`}>
+                {routinePending.length > 0 && <p className="text-xs text-fg-3">人工批量确认当前值，不采用 AI 修改建议。</p>}
                 {routinePending.length > 0 && (
-                  <button onClick={acceptRoutine} disabled={saving} className="btn btn-info btn-sm w-full">
+                  <button onClick={acceptRoutine} disabled={operationBusy} className="btn btn-info btn-sm w-full">
                     <IconCheck className="h-3 w-3" />
                     {saving ? "采纳中…" : `一键采纳全部常规项（${routinePending.length}）`}
                   </button>
                 )}
                 {groups.routine.length === 0 && <p className="text-sm text-fg-3">（无）</p>}
-                {groups.routine.map((a) => (
-                  <AssumptionCard key={a.field_path} a={a} saving={saving} onConfirm={confirmAssumption} />
-                ))}
+                {groups.routine.map(renderAssumption)}
               </Section>
 
               {groups.info.length > 0 && (
                 <Section title={`说明 Info（${groups.info.length}）`}>
-                  {groups.info.map((a) => (
-                    <AssumptionCard key={a.field_path} a={a} saving={saving} onConfirm={confirmAssumption} />
-                  ))}
+                  {groups.info.map(renderAssumption)}
                 </Section>
               )}
             </div>
@@ -674,6 +865,7 @@ function PlanInner({ experimentId }: { experimentId: string }) {
                   <button
                     key={v.id}
                     onClick={() => switchVersion(v.version)}
+                    disabled={operationBusy}
                     className={`field-row cursor-pointer! ${current?.version === v.version ? "field-row-active" : ""}`}
                   >
                     <span className="min-w-0">
@@ -692,8 +884,15 @@ function PlanInner({ experimentId }: { experimentId: string }) {
                 <div className="card space-y-1 bg-ink-950/70 px-3 py-2 font-mono text-[10.5px] text-fg-2">
                   <p className="label text-[9px]!">本版本改动（前 → 后）</p>
                   {current.changes.map((c) => (
-                    <p key={c.field_path} className="break-all">
+                    <p key={c.id} className="break-all">
                       {c.field_path}: {String(c.before)} → {String(c.after)}
+                      {c.confirmed_by && <> · <ConfirmationBadge by={c.confirmed_by} /></>}
+                      {c.review_mode && <span> · {c.review_mode === "delegated" ? "托管模式" : c.review_mode === "assisted" ? "辅助模式" : "专家模式"}</span>}
+                      {c.actor && <span> · 操作者 {c.actor}</span>}
+                      {c.timestamp && <span> · {c.timestamp}</span>}
+                      {c.recommendation_id && <span> · 推荐 {c.recommendation_id}</span>}
+                      {c.recommendation_confidence != null && <span> · 推荐置信度 {(c.recommendation_confidence * 100).toFixed(0)}%</span>}
+                      {c.preselection_threshold != null && <span> · 预选阈值 {(c.preselection_threshold * 100).toFixed(0)}%</span>}
                     </p>
                   ))}
                   {current.related_error && (
@@ -732,7 +931,7 @@ function PlanInner({ experimentId }: { experimentId: string }) {
             </span>
             <span className="flex-1" />
             {routinePending.length > 0 && (
-              <button onClick={acceptRoutine} disabled={saving} className="btn btn-ghost btn-sm">
+              <button onClick={acceptRoutine} disabled={operationBusy} className="btn btn-ghost btn-sm">
                 一键采纳常规项（{routinePending.length}）
               </button>
             )}
@@ -744,9 +943,11 @@ function PlanInner({ experimentId }: { experimentId: string }) {
               <IconCheck className="h-3.5 w-3.5" />
               {approving
                 ? "提交中…"
-                : workflowDriven && wfStatus === "awaiting_plan_approval"
-                  ? "批准并执行"
-                  : "批准计划"}
+                : reviewingDelegatedNormally
+                  ? `按${mode === "expert" ? "专家" : "辅助"}模式重新校验并批准`
+                  : workflowDriven && wfStatus === "awaiting_plan_approval"
+                    ? "批准并执行"
+                    : "批准计划"}
             </button>
           </div>
         </div>
@@ -767,7 +968,7 @@ export default function PlanClient({ experimentId }: { experimentId: string }) {
     <AuthGate>
       <Shell>
         <Suspense fallback={<div className="p-6 text-fg-3">加载中…</div>}>
-          <PlanInner experimentId={experimentId} />
+          <PlanInner key={experimentId} experimentId={experimentId} />
         </Suspense>
       </Shell>
     </AuthGate>

@@ -16,7 +16,13 @@ ARG PYTHON_VERSION=""
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
-    PIP_NO_CACHE_DIR=1
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DEFAULT_TIMEOUT=120 \
+    PIP_RETRIES=8
+# 为什么显式写超时与重试：2026-11-23 在这台大陆机房上，torch 本体从
+# download.pytorch.org 下载是正常的，但 files.pythonhosted.org 会随机把一次读拖到
+# 默认 15s 超时之外，整条 RUN 在跑了 40 分钟后才失败。重试与放宽超时让这种抖动
+# 只影响速度，不影响构建结果。
 
 RUN pip install --index-url ${PYPI_INDEX} numpy==1.26.4 pyyaml==6.0.2 \
     && pip install --index-url ${TORCH_INDEX} --extra-index-url ${PYPI_INDEX} \

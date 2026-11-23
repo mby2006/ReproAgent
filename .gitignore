@@ -21,6 +21,7 @@ htmlcov/
 .env
 .env.*
 !.env.example
+!deploy/server/.env.prod.example
 
 # Supabase local
 infra/supabase/.temp/
@@ -42,3 +43,6 @@ Thumbs.db
 .workbuddy/
 .tmp_dev_block.txt
 apps/web/.ReproAgent.qoder.site
+
+# CLI 时代的临时工作目录（现在迁移由 deploy/server/bootstrap.sh 直接 psql 打）
+deploy/server/supabase/

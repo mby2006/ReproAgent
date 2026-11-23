@@ -327,6 +327,8 @@ class WorkerSettings:
     ]
     max_tries = 1
     job_timeout = 1200
+    # Each job can hold a 512MB+ sandbox; the default of 10 would OOM a small host.
+    max_jobs = int(os.getenv("WORKER_MAX_JOBS", "10"))
     redis_settings = RedisSettings.from_dsn(os.getenv("REDIS_URL", "redis://127.0.0.1:6379"))
 
     @staticmethod

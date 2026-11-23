@@ -1,0 +1,182 @@
+# ReproAgent 生产编排（服务器上运行，配合 --env-file deploy/server/.env.prod）
+#
+# 与 docker-compose.yml 的差别是有意的：
+#   - 不跑 web：静态产物已在 Qoder Sites 上，服务器不需要 SSR。
+#   - 没有 --reload、没有源码 bind mount：容器跑镜像里的代码，改代码要重新 build。
+#   - 一个端口都不发布到宿主机。公网入口唯一来自 cloudflared 的出站连接，
+#     它按面板里的配置转发到容器名：api.<域名> -> http://api:8000，
+#     sb.<域名> -> http://edge:80（edge 是路径白名单，见 nginx-edge.conf）。
+#   - 每个服务都有 mem_limit：4GB 机器上必须有墙，否则单个泄漏会拖垮 dockerd。
+#   - worker/runner 并发压到 1：一次训练沙箱默认 512MB、上限 4GB。
+#
+# 数据层不在本文件里：Supabase 由 /opt/supabase-src 的官方 compose + docker-compose.slim.yml
+# 起，项目名 supabase，网络 supabase_default。本文件把它当外部网络挂进来，
+# 于是 api/worker 能用 `kong`、`db` 这两个容器名直连，全程不经过任何公网地址。
+# 所以先起 supabase 再起本文件（bootstrap.sh 保证这个顺序）。
+#
+# 信任边界沿用开发版：api/worker 只拿 Supabase 密钥，agent 只拿 LLM 密钥，
+# runner 两种密钥都不拿。这里不写 environment 的 key 值，全部从 --env-file 插值，
+# 且每个服务只显式声明自己那一组，避免密钥跨容器扩散。
+
+name: reproagent-prod
+
+x-build-args: &py-args
+  PYPI_INDEX: ${PYPI_INDEX:-https://pypi.org/simple}
+
+services:
+  api:
+    build:
+      context: ../..
+      dockerfile: infra/docker/api.Dockerfile
+      args: *py-args
+    # 单 worker：多进程会各自持有连接池，4GB 机器上没必要。
+    command: uvicorn reproagent_api.main:app --host 0.0.0.0 --port 8000 --workers 1
+    ports:
+      # 唯一保留的宿主端口，而且只绑 127.0.0.1：回环地址不可路由，公网仍然只能经
+      # cloudflared 进来。留着的理由很实际 —— scripts/smoke_test.py 和故障排查都要
+      # 从宿主机打 API；把这条也堵掉的话，每次自检都得先 docker exec 进容器。
+      - "127.0.0.1:${API_PORT:-8000}:8000"
+    environment:
+      ENVIRONMENT: production
+      # 容器名直连，无宿主端口发布：Kong 只在 supabase_default 网络里可解析。
+      SUPABASE_URL: http://kong:8000
+      SUPABASE_ANON_KEY: ${ANON_KEY}
+      SUPABASE_SERVICE_ROLE_KEY: ${SERVICE_ROLE_KEY}
+      # PDF 链接的 HMAC 密钥：直接复用本机自生成的 JWT_SECRET。
+      PDF_LINK_SECRET: ${JWT_SECRET}
+      SUPABASE_DB_URL: postgresql://postgres:${POSTGRES_PASSWORD}@db:${POSTGRES_PORT:-5432}/${POSTGRES_DB:-postgres}
+      AGENT_BASE_URL: http://agent:8001
+      RUNNER_BASE_URL: http://runner:8002
+      REDIS_URL: redis://redis:6379
+      CORS_ORIGINS: ${CORS_ORIGINS}
+    networks:
+      - frontend
+      - backend
+      - runner
+      - supabase
+    mem_limit: 768m
+    restart: unless-stopped
+    depends_on:
+      - redis
+
+  worker:
+    build:
+      context: ../..
+      dockerfile: infra/docker/api.Dockerfile
+      args: *py-args
+    command: arq reproagent_api.worker.WorkerSettings
+    environment:
+      ENVIRONMENT: production
+      SUPABASE_URL: http://kong:8000
+      SUPABASE_ANON_KEY: ${ANON_KEY}
+      SUPABASE_SERVICE_ROLE_KEY: ${SERVICE_ROLE_KEY}
+      SUPABASE_DB_URL: postgresql://postgres:${POSTGRES_PASSWORD}@db:${POSTGRES_PORT:-5432}/${POSTGRES_DB:-postgres}
+      AGENT_BASE_URL: http://agent:8001
+      RUNNER_BASE_URL: http://runner:8002
+      REDIS_URL: redis://redis:6379
+      # arq 默认 max_jobs=10。沙箱 512MB × 10 会直接打爆 4GB。
+      WORKER_MAX_JOBS: ${WORKER_MAX_JOBS:-1}
+    networks:
+      - backend
+      - runner
+      - supabase
+    mem_limit: 1024m
+    restart: unless-stopped
+    depends_on:
+      - redis
+      - agent
+
+  agent:
+    build:
+      context: ../..
+      dockerfile: infra/docker/agent.Dockerfile
+      args: *py-args
+    command: uvicorn reproagent_agent.main:app --host 0.0.0.0 --port 8001 --workers 1
+    environment:
+      ENVIRONMENT: production
+      QWEN_API_KEY: ${QWEN_API_KEY}
+      QWEN_BASE_URL: ${QWEN_BASE_URL:-https://dashscope.aliyuncs.com/compatible-mode/v1}
+      QWEN_MODEL: ${QWEN_MODEL:-qwen-plus}
+      RUNNER_BASE_URL: http://runner:8002
+    networks:
+      - backend
+      - runner
+    mem_limit: 768m
+    restart: unless-stopped
+
+  runner:
+    build:
+      context: ../..
+      dockerfile: infra/docker/runner.Dockerfile
+      args: *py-args
+    command: uvicorn reproagent_runner.main:app --host 0.0.0.0 --port 8002 --workers 1
+    environment:
+      ENVIRONMENT: production
+      # 宿主机路径与容器内路径必须一致：Runner 把这两个路径原样交给 dockerd 做 bind，
+      # 被拉起的 exec 容器看到的是同一个宿主机路径。
+      RUNNER_WORK_DIR: ${RUNNER_HOST_WORK_DIR}
+      RUNNER_TIMEOUT_SECONDS: ${RUNNER_TIMEOUT_SECONDS:-600}
+      RUNNER_MAX_CONCURRENT_RUNS: ${RUNNER_MAX_CONCURRENT_RUNS:-1}
+      RUNNER_EXEC_IMAGE: ${EXEC_IMAGE:-reproagent-exec:latest}
+      # overlay2 上 storage_opt=size 需要 xfs pquota 或 ext4 pquota；不支持时置 false。
+      RUNNER_ENFORCE_DISK_QUOTA: ${RUNNER_ENFORCE_DISK_QUOTA:-true}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ${RUNNER_HOST_WORK_DIR}:${RUNNER_HOST_WORK_DIR}
+    networks:
+      - runner
+    mem_limit: 512m
+    restart: unless-stopped
+
+  redis:
+    image: ${REGISTRY_PREFIX:-}redis:7-alpine
+    # 队列持久化：重启后已排队任务不丢；崩溃中的任务由 worker.on_startup 从库里重新驱动。
+    command: redis-server --appendonly yes --maxmemory 128mb --maxmemory-policy noeviction
+    volumes:
+      - redis_data:/data
+    networks:
+      - backend
+    mem_limit: 192m
+    restart: unless-stopped
+
+  # 公网侧的 Supabase 入口：只做路径白名单，原因写在 nginx-edge.conf 顶部。
+  edge:
+    image: ${REGISTRY_PREFIX:-}nginx:1.27-alpine
+    volumes:
+      - ./nginx-edge.conf:/etc/nginx/conf.d/default.conf:ro
+    networks:
+      - frontend
+      - supabase
+    mem_limit: 64m
+    restart: unless-stopped
+
+  tunnel:
+    # 固定版本：latest 在 4GB 机器上偶尔会因为边缘协议变更直接连不上，且无法回滚。
+    image: ${REGISTRY_PREFIX:-}cloudflare/cloudflared:2025.4.2
+    command: tunnel --no-autoupdate run
+    environment:
+      TUNNEL_TOKEN: ${CLOUDFLARE_TUNNEL_TOKEN}
+    # 两条公网主机名全部填容器名，因此不需要 host.docker.internal，
+    # 宿主机上一个监听端口都不用开：
+    #   api.<域名> -> http://api:8000
+    #   sb.<域名>  -> http://edge:80
+    networks:
+      - frontend
+      - supabase
+    mem_limit: 128m
+    restart: unless-stopped
+
+networks:
+  frontend:
+  backend:
+  # Runner 与生成代码所在沙箱的隔离网：internal 让它自己都没有出站网络。
+  runner:
+    internal: true
+  # supabase 项目（官方 compose + docker-compose.slim.yml）自己的默认网络。
+  # external 表示本文件既不创建也不删除它，只是加入进去 —— 所以必须先起 supabase。
+  supabase:
+    external: true
+    name: supabase_default
+
+volumes:
+  redis_data:

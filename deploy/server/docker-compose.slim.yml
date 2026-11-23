@@ -1,0 +1,71 @@
+# ReproAgent 精简覆盖层（叠在 supabase/docker 官方 compose 之上，不重写它的字段）
+#
+# 为什么不自己手写一份 supabase compose：GoTrue/PostgREST/Storage 的 env 有上百个
+# 相互嵌套的插值，手抄 600 行参考文件迟早抄出一个「本地能跑、上线少个变量」的坑。
+# 这一层只做四件事：
+#   1. 网关从默认的 Envoy 换成 Kong（官方 docker-compose.kong.yml 已经在链条里）。
+#   2. 取消一切宿主机端口发布 —— 公网唯一的入口是 cloudflared 容器，容器之间走网络名。
+#      （supabase start 之所以危险，就是把 54321 连同开发默认密钥一起摊在 0.0.0.0。）
+#   3. 每个服务给 mem_limit：4GB 机器上，Postgres 自己就能吃满。
+#   4. 摘掉 api-gw 对 studio 的依赖：Studio 是给人看的控制台，演示机不需要，
+#      而起 api-gw 会把它连带拉起来。
+#
+# 启动只拉需要的六个服务，realtime / meta / functions / supavisor / vector / studio
+# 从头到尾不存在（compose 不会启动未被请求、也未被依赖的服务，这是「精简」的全部机制）。
+#
+#   docker compose -p supabase \
+#     -f /opt/supabase-src/docker/docker-compose.yml \
+#     -f /opt/supabase-src/docker/docker-compose.kong.yml \
+#     -f /opt/reproagent/deploy/server/docker-compose.slim.yml \
+#     --env-file /opt/reproagent/deploy/server/.env.prod \
+#     up -d db auth rest storage imgproxy api-gw
+#
+# 数据落盘：db 与 storage 用的是官方 compose 里的相对路径 ./volumes/db/data、
+# ./volumes/storage，它们指向 /opt/supabase-src/docker/volumes/。那是个可丢弃的
+# sparse clone，所以 bootstrap 会先把这两个位置做成指向 /var/lib/reproagent 的软链接，
+# 数据实际在 /var/lib/reproagent/supabase/ 下，删掉 clone 不会带走数据。
+
+services:
+  db:
+    mem_limit: 1024m
+    command:
+      [
+        "postgres",
+        "-c",
+        "config_file=/etc/postgresql/postgresql.conf",
+        "-c",
+        "log_min_messages=fatal",
+        # 4GB 机器上的默认值偏大（shared_buffers 128MB 是官方镜像给的），
+        # 这里不覆盖 shared_buffers，只把最大连接压下来：连接数才是内存的大头，
+        # api/worker 各持一个池，加上 psql 运维会话，100 已经宽裕。
+        "-c",
+        "max_connections=100"
+      ]
+
+  api-gw:
+    # 不发布任何端口：只有同一个 docker 网络里的服务能用 `kong` 这个名字访问它。
+    ports: !override []
+    mem_limit: 256m
+    # studio 被 api-gw 依赖是官方编排为了方便控制台；这里换成真正需要的后端。
+    # depends_on 必须整体覆盖而不是追加 —— 用 !override 正是为了把 studio 甩掉。
+    depends_on: !override
+      db:
+        condition: service_healthy
+      auth:
+        condition: service_started
+      rest:
+        condition: service_started
+      storage:
+        condition: service_started
+
+  auth:
+    mem_limit: 256m
+
+  rest:
+    mem_limit: 192m
+
+  storage:
+    mem_limit: 256m
+
+  imgproxy:
+    mem_limit: 192m

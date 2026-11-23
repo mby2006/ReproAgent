@@ -41,13 +41,14 @@ services:
       dockerfile: infra/docker/api.Dockerfile
       args:
         PYPI_INDEX: ${PYPI_INDEX:-https://pypi.org/simple}
-        UV_IMAGE: ${UV_IMAGE:-ghcr.io/astral-sh/uv:latest}
     ports:
       - "8000:8000"
     environment:
       ENVIRONMENT: ${ENVIRONMENT:-development}
       SUPABASE_URL: http://host.docker.internal:54321
-      SUPABASE_PUBLIC_URL: ${SUPABASE_PUBLIC_URL:-http://localhost:54321}
+      # PDF capability 链接的 HMAC 密钥。开发环境直接用 supabase CLI 那套公开默认值；
+      # 服务器上由 gen_secrets.sh 生成的 JWT_SECRET 顶替（compose 里 PDF_LINK_SECRET: ${JWT_SECRET}）。
+      PDF_LINK_SECRET: ${PDF_LINK_SECRET:-super-secret-jwt-token-with-at-least-32-characters-long}
       SUPABASE_DB_URL: ${SUPABASE_DB_URL_CONTAINER:-postgresql://postgres:postgres@host.docker.internal:54322/postgres}
       SUPABASE_ANON_KEY: ${SUPABASE_ANON_KEY}
       SUPABASE_SERVICE_ROLE_KEY: ${SUPABASE_SERVICE_ROLE_KEY}
@@ -75,7 +76,6 @@ services:
       dockerfile: infra/docker/api.Dockerfile
       args:
         PYPI_INDEX: ${PYPI_INDEX:-https://pypi.org/simple}
-        UV_IMAGE: ${UV_IMAGE:-ghcr.io/astral-sh/uv:latest}
     environment:
       ENVIRONMENT: ${ENVIRONMENT:-development}
       SUPABASE_URL: http://host.docker.internal:54321
@@ -112,7 +112,6 @@ services:
       dockerfile: infra/docker/agent.Dockerfile
       args:
         PYPI_INDEX: ${PYPI_INDEX:-https://pypi.org/simple}
-        UV_IMAGE: ${UV_IMAGE:-ghcr.io/astral-sh/uv:latest}
     ports:
       - "8001:8001"
     environment:
@@ -136,7 +135,6 @@ services:
       dockerfile: infra/docker/runner.Dockerfile
       args:
         PYPI_INDEX: ${PYPI_INDEX:-https://pypi.org/simple}
-        UV_IMAGE: ${UV_IMAGE:-ghcr.io/astral-sh/uv:latest}
     # No published ports: reachable only from the agent via the isolated network.
     environment:
       ENVIRONMENT: ${ENVIRONMENT:-development}

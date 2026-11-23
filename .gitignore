@@ -43,6 +43,8 @@ Thumbs.db
 .workbuddy/
 .tmp_dev_block.txt
 apps/web/.ReproAgent.qoder.site
+# Qoder Sites 发布时由工具生成的绑定描述符（根目录或子目录），不手写也不入库
+*.qoder.site
 
 # CLI 时代的临时工作目录（现在迁移由 deploy/server/bootstrap.sh 直接 psql 打）
 deploy/server/supabase/

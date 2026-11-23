@@ -4,6 +4,13 @@ import type { CandidateResponse, ComparisonDetail, ComparisonPlanDetail } from "
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
 
+/**
+ * 把 API 返回的相对路径补成可直接导航的绝对地址。
+ * 用于 <iframe src> 和新标签页链接：这两种请求加不了 Authorization 头，
+ * 只能靠服务端签在 URL 里的 capability 签名自证身份。
+ */
+export const apiHref = (path: string) => `${API_URL}${path}`;
+
 export async function apiFetch<T>(path: string, init?: RequestInit): Promise<T> {
   const {
     data: { session },

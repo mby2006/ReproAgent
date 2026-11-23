@@ -1,7 +1,9 @@
 import hashlib
+import hmac
 import ipaddress
 import socket
 from datetime import datetime
+from time import time
 from typing import Annotated
 from urllib.parse import urlparse
 from uuid import UUID, uuid4
@@ -69,9 +71,27 @@ class PaperSummary(SchemaModel):
     created_at: datetime
 
 
-class SignedPdfUrl(SchemaModel):
+class PdfLink(SchemaModel):
     url: str
     expires_in: int = 3600
+
+
+# 与旧的 Storage 签名 URL 保持同一个时长：预览面板换页会重设 iframe 的 src，
+# 短于用户一次阅读会话的有效期会在读到一半时把 PDF 变成 410。
+PDF_LINK_TTL_SECONDS = 3600
+
+
+def _pdf_link_secret(request: Request) -> bytes:
+    secret = request.app.state.settings.pdf_link_secret
+    if not secret:
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "服务未配置 PDF 链接密钥")
+    return secret.encode()
+
+
+def _pdf_link_signature(secret: bytes, user_id: UUID, paper_id: UUID, expires: int) -> str:
+    return hmac.new(
+        secret, f"{user_id}:{paper_id}:{expires}".encode(), hashlib.sha256
+    ).hexdigest()
 
 
 class CardVersionMeta(SchemaModel):
@@ -419,26 +439,67 @@ def delete_paper(
     return {"paper_id": str(paper_id), "status": "deleted"}
 
 
-@router.get("/papers/{paper_id}/pdf", response_model=SignedPdfUrl)
+@router.get("/papers/{paper_id}/pdf", response_model=PdfLink)
 async def get_pdf_url(
     request: Request, paper_id: UUID, user_id: Annotated[UUID, Depends(get_current_user_id)]
-) -> SignedPdfUrl:
+) -> PdfLink:
+    """签发一条指向本服务自己的 PDF 地址，而不是 Storage 的签名 URL。
+
+    原方案让浏览器直接去 /storage/v1 拿签名 URL，代价是公网必须放行整个 Storage 路径。
+    一旦放行，任何人拿到 anon key 就能读任意桶，签名 URL 的 3600 秒有效期反而成了
+    最小的那一个问题。改成用 JWT_SECRET 派生的 HMAC capability 链接后，
+    公网上 Supabase 只需要留 auth 的四个路径。
+    """
     admin = _admin(request)
     paper = _get_paper(admin, paper_id, user_id)
     if not paper["pdf_path"]:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Paper has no stored PDF")
-    result = admin.storage.from_("papers").create_signed_url(paper["pdf_path"], 3600)
-    url = result.get("signedURL") or result.get("signedUrl")
-    if not url:
-        raise HTTPException(status.HTTP_502_BAD_GATEWAY, "Storage did not return a signed URL")
-    settings = request.app.state.settings
-    public = settings.browser_supabase_url
-    internal = settings.supabase_url.rstrip("/")
-    if url.startswith("/"):
-        url = public + url
-    elif url.startswith(internal):
-        url = public + url[len(internal) :]
-    return SignedPdfUrl(url=url)
+    expires = int(time()) + PDF_LINK_TTL_SECONDS
+    signature = _pdf_link_signature(_pdf_link_secret(request), user_id, paper_id, expires)
+    return PdfLink(
+        url=f"/v1/papers/{paper_id}/pdf/content?user_id={user_id}&expires={expires}&sig={signature}",
+        expires_in=PDF_LINK_TTL_SECONDS,
+    )
+
+
+@router.get("/papers/{paper_id}/pdf/content")
+async def get_pdf_content(
+    request: Request,
+    paper_id: UUID,
+    user_id: UUID,
+    expires: int,
+    sig: str,
+) -> Response:
+    """按 capability 链接流回 PDF。
+
+    这个地址不带 Authorization，因为它要放进 <iframe src> 和新标签页链接里，
+    而这两种导航都没法加请求头。身份由链接本身证明：HMAC 覆盖 (user, paper, 过期时间)，
+    拿到链接的人只能读这一篇、只能在这个时间点之前读。归属校验仍然走 _get_paper，
+    所以就算有人拿到别人的 user_id，签不出对应的 sig。
+    """
+    if expires < int(time()):
+        raise HTTPException(status.HTTP_410_GONE, "链接已过期，请刷新页面")
+    secret = _pdf_link_secret(request)
+    if not hmac.compare_digest(_pdf_link_signature(secret, user_id, paper_id, expires), sig):
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "链接无效")
+    admin = _admin(request)
+    paper = _get_paper(admin, paper_id, user_id)
+    if not paper["pdf_path"]:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Paper has no stored PDF")
+    try:
+        data = admin.storage.from_("papers").download(paper["pdf_path"])
+    except (StorageApiError, httpx.HTTPError) as exc:
+        raise HTTPException(status.HTTP_502_BAD_GATEWAY, "读取论文 PDF 失败") from exc
+    return Response(
+        content=data,
+        media_type="application/pdf",
+        # inline：预览要在页面里渲染，而不是逼用户存盘；同时禁缓存，
+        # 这条链接是按用户签的，落到共享缓存里就等于把它交给了下一个人。
+        headers={
+            "Content-Disposition": "inline",
+            "Cache-Control": "private, no-store",
+        },
+    )
 
 
 @router.get("/papers/{paper_id}/card", response_model=CardVersion)

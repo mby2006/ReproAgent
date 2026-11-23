@@ -16,7 +16,7 @@ import {
   IconQuote,
   IconRefresh,
 } from "@/components/icons";
-import { apiFetch, confirmCard, confirmCardBatch, delegateCard, explainCard, fetchCardMarkdown, getPaperWorkflow, resumeWorkflow, retryWorkflow } from "@/lib/api";
+import { apiFetch, apiHref, confirmCard, confirmCardBatch, delegateCard, explainCard, fetchCardMarkdown, getPaperWorkflow, resumeWorkflow, retryWorkflow } from "@/lib/api";
 import { ConfirmationBadge, DelegationDialog, DelegationNotice, ExplanationCard, PreselectionHint, ReviewModeSelector, ReviewRequestStatus } from "@/components/ReviewControls";
 import { hasDelegation, isReviewHandled, isRoutineCardPath, ordinaryReviewMode, useReviewMode, useReviewRequest, useReviewSelection } from "@/lib/useReview";
 import { useWorkflow } from "@/lib/useWorkflow";
@@ -133,7 +133,7 @@ function PaperInner({ paperId }: { paperId: string }) {
       .then(setPaper)
       .catch((err) => setError(err.message));
     apiFetch<{ url: string }>(`/v1/papers/${paperId}/pdf`)
-      .then((r) => setPdfUrl(r.url))
+      .then((r) => setPdfUrl(apiHref(r.url)))
       .catch(() => setPdfUrl(null));
     apiFetch<CardVersionMeta[]>(`/v1/papers/${paperId}/versions`)
       .then((list) => {

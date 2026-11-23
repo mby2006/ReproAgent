@@ -4,7 +4,7 @@ import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { useEffect, useState } from "react";
 import { IconArrowLeft, LogoMark } from "@/components/icons";
-import { isStaticSite } from "@/lib/site";
+import { demoLogin, isStaticSite, selfServiceAuth } from "@/lib/site";
 import { supabase } from "@/lib/supabase";
 
 type Mode = "signin" | "signup" | "reset" | "update";
@@ -37,6 +37,7 @@ function BrandPanel() {
 
 export default function LoginPage() {
   const router = useRouter();
+  const demo = demoLogin;
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [mode, setMode] = useState<Mode>("signin");
@@ -63,6 +64,21 @@ export default function LoginPage() {
     return () => subscription.unsubscribe();
   }, []);
 
+  async function signIn(mail: string, pass: string) {
+    setBusy(true);
+    setError(null);
+    setNotice(null);
+    try {
+      const { error } = await supabase.auth.signInWithPassword({ email: mail, password: pass });
+      if (error) throw error;
+      router.replace("/papers");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "登录失败");
+    } finally {
+      setBusy(false);
+    }
+  }
+
   async function submit(e: React.FormEvent) {
     e.preventDefault();
     if (isStaticSite) {
@@ -70,15 +86,15 @@ export default function LoginPage() {
       setNotice("当前为静态演示版，账号与复现工作台需后端服务支持；可先体验公开实验。");
       return;
     }
+    if (mode === "signin") {
+      await signIn(email, password);
+      return;
+    }
     setBusy(true);
     setError(null);
     setNotice(null);
     try {
-      if (mode === "signin") {
-        const { error } = await supabase.auth.signInWithPassword({ email, password });
-        if (error) throw error;
-        router.replace("/papers");
-      } else if (mode === "signup") {
+      if (mode === "signup") {
         const { data, error } = await supabase.auth.signUp({ email, password });
         if (error) throw error;
         if (data.session) router.replace("/papers");
@@ -119,7 +135,22 @@ export default function LoginPage() {
             </p>
           )}
 
-          {(mode === "signin" || mode === "signup") && (
+          {demo && mode === "signin" && (
+            <button
+              type="button"
+              disabled={busy || isStaticSite}
+              onClick={() => {
+                setEmail(demo.email);
+                setPassword(demo.password);
+                void signIn(demo.email, demo.password);
+              }}
+              className="btn btn-primary w-full"
+            >
+              {busy ? "处理中…" : "一键进入演示账号"}
+            </button>
+          )}
+
+          {(mode === "signin" || mode === "signup") && selfServiceAuth && (
             <div className="flex gap-1 rounded-lg border border-line-soft bg-ink-950/60 p-1">
               {(["signin", "signup"] as const).map((m) => (
                 <button
@@ -176,11 +207,11 @@ export default function LoginPage() {
             </p>
           )}
 
-          <button type="submit" disabled={busy} className="btn btn-primary w-full">
+          <button type="submit" disabled={busy} className={`btn w-full ${demo ? "btn-ghost" : "btn-primary"}`}>
             {busy ? "处理中…" : SUBMIT_LABEL[mode]}
           </button>
 
-          {mode === "signin" && (
+          {mode === "signin" && selfServiceAuth && (
             <button
               type="button"
               onClick={() => {

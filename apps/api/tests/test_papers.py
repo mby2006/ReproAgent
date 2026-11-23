@@ -1,5 +1,6 @@
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from time import time
 from types import SimpleNamespace
 from uuid import uuid4
 
@@ -120,60 +121,131 @@ class _FakeQuery:
 
 
 class _FakeStorage:
-    def __init__(self, signed_url):
-        self._signed_url = signed_url
+    def __init__(self, data: bytes):
+        self._data = data
 
     def from_(self, bucket):
         return self
 
-    def create_signed_url(self, path, expires_in):
-        return {"signedURL": self._signed_url}
+    def download(self, path):
+        return self._data
+
+
+class _PaperQuery:
+    """papers!inner(projects.user_id) 的过滤条件在这里是真的要执行的。
+
+    真库里的归属由 RLS 兜住，测试没有 RLS，所以这一层必须自己判：
+    否则「链接里换别人的 user_id」这条路径会被静默测成通过。
+    """
+
+    def __init__(self, row, owner_id):
+        self._row = row
+        self._owner_id = owner_id
+        self._filters = {}
+
+    def select(self, *args):
+        return self
+
+    def eq(self, key, value):
+        self._filters[key] = value
+        return self
+
+    def execute(self):
+        if self._filters.get("projects.user_id") == str(self._owner_id):
+            return _FakeResult([self._row])
+        return _FakeResult([])
 
 
 class _FakeAdmin:
-    def __init__(self, paper_row, signed_url):
+    def __init__(self, paper_row, owner_id, data):
         self._paper_row = paper_row
-        self.storage = _FakeStorage(signed_url)
+        self._owner_id = owner_id
+        self.storage = _FakeStorage(data)
 
     def table(self, name):
-        return _FakeQuery([self._paper_row])
+        return _PaperQuery(self._paper_row, self._owner_id)
 
 
-def _pdf_client(monkeypatch, signed_url):
+PDF_SECRET = "test-pdf-link-secret"
+PDF_BYTES = b"%PDF-1.4 fake body"
+
+
+def _pdf_client(monkeypatch, pdf_bytes=PDF_BYTES, secret=PDF_SECRET, owner_id=None):
     settings = ApiSettings(
         supabase_url="http://host.docker.internal:54321",
-        supabase_public_url="http://localhost:54321",
         supabase_anon_key="anon-test",
         supabase_service_role_key="service-test",
+        pdf_link_secret=secret,
         _env_file=None,
     )
     paper_id = uuid4()
     row = {"id": str(paper_id), "project_id": str(uuid4()), "pdf_path": "u/p.pdf"}
-    monkeypatch.setattr(papers, "make_service_client", lambda s: _FakeAdmin(row, signed_url))
+    admin = _FakeAdmin(row, owner_id or USER_ID, pdf_bytes)
+    monkeypatch.setattr(papers, "make_service_client", lambda s: admin)
     app = create_app(settings)
     app.dependency_overrides[get_anon_client] = lambda: SimpleNamespace(auth=FakeAuth())
     return TestClient(app), paper_id
 
 
-def test_pdf_url_rewrites_internal_host(monkeypatch):
-    signed = "http://host.docker.internal:54321/storage/v1/object/sign/papers/u/p.pdf?token=abc"
-    client, paper_id = _pdf_client(monkeypatch, signed)
-    with client:
-        response = client.get(f"/v1/papers/{paper_id}/pdf", headers=AUTH)
+def _link(client, paper_id):
+    response = client.get(f"/v1/papers/{paper_id}/pdf", headers=AUTH)
     assert response.status_code == 200
-    assert response.json()["url"] == (
-        "http://localhost:54321/storage/v1/object/sign/papers/u/p.pdf?token=abc"
-    )
+    return response.json()
 
 
-def test_pdf_url_prefixes_relative_path(monkeypatch):
-    client, paper_id = _pdf_client(monkeypatch, "/storage/v1/object/sign/papers/u/p.pdf?token=abc")
-    with client:
-        response = client.get(f"/v1/papers/{paper_id}/pdf", headers=AUTH)
+def test_pdf_link_is_our_own_capability_url(monkeypatch):
+    client, paper_id = _pdf_client(monkeypatch)
+    body = _link(client, paper_id)
+    assert body["url"].startswith(f"/v1/papers/{paper_id}/pdf/content?")
+    assert "storage" not in body["url"]
+    assert f"user_id={USER_ID}" in body["url"]
+    assert body["expires_in"] == 3600
+
+
+def test_pdf_content_serves_bytes_without_auth_header(monkeypatch):
+    client, paper_id = _pdf_client(monkeypatch)
+    url = _link(client, paper_id)["url"]
+    response = client.get(url)  # 导航请求：没有 Authorization，也没有 cookie
     assert response.status_code == 200
-    assert response.json()["url"] == (
-        "http://localhost:54321/storage/v1/object/sign/papers/u/p.pdf?token=abc"
+    assert response.headers["content-type"] == "application/pdf"
+    assert response.content == PDF_BYTES
+    assert "no-store" in response.headers["cache-control"]
+
+
+def test_pdf_content_rejects_tampered_signature(monkeypatch):
+    client, paper_id = _pdf_client(monkeypatch)
+    url = _link(client, paper_id)["url"]
+    head, sig = url.rsplit("sig=", 1)
+    flipped = ("0" if sig[-1] != "0" else "1") + sig[:-1]
+    assert client.get(f"{head}sig={flipped}").status_code == 401
+
+
+def test_pdf_content_rejects_expired_link(monkeypatch):
+    client, paper_id = _pdf_client(monkeypatch)
+    expired = int(time()) - 1
+    signature = papers._pdf_link_signature(PDF_SECRET.encode(), USER_ID, paper_id, expired)
+    url = (
+        f"/v1/papers/{paper_id}/pdf/content"
+        f"?user_id={USER_ID}&expires={expired}&sig={signature}"
     )
+    assert client.get(url).status_code == 410
+
+
+def test_pdf_content_cannot_read_another_users_paper(monkeypatch):
+    # 签名只证明「这个 user_id 在有效期内可以读这一篇」，它不证明归属：
+    # 归属仍然由 papers 查询里的 projects.user_id 过滤决定，所以拿一个
+    # 自己编的、签名合法的 user_id 也只能拿到 404。
+    client, paper_id = _pdf_client(monkeypatch, owner_id=uuid4())
+    intruder = uuid4()
+    expires = int(time()) + 3600
+    signature = papers._pdf_link_signature(PDF_SECRET.encode(), intruder, paper_id, expires)
+    url = f"/v1/papers/{paper_id}/pdf/content?user_id={intruder}&expires={expires}&sig={signature}"
+    assert client.get(url).status_code == 404
+
+
+def test_pdf_link_requires_configured_secret(monkeypatch):
+    client, paper_id = _pdf_client(monkeypatch, secret="")
+    assert client.get(f"/v1/papers/{paper_id}/pdf", headers=AUTH).status_code == 503
 
 
 class _ProjQuery:

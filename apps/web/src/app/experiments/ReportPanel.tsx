@@ -4,7 +4,7 @@ import ParameterTable from "@/components/ParameterTable";
 import { useCallback, useEffect, useState } from "react";
 import MetricChart from "@/components/MetricChart";
 import { IconDownload, IconRefresh, IconWarn } from "@/components/icons";
-import { apiFetch } from "@/lib/api";
+import { apiFetch, apiHref } from "@/lib/api";
 import type {
   CheckStatus,
   EvaluationReport,
@@ -277,7 +277,7 @@ export default function ReportPanel({ runId, onFile }: { runId: string; onFile: 
     if (!paperId) return;
     const controller = new AbortController();
     apiFetch<{url: string}>(`/v1/papers/${paperId}/pdf`, {signal:controller.signal})
-      .then(result => { if (!controller.signal.aborted) setPdfUrl(result.url); })
+      .then(result => { if (!controller.signal.aborted) setPdfUrl(apiHref(result.url)); })
       .catch(() => {});
     return () => controller.abort();
   }, [paperId]);

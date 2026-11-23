@@ -64,7 +64,6 @@ def env(monkeypatch):
     def build(admin, arq=None):
         settings = ApiSettings(
             supabase_url="http://host.docker.internal:54321",
-            supabase_public_url="http://localhost:54321",
             supabase_anon_key="anon-test",
             supabase_service_role_key="service-test",
             _env_file=None,

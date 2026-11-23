@@ -193,17 +193,31 @@ PY
   expect "edge 不吞子路径"           404 "$(probe http://edge/auth/v1/token/../../auth/v1/admin/users)"
 
   echo "==> 4. 公开的 supabase 开发密钥签出来的 JWT，在这里必须无效"
-  expect "dev-secret 伪造 JWT 无 apikey" 401 "$(probe "http://kong:8000/rest/v1/papers?select=id&limit=1" "" "$dev_forged$(printf x | base64 -w0 >/dev/null; true)")"
+  expect "dev-secret 伪造 JWT 无 apikey" 401 "$(probe "http://kong:8000/rest/v1/papers?select=id&limit=1" "" "$dev_forged")"
 
-  echo "==> 5. 公网侧（命名隧道没配好之前这几条会 000，属预期）"
-  if command -v curl >/dev/null; then
-    # 连不上时 curl 自己就打印 000，不要再 `|| echo 000`（会拼成 000000）。
-    code() { curl -m 15 -so /dev/null -w '%{http_code}' "$@" 2>/dev/null || true; }
-    expect "公网 anon key 读表被挡"   404 "$(code -H "apikey: $anon_key" -H "Authorization: Bearer $anon_key" "$sb_origin/rest/v1/papers?select=id&limit=1")"
-    expect "公网 admin 被挡"          404 "$(code -H "apikey: $anon_key" -H "Authorization: Bearer $anon_key" "$sb_origin/auth/v1/admin/users")"
-    expect "公网登录成功"             200 "$(code -X POST -H 'Content-Type: application/json' -H "apikey: $anon_key" -d "{\"email\":\"$demo_email\",\"password\":\"$demo_password\"}" "$sb_origin/auth/v1/token?grant_type=password")"
-    expect "公网 API 健康"            200 "$(code "$api_origin/health")"
-  fi
+  echo "==> 5. 公网侧（域名/隧道未就绪时这些会 000）"
+  # 刻意不走本机解析器：这台机器的 systemd-resolved 有两条链路，其中一个挂着云厂商
+  # 的 metadata DNS，对 api.<域名> 会返回 "<invalid>"，而 sb.<域名> 又是好的。
+  # 直接向权威 NS 要 IP 再 --resolve 直连，测的是「隧道 + Cloudflare + 白名单」，
+  # 而不是这台机器的 DNS 配置。
+  pub_code() { # pub_code <host> <path> [curl 附加参数...]
+    local host="$1" path="$2" ip; shift 2
+    command -v dig >/dev/null || { echo 000; return; }
+    ip=$(dig +short +time=4 +tries=1 A "$host" @223.5.5.5 | awk '/^[0-9.]+$/{print; exit}')
+    [ -n "$ip" ] || { echo 000; return; }
+    curl -4 -m 15 -so /dev/null -w '%{http_code}' --resolve "$host:443:$ip" "https://$host$path" "$@" 2>/dev/null || true
+  }
+  local sb_host api_host
+  sb_host="${sb_origin#https://}"
+  api_host="${api_origin#https://}"
+  expect "公网 anon key 读表被挡" 404 "$(pub_code "$sb_host" "/rest/v1/papers?select=id&limit=1" \
+    -H "apikey: $anon_key" -H "Authorization: Bearer $anon_key")"
+  expect "公网 admin 被挡" 404 "$(pub_code "$sb_host" "/auth/v1/admin/users" \
+    -H "apikey: $anon_key" -H "Authorization: Bearer $anon_key")"
+  expect "公网登录成功" 200 "$(pub_code "$sb_host" "/auth/v1/token?grant_type=password" \
+    -X POST -H 'Content-Type: application/json' -H "apikey: $anon_key" \
+    -d "{\"email\":\"$demo_email\",\"password\":\"$demo_password\"}")"
+  expect "公网 API 健康" 200 "$(pub_code "$api_host" "/health")"
 
   if [ "$FAILURES" != 0 ]; then
     echo "==> 关卡未通过：$FAILURES 条不符" >&2

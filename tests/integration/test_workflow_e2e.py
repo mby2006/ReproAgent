@@ -272,7 +272,13 @@ class TestFullClosedLoop:
         assert run["status"] == RunStatus.SUCCEEDED.value, run
         target_metric = run["metrics_json"]["target_metric"]
         assert target_metric in ("accuracy", "error_rate")
-        assert isinstance(run["metrics_json"]["metric_value"], (int, float))
+        metrics = run["metrics_json"]
+        assert metrics["metric_value"] == metrics[target_metric]
+        assert metrics["accuracy"] == pytest.approx(metrics["correct_count"] / metrics["evaluated_count"])
+        assert metrics["error_rate"] == pytest.approx(1 - metrics["accuracy"])
+        examples = alice_client.get(f"/v1/runs/{run_id}/prediction-examples")
+        assert examples.status_code == 200, examples.text
+        assert [s["index"] for s in examples.json()["samples"]] == list(range(12))
         assert run["audit_json"]["seed"] == 42
         assert run["audit_json"]["dataset_fingerprint"]
 
@@ -285,6 +291,10 @@ class TestFullClosedLoop:
         assert report["final_status"] in {s.value for s in FinalStatus}
         assert report["final_status"] != FinalStatus.EXECUTION_FAILED.value
         assert report_resp.json()["markdown"]
+        rows = {row["key"]: row for row in report["parameter_comparisons"]}
+        assert rows["training_samples"]["actual"] == "256"
+        assert rows["training_samples"]["actual_evidence"]["kind"] == "metrics"
+        assert rows["batch_size"]["actual_evidence"]["kind"] == "config"
         comparisons = report["metric_comparisons"]
         assert comparisons, "report must compare real metrics against the paper"
         assert all(c["experiment_value"] is not None for c in comparisons)

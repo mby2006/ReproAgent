@@ -244,18 +244,9 @@ export function IconChevronDown({ className }: IconProps) {
 }
 
 export function LogoMark({ className }: IconProps) {
-  return (
-    <svg className={className ?? "h-7 w-7"} viewBox="0 0 32 32" fill="none" aria-hidden>
-      <path
-        d="M16 2.5 28 9v14l-12 6.5L4 23V9z"
-        stroke="var(--color-brand)"
-        strokeWidth="1.6"
-      />
-      <path d="M16 9.5v13M10 12.5l12 7M22 12.5l-12 7" stroke="var(--color-brand)" strokeWidth="1.1" opacity="0.55" />
-      <circle cx="16" cy="9.5" r="2.1" fill="var(--color-brand)" />
-      <circle cx="10" cy="19.5" r="1.7" fill="var(--color-info)" />
-      <circle cx="22" cy="19.5" r="1.7" fill="var(--color-scale)" />
-      <circle cx="16" cy="16" r="1.4" fill="var(--color-fg)" />
-    </svg>
-  );
+  return <svg className={className ?? "h-8 w-8"} viewBox="0 0 32 32" fill="none" aria-hidden="true">
+    <rect width="32" height="32" rx="8" fill="var(--color-brand)" />
+    <path d="M8 15V8h8M24 17v7h-8" stroke="white" strokeWidth="2" />
+    <path d="M11 12h9l-6 10" stroke="white" strokeWidth="3" strokeLinejoin="round" />
+  </svg>;
 }

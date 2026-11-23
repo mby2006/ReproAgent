@@ -132,6 +132,30 @@ def settings(tmp_path):
     return RunnerSettings(work_dir=tmp_path, _env_file=None)
 
 
+def test_image_status_reports_digest_and_dataset(settings):
+    with TestClient(create_app(settings, client=FakeDockerClient())) as client:
+        body = client.get("/images/status").json()
+    assert body["available"] is True
+    assert body["digest"] == "sha256:execdigest"
+    assert body["dataset_fingerprint"] == "datasetfp"
+
+
+def test_image_status_reports_missing_image_instead_of_raising(settings):
+    class MissingImages:
+        def get(self, image):
+            raise RuntimeError("No such image: reproagent-exec:latest")
+
+    class MissingClient(FakeDockerClient):
+        def __init__(self):
+            super().__init__()
+            self.images = MissingImages()
+
+    with TestClient(create_app(settings, client=MissingClient())) as client:
+        body = client.get("/images/status").json()
+    assert body["available"] is False
+    assert "No such image" in body["error"]
+
+
 def test_health(settings):
     with TestClient(create_app(settings, client=FakeDockerClient())) as client:
         body = client.get("/health").json()

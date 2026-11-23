@@ -5,7 +5,7 @@ Every value sourced from here is tagged ParamSource.MVP_SCALING and surfaced in
 the plan's deviations_from_paper so it can never masquerade as paper config.
 """
 
-from reproagent_schemas import SchemaModel
+from reproagent_schemas import OPTIMIZER_NAMES, SchemaModel
 
 SCALING_PROFILE = "mvp_lenet5_mnist_v1"
 
@@ -24,7 +24,7 @@ MNIST_INPUT_SHAPE = [1, 28, 28]
 MNIST_NORMALIZE_MEAN = 0.1307
 MNIST_NORMALIZE_STD = 0.3081
 
-SUPPORTED_OPTIMIZERS = {"sgd", "adam", "adamw", "adagrad", "adadelta", "rmsprop"}
+SUPPORTED_OPTIMIZERS = set(OPTIMIZER_NAMES)
 
 # Absolute tolerance for a scaled-down trend comparison (not a paper-equivalence claim).
 MVP_TOLERANCE = 0.03

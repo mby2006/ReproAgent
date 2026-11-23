@@ -1,0 +1,27 @@
+data:
+  dir: /data/mnist
+  input_shape:
+  - 1
+  - 28
+  - 28
+  normalize_mean: 0.1307
+  normalize_std: 0.3081
+  num_classes: 10
+  test_subset_size: 1024
+  train_subset_size: 4096
+evaluation:
+  target_metric: error_rate
+  tolerance: 0.03
+model:
+  architecture: lenet-5
+output:
+  dir: /output
+  metrics_filename: metrics.json
+seed: 42
+training:
+  batch_size: 64
+  epochs: 4
+  learning_rate: 0.03
+  loss_function: cross entropy
+  optimizer: sgd
+  weight_decay: 0.0

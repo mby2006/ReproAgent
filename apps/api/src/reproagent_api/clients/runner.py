@@ -1,7 +1,7 @@
 from uuid import UUID
 
 import httpx
-from reproagent_schemas import RunAccepted, RunLogs, RunRequest, RunResult
+from reproagent_schemas import ExecImageStatus, RunAccepted, RunLogs, RunRequest, RunResult
 
 from ..config import ApiSettings
 
@@ -52,6 +52,11 @@ class RunnerClient:
         response = await self._client.get(f"/runs/{run_id}/artifacts/{name}")
         response.raise_for_status()
         return response.content
+
+    async def image_status(self) -> ExecImageStatus:
+        response = await self._client.get("/images/status")
+        response.raise_for_status()
+        return ExecImageStatus.model_validate(response.json())
 
     async def aclose(self) -> None:
         await self._client.aclose()

@@ -15,6 +15,7 @@ from uuid import UUID, uuid4
 
 from reproagent_schemas import (
     ErrorCategory,
+    ExecImageStatus,
     RunAccepted,
     RunLogs,
     RunRequest,
@@ -169,3 +170,21 @@ class RunRegistry:
         if not path.is_file():
             raise KeyError(name)
         return path
+
+    def image_status(self) -> ExecImageStatus:
+        """Report the pinned exec image so a rerun can refuse to start blind."""
+        image = self._settings.exec_image
+        try:
+            obj = self._client.images.get(image)
+            labels = obj.labels or {}
+            return ExecImageStatus(
+                image=image,
+                available=True,
+                digest=obj.id,
+                dataset_fingerprint=labels.get("reproagent.dataset_fingerprint"),
+                built_at=labels.get("reproagent.built_at"),
+            )
+        except Exception as exc:  # daemon down or image removed
+            return ExecImageStatus(
+                image=image, available=False, error=_truncate(str(exc), 300)
+            )

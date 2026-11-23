@@ -28,6 +28,7 @@ SCALAR_PATHS = {
     "dataset_config.test_subset_size",
     "runtime_budget.max_seconds",
     "evaluation_config.tolerance",
+    "evaluation_config.target_metric",
 }
 
 
@@ -139,6 +140,9 @@ def _apply_changes(
             node, key = editable
             before = node[key]
             node[key] = change.value
+            if fp == "evaluation_config.target_metric" and change.value != before:
+                # These numbers describe the old target, not the newly selected metric.
+                node.update(reported_value=None, reported_condition=None, reported_source_page=None)
             if fp.startswith("preprocessing_config."):
                 node[key] = str(change.value)
                 if auto or change.human_confirmed:

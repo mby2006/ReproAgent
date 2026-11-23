@@ -1,0 +1,131 @@
+"""Train LeNet-5 on a MNIST subset and emit deterministic metrics.json."""
+
+import json
+import time
+from pathlib import Path
+
+import torch
+import yaml
+from torch.utils.data import DataLoader, Subset
+from torchvision import datasets, transforms
+
+from model import build_model
+
+CONFIG_PATH = "config.yaml"
+OPTIMIZERS = {
+    "sgd": torch.optim.SGD,
+    "adam": torch.optim.Adam,
+    "adamw": torch.optim.AdamW,
+    "adagrad": torch.optim.Adagrad,
+    "adadelta": torch.optim.Adadelta,
+    "rmsprop": torch.optim.RMSprop,
+}
+
+
+def load_config() -> dict:
+    with open(CONFIG_PATH, encoding="utf-8") as handle:
+        return yaml.safe_load(handle)
+
+
+def build_loaders(cfg: dict):
+    data = cfg["data"]
+    transform = transforms.Compose(
+        [
+            transforms.ToTensor(),
+            transforms.Normalize((data["normalize_mean"],), (data["normalize_std"],)),
+        ]
+    )
+    train_full = datasets.MNIST(data["dir"], train=True, download=False, transform=transform)
+    test_full = datasets.MNIST(data["dir"], train=False, download=False, transform=transform)
+    train_set = Subset(train_full, range(data["train_subset_size"]))
+    test_set = Subset(test_full, range(data["test_subset_size"]))
+    batch_size = cfg["training"]["batch_size"]
+    train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True)
+    test_loader = DataLoader(test_set, batch_size=batch_size, shuffle=False)
+    return train_loader, test_loader, train_set, test_set
+
+
+def evaluate(model, loader, criterion, output, target):
+    model.eval()
+    correct = 0
+    total = 0
+    loss_sum = 0.0
+    samples = []
+    subset = loader.dataset
+    with torch.no_grad():
+        for features, labels in loader:
+            outputs = model(features)
+            predictions = outputs.argmax(1)
+            loss_sum += criterion(outputs, labels).item() * labels.size(0)
+            correct += (predictions == labels).sum().item()
+            for offset in range(min(len(labels), 12 - len(samples))):
+                index = subset.indices[total + offset]
+                pixels = subset.dataset.data[index].flatten().tolist()
+                samples.append({"index": index, "pixels": bytes(pixels).hex(),
+                                "label": int(labels[offset]), "prediction": int(predictions[offset])})
+            total += labels.size(0)
+    values = {"accuracy": correct / total, "error_rate": (total - correct) / total,
+              "test_loss": loss_sum / total}
+    (output / "prediction_examples.json").write_text(
+        json.dumps({"version": 1, "samples": samples}), encoding="utf-8"
+    )
+    return {**values, "target_metric": target, "metric_value": values[target],
+            "correct_count": correct, "evaluated_count": total}
+
+
+def main() -> None:
+    cfg = load_config()
+    seed = cfg["seed"]
+    torch.manual_seed(seed)
+    output = Path(cfg["output"]["dir"])
+    output.mkdir(parents=True, exist_ok=True)
+
+    train_loader, test_loader, train_set, test_set = build_loaders(cfg)
+    model = build_model(cfg["data"]["num_classes"])
+    training = cfg["training"]
+    optimizer = OPTIMIZERS[training["optimizer"].lower()](
+        model.parameters(),
+        lr=training["learning_rate"],
+        weight_decay=training.get("weight_decay", 0.0),
+    )
+    criterion = torch.nn.CrossEntropyLoss()
+
+    started = time.time()
+    log = []
+    train_loss = 0.0
+    for epoch in range(training["epochs"]):
+        model.train()
+        running = 0.0
+        seen = 0
+        for features, labels in train_loader:
+            optimizer.zero_grad()
+            loss = criterion(model(features), labels)
+            loss.backward()
+            optimizer.step()
+            running += loss.item() * labels.size(0)
+            seen += labels.size(0)
+        train_loss = running / max(seen, 1)
+        log.append({"epoch": epoch + 1, "train_loss": train_loss})
+
+    results = evaluate(model, test_loader, criterion, output, cfg["evaluation"]["target_metric"])
+    runtime = time.time() - started
+    metrics = {
+        "schema_version": "1.1",
+        **results,
+        "train_loss": train_loss,
+        "epochs_completed": training["epochs"],
+        "train_samples": len(train_set),
+        "test_samples": len(test_set),
+        "seed": seed,
+        "runtime_seconds": runtime,
+    }
+    (output / cfg["output"]["metrics_filename"]).write_text(
+        json.dumps(metrics, indent=2), encoding="utf-8"
+    )
+    (output / "training_log.json").write_text(json.dumps(log, indent=2), encoding="utf-8")
+    torch.save(model.state_dict(), output / "model.pt")
+    print(json.dumps({"status": "ok", "accuracy": results["accuracy"], "epochs": training["epochs"]}))
+
+
+if __name__ == "__main__":
+    main()

@@ -675,8 +675,12 @@ def test_markdown_has_exactly_fourteen_sections_in_order():
     response = evaluate_run(request)
     numbers = [int(m) for m in re.findall(r"^## (\d+)\. ", response.markdown, re.MULTILINE)]
     assert numbers == list(range(1, 15))
-    assert "Paper Overview" in response.markdown
-    assert "Code and Execution Trace References" in response.markdown
+    # The narrative sections come first so a non-specialist can stop early.
+    assert response.markdown.index("## 1. 这次实验想验证什么") < response.markdown.index(
+        "## 8. 论文信息与证据基础"
+    )
+    assert "## 8. 论文信息与证据基础" in response.markdown
+    assert "## 14. 追溯信息与审核记录" in response.markdown
     assert str(request.references.run_id) in response.markdown
     assert str(request.references.plan_id) in response.markdown
     assert "r/stdout.txt" in response.markdown
@@ -835,7 +839,84 @@ def test_inferred_result_is_not_upgraded_to_paper_evidence_by_acceptance(source)
     assert acc.paper_value is None and acc.paper_evidence is None
     assert acc.comparison_status is CheckStatus.NOT_APPLICABLE
     assert response.report.final_status is FinalStatus.INSUFFICIENT_EVIDENCE
-    assert "论文报告值：0.999" not in response.markdown
+    purpose = response.markdown.split("## 1. ")[1].split("## 2. ")[0]
+    assert "缺少可核验的论文参考值" in purpose
+    assert "99.90%" not in purpose and "0.999" not in purpose and "第 10 页" not in purpose
+
+
+def test_grounded_reference_uses_normalized_value_in_every_section():
+    card = make_card()
+    card.reported_results[0].value = 99
+    response = evaluate_run(make_request(card=card))
+    assert "**99.00%**（论文第 10 页）" in response.markdown
+    assert "9900.00%" not in response.markdown
+
+
+@pytest.mark.parametrize("actual,expected", [
+    (0.05, FinalStatus.METHOD_VALIDATED),
+    (0.08, FinalStatus.METHOD_VALIDATED),
+    (0.12, FinalStatus.SCALED_RUN_COMPLETED),
+])
+def test_approved_loss_drives_verdict_summary_and_units(actual, expected):
+    card = make_card()
+    card.reported_results.append(ReportedResult(
+        metric="test loss", value=0.05, status=EvidenceStatus.PAPER_EXPLICIT,
+        source_page=11, evidence_quote="test loss 0.05",
+    ))
+    plan = make_plan(card)
+    plan.evaluation_config.target_metric = "test loss"
+    metrics = full_metrics(plan) | {"target_metric": "test_loss", "test_loss": actual, "accuracy": 0.1}
+    response = evaluate_run(make_request(card=card, plan=plan, metrics=metrics))
+    assert response.report.final_status is expected
+    assert response.report.target_metric == "test_loss"
+    assert "test_loss（nats）" in response.report.summary
+    assert "accuracy" not in response.report.summary
+    assert "**0.0500 nats**（论文第 11 页）" in response.markdown
+    assert "低于论文" not in response.markdown
+    assert "目标指标是 `test_loss`" not in response.markdown
+
+
+def test_error_rate_aliases_use_native_reference_and_actual_run_target():
+    card = make_card(reported_results=[ReportedResult(
+        metric="error rate", value=0.8, status=EvidenceStatus.PAPER_EXPLICIT,
+        source_page=12, evidence_quote="error rate 0.8%",
+    )])
+    plan = make_plan(card)
+    metrics = full_metrics(plan) | {"target_metric": "error_rate", "error_rate": 0.015}
+    req = make_request(card=card, plan=plan, metrics=metrics)
+    response = evaluate_run(req)
+    assert response.report.target_metric == "error_rate"
+    target = next(c for c in response.report.metric_comparisons if c.metric == "error_rate")
+    assert target.paper_value == pytest.approx(0.008)
+    assert target.percentage_point_difference == pytest.approx(0.7)
+    assert target.experiment_evidence.field_path == "metrics_json.error_rate"
+    assert "运行记录的目标指标是" not in response.markdown
+    assert "**0.80%**（论文第 12 页）" in response.markdown
+    del req.metrics["error_rate"]
+    req.metrics["metric_value"] = 0.985  # Legacy value stored accuracy under the error-rate label.
+    legacy = evaluate_run(req)
+    row = next(c for c in legacy.report.metric_comparisons if c.metric == "error_rate")
+    assert row.experiment_value == pytest.approx(0.015)
+    assert row.experiment_evidence.field_path == "metrics_json.accuracy"
+    req.metrics["target_metric"] = "test_loss"
+    assert "运行记录的目标指标是 `test_loss`" in evaluate_run(req).markdown
+
+
+def test_setup_keeps_plan_separate_from_recorded_or_missing_sample_counts():
+    req = make_request()
+    req.plan.dataset_config.test_subset_size = 1024
+    req.metrics["test_samples"] = 10
+    req.metrics["accuracy"] = 0.1
+    markdown = evaluate_run(req).markdown
+    section = markdown.split("## 3. ")[1].split("## 4. ")[0]
+    assert "1024 | 10 · metrics · metrics_json.test_samples" in section
+    assert "测试集保持全量" not in markdown
+    assert "接近" in markdown and "训练本身失效" not in markdown
+    assert "训练未生效" not in markdown and "没有学到任何规律" not in markdown
+    req.metrics.clear()
+    req.run_status = RunStatus.FAILED
+    section = evaluate_run(req).markdown.split("## 3. ")[1].split("## 4. ")[0]
+    assert "1024 | 未核实" in section
 
 
 @pytest.mark.parametrize("source", [ConfirmationSource.AUTO, ConfirmationSource.AI_ASSISTED])

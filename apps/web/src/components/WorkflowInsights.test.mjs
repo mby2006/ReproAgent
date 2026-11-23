@@ -15,6 +15,7 @@ function loadComponent(relativePath) {
   });
   const loaded = { exports: {} };
   const mockedRequire = (name) => {
+    if (name === "@/lib/ui") return loadComponent("../lib/ui.ts");
     if (name.includes("icons")) return { IconChevronDown: () => null, IconWarn: () => null };
     if (name.startsWith("@/")) return {};
     return require(name);
@@ -24,7 +25,7 @@ function loadComponent(relativePath) {
 }
 
 const { TraceRow } = loadComponent("./WorkflowInsights.tsx");
-const { ReportReview, ReviewAudit } = loadComponent("../app/experiments/[id]/ReportPanel.tsx");
+const { FinalSummary, ReportReview, ReviewAudit } = loadComponent("../app/experiments/[id]/ReportPanel.tsx");
 const render = (component, props) => renderToStaticMarkup(React.createElement(component, props));
 const disclaimer = "本实验关键假设由系统自动接受，未经人工逐项核验；结果仅供趋势参考。";
 const decision = {
@@ -32,6 +33,23 @@ const decision = {
   confirmed_by: "auto", review_mode: "delegated", actor: "actor-id", timestamp: "2026-01-02T12:00:00Z",
   recommendation_reasoning: "[REDACTED] recommended", recommendation_confidence: 0.95,
 };
+
+test("report headline uses the approved metric even when a different row is complete", () => {
+  const data = {
+    final_status: "SCALED_RUN_COMPLETED", target_metric: "test_loss", summary: "",
+    metric_comparisons: [
+      { metric: "accuracy", unit: "fraction", paper_value: .99, experiment_value: .85 },
+      { metric: "test_loss", unit: "nats", paper_value: .05, experiment_value: .12, absolute_difference: .07 },
+    ],
+  };
+  const html = render(FinalSummary, { data });
+  for (const text of ["test_loss", "nats", "0.0500", "0.1200", "0.0700", "绝对差"]) assert.ok(html.includes(text));
+  assert.ok(!html.includes("99.00%"));
+  data.metric_comparisons[1].experiment_value = null;
+  assert.ok(!render(FinalSummary, { data }).includes("85.00%"));
+  delete data.target_metric;
+  assert.ok(render(FinalSummary, { data }).includes("历史报告未记录主指标"));
+});
 
 test("delegated report displays the exact warning and real authorizer/time", () => {
   const html = render(ReportReview, { data: {

@@ -8,7 +8,17 @@ from uuid import UUID, uuid4
 
 import httpx
 import psycopg
-from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile, status
+from fastapi import (
+    APIRouter,
+    Depends,
+    File,
+    Form,
+    HTTPException,
+    Request,
+    Response,
+    UploadFile,
+    status,
+)
 from psycopg import sql
 from psycopg.rows import dict_row
 from reproagent_schemas import (
@@ -34,7 +44,7 @@ from storage3.exceptions import StorageApiError
 
 from ..auth import get_current_user_id
 from ..clients.supabase import make_service_client
-from ..services import EditError, apply_edits, insert_versioned
+from ..services import EditError, apply_edits, insert_versioned, render_card_markdown
 from ..services.card_edits import delegate_card
 from ..services.review import generate_review
 
@@ -448,6 +458,49 @@ async def get_card(
     if not rows:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "No reproduction card for this paper yet")
     return _to_card_version(rows[0])
+
+
+@router.get(
+    "/papers/{paper_id}/card.md",
+    response_class=Response,
+    responses={200: {"content": {"text/markdown": {}}}},
+)
+async def get_card_markdown(
+    request: Request,
+    paper_id: UUID,
+    user_id: Annotated[UUID, Depends(get_current_user_id)],
+    version: int | None = None,
+) -> Response:
+    """Deterministic Markdown export of one persisted Card version.
+
+    Same ownership check and version selection as ``GET /card``; the payload is
+    rendered from stored evidence only, so it can be audited against the paper.
+    """
+    admin = _admin(request)
+    paper = _get_paper(admin, paper_id, user_id)
+    query = admin.table("reproduction_specs").select(VERSION_COLUMNS).eq("paper_id", str(paper_id))
+    if version is not None:
+        rows = query.eq("version", version).execute().data
+    else:
+        rows = query.order("version", desc=True).limit(1).execute().data
+    if not rows:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "No reproduction card for this paper yet")
+    card_version = _to_card_version(rows[0])
+    markdown = render_card_markdown(
+        card_version.card,
+        paper_title=paper["title"],
+        paper_id=paper_id,
+        version=card_version.version,
+        version_id=card_version.id,
+        origin=card_version.origin,
+        created_at=card_version.created_at,
+    )
+    filename = f"reproduction-card-{str(paper_id)[:8]}-v{card_version.version}.md"
+    return Response(
+        content=markdown,
+        media_type="text/markdown; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
 
 
 @router.get("/papers/{paper_id}/versions", response_model=list[CardVersionMeta])

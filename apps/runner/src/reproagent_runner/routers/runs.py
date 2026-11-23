@@ -3,13 +3,19 @@ from uuid import UUID
 
 from fastapi import APIRouter, HTTPException, Request, status
 from fastapi.responses import FileResponse
-from reproagent_schemas import RunAccepted, RunLogs, RunRequest, RunResult
+from reproagent_schemas import ExecImageStatus, RunAccepted, RunLogs, RunRequest, RunResult
 
 router = APIRouter(tags=["runs"])
 
 
 def _registry(request: Request):
     return request.app.state.registry
+
+
+@router.get("/images/status", response_model=ExecImageStatus)
+async def image_status(request: Request) -> ExecImageStatus:
+    """A rerun must know whether its pinned image is still present."""
+    return _registry(request).image_status()
 
 
 @router.post("/runs", response_model=RunAccepted, status_code=status.HTTP_202_ACCEPTED)

@@ -135,8 +135,22 @@ class ReportReferences(SchemaModel):
     review_trace_ids: list[UUID] = Field(default_factory=list)
 
 
+class ParameterComparison(SchemaModel):
+    key: str
+    label: str
+    paper: str | None = None
+    plan: str | None = None
+    actual: str | None = None
+    paper_evidence: EvidenceRef | None = None
+    actual_evidence: EvidenceRef | None = None
+    decision: str | None = None
+    note: str
+
+
 class EvaluationReport(SchemaModel):
     references: ReportReferences
+    target_metric: str | None = None
+    parameter_comparisons: list[ParameterComparison] = Field(default_factory=list)
     final_status: FinalStatus
     summary: str = Field(min_length=1)
     method_checks: list[MethodCheck] = Field(default_factory=list)

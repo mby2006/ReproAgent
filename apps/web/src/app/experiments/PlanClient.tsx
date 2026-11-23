@@ -1,12 +1,11 @@
 "use client";
 
 import Link from "next/link";
-import { useSearchParams } from "next/navigation";
+import { useRouter, useSearchParams } from "next/navigation";
 import { Suspense, useCallback, useEffect, useRef, useState } from "react";
 import AuthGate from "@/components/AuthGate";
 import Shell from "@/components/Shell";
 import WorkflowInsights from "@/components/WorkflowInsights";
-import WorkflowStepper from "@/components/WorkflowStepper";
 import { IconArrowLeft, IconCheck, IconWarn } from "@/components/icons";
 import RunPanel from "./RunPanel";
 import { adoptPlanRecommendations, apiFetch, delegatePlan, explainPlan, overridePlanTier, recommendPlan, resumeWorkflow, retryWorkflow } from "@/lib/api";
@@ -26,13 +25,20 @@ import type {
   PlanVersionMeta,
   RiskTier,
 } from "@/lib/types";
-import { RISK_META, SOURCE_META, TONE_BADGE, tierOf } from "@/lib/ui";
+import { RISK_META, SOURCE_META, TONE_BADGE, fmtDate, tierOf } from "@/lib/ui";
+import { fieldLabel, kindHint, shortValue } from "@/lib/fieldLabels";
 
-const KIND_LABEL: Record<string, string> = {
-  inferred: "推断",
-  missing_proposal: "缺失·提案",
-  mvp_scaling: "MVP缩放",
-  nonstandard_choice: "非标准·替代",
+const EXPERIMENT_STATUS: Record<string, string> = {
+  planning: "计划中",
+  approved: "已批准",
+  succeeded: "已完成",
+  failed: "已失败",
+};
+
+const REVIEW_MODE_TEXT: Record<string, string> = {
+  expert: "人工逐项确认",
+  assisted: "AI 给建议，你来决定",
+  delegated: "交给系统自动处理",
 };
 
 const ORIGIN_LABEL: Record<string, string> = {
@@ -60,22 +66,29 @@ interface Editable {
   param?: PlanParam;
 }
 
+function executableMetric(name: string) {
+  return ["accuracy", "test accuracy", "top1 accuracy", "top-1 accuracy", "error", "error rate",
+    "test error", "test error rate", "misclassification rate", "loss", "test loss",
+    "cross entropy loss"].includes(name.trim().toLowerCase().replaceAll("_", " "));
+}
+
 function buildEditables(plan: ExperimentPlan): Editable[] {
   const t = plan.training_config;
   const list: Editable[] = [
-    { path: "training_config.optimizer", label: "优化器 Optimizer", value: t.optimizer.value, param: t.optimizer },
-    { path: "training_config.learning_rate", label: "学习率 Learning Rate", value: t.learning_rate.value, param: t.learning_rate },
-    { path: "training_config.loss_function", label: "损失函数 Loss", value: t.loss_function.value, param: t.loss_function },
-    { path: "training_config.batch_size", label: "批大小 Batch Size", value: t.batch_size.value, param: t.batch_size },
-    { path: "training_config.epochs", label: "Epochs", value: t.epochs.value, param: t.epochs },
+    { path: "training_config.optimizer", label: "优化器", value: t.optimizer.value, param: t.optimizer },
+    { path: "training_config.learning_rate", label: "学习率", value: t.learning_rate.value, param: t.learning_rate },
+    { path: "training_config.loss_function", label: "损失函数", value: t.loss_function.value, param: t.loss_function },
+    { path: "training_config.batch_size", label: "批大小", value: t.batch_size.value, param: t.batch_size },
+    { path: "training_config.epochs", label: "训练轮数（epoch）", value: t.epochs.value, param: t.epochs },
   ];
   if (t.weight_decay) {
-    list.push({ path: "training_config.weight_decay", label: "Weight Decay", value: t.weight_decay.value, param: t.weight_decay });
+    list.push({ path: "training_config.weight_decay", label: "权重衰减", value: t.weight_decay.value, param: t.weight_decay });
   }
   list.push(
     { path: "dataset_config.train_subset_size", label: "训练子集大小", value: plan.dataset_config.train_subset_size },
     { path: "dataset_config.test_subset_size", label: "测试子集大小", value: plan.dataset_config.test_subset_size },
     { path: "runtime_budget.max_seconds", label: "时间预算 (秒)", value: plan.runtime_budget.max_seconds },
+    { path: "evaluation_config.target_metric", label: "执行目标（accuracy / error_rate / test_loss）", value: plan.evaluation_config.target_metric },
     { path: "evaluation_config.tolerance", label: "对比容差", value: plan.evaluation_config.tolerance },
   );
   return list;
@@ -86,16 +99,18 @@ function EditRow({ item, active, onClick, delegated }: { item: Editable; active:
   return (
     <button onClick={onClick} className={`field-row ${active ? "field-row-active" : ""}`}>
       <span className="min-w-0">
-        <span className="block text-[11px] text-fg-3">{item.label}</span>
-        <span className="block truncate font-mono text-[13px] text-fg">
+        <span className="block text-[13px] text-fg-3">{item.label}</span>
+        <span className="block truncate font-mono text-[14.5px] text-fg">
           {item.value === null ? "—" : String(item.value)}
         </span>
       </span>
       <span className="flex shrink-0 items-center gap-1.5">
         {p?.source === "mvp_scaling" && p.paper_value != null && (
-          <span className="font-mono text-[10.5px] text-fg-3">原文 {String(p.paper_value)}</span>
+          <span className="text-[12px] text-fg-3">原文 {String(p.paper_value)}</span>
         )}
-        {p && <SourceBadge source={p.source} confirmed={p.human_confirmed} by={p.confirmed_by} />}
+        {p && p.confirmed_by !== "auto" && (
+          <SourceBadge source={p.source} confirmed={p.human_confirmed} by={p.confirmed_by} />
+        )}
         {p?.requires_confirmation && !isReviewHandled(p, delegated) && (
           <IconWarn className="h-3.5 w-3.5 text-warn" />
         )}
@@ -152,43 +167,49 @@ function AssumptionCard({
 }) {
   const tier = tierOf(a);
   const meta = RISK_META[tier];
+  const kind = kindHint(a.kind);
   const pending = a.requires_confirmation && !isReviewHandled(a, delegated);
   return (
     <div className={`card space-y-1.5 border-l-2 p-3 text-sm ${TIER_BORDER[tier]}`}>
-      <div className="flex items-center justify-between gap-2">
-        <span className="truncate font-mono text-[10.5px] text-fg-3">{a.field_path}</span>
-        <span className="flex shrink-0 items-center gap-1.5">
-          <select
-            className={`select w-auto! py-0.5! pl-2! pr-6! text-[10.5px] ${TONE_BADGE[meta.tone]}`}
-            value={tier}
-            disabled={tierDisabled}
-            aria-label={`调整 ${a.field_path} 的风险分级`}
-            title={`${meta.hint}。人工调整将生成新版本并留痕。`}
-            onChange={(event) => onTierChange(event.target.value as RiskTier)}
-          >
-            <option value="critical">关键</option>
-            <option value="routine">常规</option>
-            <option value="info">说明</option>
-          </select>
-          <span className="chip">{KIND_LABEL[a.kind] ?? a.kind}</span>
-        </span>
+      <div className="flex items-start justify-between gap-2">
+        <div className="min-w-0">
+          <p className="text-[15px] font-semibold text-fg">{fieldLabel(a.field_path)}</p>
+          <p className="mt-0.5 text-[12.5px] text-fg-3">{kind.label}</p>
+        </div>
+        <select
+          className={`select w-auto! shrink-0 py-0.5! pl-2! pr-6! text-[12px] ${TONE_BADGE[meta.tone]}`}
+          value={tier}
+          disabled={tierDisabled}
+          aria-label={`调整「${fieldLabel(a.field_path)}」的重要程度`}
+          title={`${meta.hint}。改动会生成新版本并留痕。`}
+          onChange={(event) => onTierChange(event.target.value as RiskTier)}
+        >
+          <option value="critical">关键</option>
+          <option value="routine">次要</option>
+          <option value="info">仅告知</option>
+        </select>
       </div>
-      <p className="text-[13px] leading-relaxed text-fg-2">{a.rationale}</p>
-      <p className="font-mono text-[10.5px] text-fg-3">提案值：{String(a.value)}</p>
+      <p className="text-[13.5px] leading-relaxed text-fg-2">{kind.explain}</p>
+      <div className="mt-1 rounded-lg border border-line-soft bg-ink-950/60 px-3 py-2">
+        <span className="text-[12.5px] text-fg-3">这次实际用</span>
+        <span className="ml-2 break-all font-mono text-[14px] text-fg">{shortValue(a.value, 90)}</span>
+      </div>
+      {a.rationale && <p className="text-[12.5px] leading-relaxed text-fg-3">这样取的原因：{a.rationale}</p>}
       {a.evidence_quote && (
-        <blockquote className="quote">
-          “{a.evidence_quote}”
-          {a.source_page != null && (
-            <span className="ml-2 font-mono text-[10.5px] not-italic text-fg-3">p.{a.source_page}</span>
-          )}
-        </blockquote>
+        <details className="rounded-lg border border-line-soft bg-ink-950/40 px-3 py-2">
+          <summary className="cursor-pointer text-[12.5px] text-fg-3">
+            看论文里怎么写的{a.source_page != null ? `（第 ${a.source_page} 页）` : ""}
+          </summary>
+          <blockquote className="quote mt-2">
+            “{a.evidence_quote}”
+          </blockquote>
+        </details>
       )}
       {explanation && <ExplanationCard explanation={explanation} mode={mode} />}
       {pending && recommendation && (
         <RecommendationCard recommendation={recommendation} currentValue={a.value} checked={checked}
           disabled={adviceDisabled} onCheck={onCheck} onAdopt={onAdopt} onModify={onModify} />
       )}
-      <ConfirmationBadge by={a.confirmed_by} />
       {pending ? (
         <button onClick={() => onConfirm(a)} disabled={saving} className="btn btn-info btn-sm">
           <IconCheck className="h-3 w-3" /> 确认此假设
@@ -202,8 +223,22 @@ function AssumptionCard({
   );
 }
 
+type ExperimentView = "plan" | "run" | "versions";
+
 function PlanInner({ experimentId }: { experimentId: string }) {
   const search = useSearchParams();
+  const router = useRouter();
+  const view = (search.get("view") ?? "plan") as ExperimentView;
+  const goView = useCallback(
+    (next: ExperimentView) => {
+      const params = new URLSearchParams(search.toString());
+      if (next === "plan") params.delete("view");
+      else params.set("view", next);
+      router.replace(params.toString() ? `?${params.toString()}` : "?", { scroll: false });
+      window.scrollTo({ top: 0, behavior: "smooth" });
+    },
+    [router, search],
+  );
   const [experiment, setExperiment] = useState<ExperimentDetail | null>(null);
   const [versions, setVersions] = useState<PlanVersionMeta[]>([]);
   const [current, setCurrent] = useState<PlanVersion | null>(null);
@@ -548,6 +583,15 @@ function PlanInner({ experimentId }: { experimentId: string }) {
   const canApprove = (criticalPending.length === 0 || reviewingDelegatedNormally) &&
     !approved && !!current && !writeDisabled && mode !== "delegated";
   const shownError = error ?? wfError;
+  const planHeadline = !current
+    ? "正在加载实验计划…"
+    : approved
+      ? storedDelegated
+        ? `计划已于 ${current.approved_at ? fmtDate(current.approved_at) : "此前"} 按「托管」方式批准：关键设置有系统自动接受，可以直接执行，但结果只能当趋势参考。`
+        : `计划已于 ${current.approved_at ? fmtDate(current.approved_at) : "此前"} 批准，可以开始生成代码并训练。`
+      : criticalPending.length > 0
+        ? `还有 ${criticalPending.length} 项关键设置需要你决定，确认后即可开始训练。`
+        : "计划已生成，确认参数无误后点击「批准并执行」。";
   const criticalRecommendations = recommendations.filter((r) => groups.critical.some((a) => a.field_path === r.field_path)).length;
   function renderAssumption(a: Assumption) {
     const recommendation = recommendations.find((r) => r.field_path === a.field_path);
@@ -563,121 +607,179 @@ function PlanInner({ experimentId }: { experimentId: string }) {
 
   return (
     <main className="mx-auto w-full max-w-7xl space-y-4 px-5 py-6">
-      <header className="rise flex flex-wrap items-center gap-3">
-        <Link
-          href={
-            experiment
-              ? `/papers/${experiment.paper_id}${workflowDriven ? `?workflow=${workflowId}` : ""}`
-              : "/papers"
-          }
-          className="btn btn-ghost btn-sm px-2!"
-          title="返回论文"
-        >
-          <IconArrowLeft className="h-4 w-4" />
-        </Link>
-        <div className="min-w-0 flex-1">
-          <p className="label mb-0.5">Experiment · Plan</p>
-          <h1 className="display truncate text-xl font-bold">
-            {experiment?.name ?? "实验计划"}
-          </h1>
-        </div>
-        {experiment && <span className="chip">{experiment.status}</span>}
-        {versions.length > 0 && (
-          <select
-            value={current?.version ?? ""}
-            disabled={operationBusy}
-            onChange={(e) => switchVersion(Number(e.target.value))}
-            className="select w-48!"
-            aria-label="计划版本"
+      <header className="workspace-heading space-y-4">
+        <div className="flex flex-wrap items-center gap-3">
+          <Link
+            href={
+              experiment
+                ? `/papers?id=${experiment.paper_id}${workflowDriven ? `&workflow=${workflowId}` : ""}`
+                : "/papers"
+            }
+            className="btn btn-ghost btn-sm"
+            aria-label="返回论文"
           >
-            {versions.map((v) => (
-              <option key={v.id} value={v.version}>
-                v{v.version} · {ORIGIN_LABEL[v.origin] ?? v.origin}
-                {v.approved_at ? " · 已批准" : ""}
-              </option>
-            ))}
-          </select>
-        )}
-        <button
-          onClick={approve}
-          disabled={!canApprove || approving}
-          className="btn btn-primary btn-sm"
-        >
-          <IconCheck className="h-3.5 w-3.5" />
-          {approving
-            ? "提交中…"
-            : reviewingDelegatedNormally
-              ? `按${mode === "expert" ? "专家" : "辅助"}模式重新校验并批准`
-              : approved
-                ? storedDelegated ? "已托管批准 · 未人工核验" : "已批准"
-                : workflowDriven && wfStatus === "awaiting_plan_approval"
-                  ? "批准并执行"
-                  : "批准计划"}
-        </button>
-        {workflowDriven && wfStatus === "awaiting_plan_approval" && approved && (
-          <button onClick={continueWorkflow} disabled={operationBusy || !isLatest} className="btn btn-info btn-sm">
-            {continuing ? "提交中…" : "继续执行"}
+            <IconArrowLeft className="h-4 w-4" />
+          </Link>
+          <div className="workspace-title">
+            <p className="label mb-1">实验计划</p>
+            <h1 className="display text-2xl font-bold">
+              {experiment?.name ?? "实验计划"}
+            </h1>
+          </div>
+          {experiment && (
+            <span className="chip">{EXPERIMENT_STATUS[experiment.status] ?? experiment.status}</span>
+          )}
+          {versions.length > 0 && (
+            <select
+              value={current?.version ?? ""}
+              disabled={operationBusy}
+              onChange={(e) => switchVersion(Number(e.target.value))}
+              className="select w-52!"
+              aria-label="计划版本"
+            >
+              {versions.map((v) => (
+                <option key={v.id} value={v.version}>
+                  第 {v.version} 版 · {ORIGIN_LABEL[v.origin] ?? v.origin}
+                  {v.approved_at ? " · 已批准" : ""}
+                </option>
+              ))}
+            </select>
+          )}
+        </div>
+
+        <div className="flex flex-wrap items-center gap-3 rounded-lg bg-ink-800 px-4 py-3">
+          <p className="min-w-52 flex-1 text-[15px] leading-relaxed text-fg-2">{planHeadline}</p>
+          <button
+            onClick={approve}
+            disabled={!canApprove || approving}
+            className="btn btn-primary"
+          >
+            <IconCheck className="h-4 w-4" />
+            {approving
+              ? "提交中…"
+              : reviewingDelegatedNormally
+                ? `按「${REVIEW_MODE_TEXT[mode] ?? mode}」重新校验并批准`
+                : approved
+                  ? storedDelegated ? "已托管批准 · 未人工核验" : "已批准"
+                  : workflowDriven && wfStatus === "awaiting_plan_approval"
+                    ? "批准并执行"
+                    : "批准计划"}
           </button>
-        )}
+          {workflowDriven && wfStatus === "awaiting_plan_approval" && approved && (
+            <button onClick={continueWorkflow} disabled={operationBusy || !isLatest} className="btn btn-info">
+              {continuing ? "提交中…" : "继续执行"}
+            </button>
+          )}
+          <button className="btn btn-ghost btn-sm" disabled={operationBusy} onClick={() => {
+            setError(null);
+            Promise.all([loadExperiment(), loadVersions()]).catch((err) => setError(err.message));
+          }}>刷新</button>
+        </div>
       </header>
 
-      <ReviewModeSelector mode={mode} onChange={setMode} disabled={operationBusy || !current}
-        delegationDisabled={writeDisabled} onDelegate={() => { if (!writeDisabled) setDelegationTarget(current); }} />
-      {delegationTarget && <DelegationDialog version={delegationTarget.version} workflowDriven={workflowDriven}
-        budget={`${delegationTarget.plan.runtime_budget.max_seconds} 秒 · ${delegationTarget.plan.runtime_budget.device}`}
-        onConfirm={authorizeDelegation} onCancel={() => setDelegationTarget(null)}
-        onExpert={() => { setDelegationTarget(null); setMode("expert"); }} />}
-      {plan?.review_mode === "delegated" && <DelegationNotice delegatedAt={plan.delegated_at} delegatedBy={plan.delegated_by} />}
-      {reviewingDelegatedNormally && <p role="status" className="rounded-lg border border-warn/40 bg-warn/10 px-4 py-3 text-sm text-warn">
-        仅切换了本地审核模式，尚未保存。原版本{savedApproved ? `已于 ${current?.approved_at} 按托管批准` : "的托管记录保留"}，不代表专家或辅助模式已批准。
-        按所选模式重新批准将校验关键假设并撤销新版本授权；也可人工编辑创建新版本。
-      </p>}
-      {current && !isLatest && <p className="text-sm text-warn">正在查看历史版本，仍可人工编辑产生分支；授权、AI 采纳或批准前请加载最新版本。</p>}
-      {loading && <p role="status" className="text-xs text-fg-3">正在加载计划版本…</p>}
-      <button className="btn btn-ghost btn-sm" disabled={operationBusy} onClick={() => {
-        setError(null);
-        Promise.all([loadExperiment(), loadVersions()]).catch((err) => setError(err.message));
-      }}>加载最新版本</button>
+      <nav className="experiment-nav grid gap-2 sm:grid-cols-3" aria-label="实验步骤">
+        {([
+          {
+            key: "plan",
+            no: "1",
+            title: "设置与确认",
+            hint: criticalPending.length
+              ? `还有 ${criticalPending.length} 项要你决定`
+              : "设置已确认，可以开始",
+          },
+          { key: "run", no: "2", title: "训练与结果", hint: "跑完看结论和报告" },
+          { key: "versions", no: "3", title: "修改记录", hint: `共 ${versions.length} 个版本` },
+        ] as const).map((item) => {
+          const active = view === item.key;
+          return (
+            <button
+              key={item.key}
+              onClick={() => goView(item.key)}
+              aria-current={active ? "step" : undefined}
+              className={`rounded-xl border px-4 py-3 text-left transition ${
+                active
+                  ? "border-brand/50 bg-brand/8"
+                  : "border-line bg-ink-900/60 hover:border-fg-3/30"
+              }`}
+            >
+              <span className="flex items-center gap-2">
+                <span
+                  className={`flex h-5 w-5 items-center justify-center rounded-full text-[12px] ${
+                    active ? "bg-brand text-ink-950" : "bg-line text-fg-3"
+                  }`}
+                >
+                  {item.no}
+                </span>
+                <span className={`text-[15px] font-semibold ${active ? "text-fg" : "text-fg-2"}`}>
+                  {item.title}
+                </span>
+              </span>
+              <span className="mt-1 block text-[12.5px] text-fg-3">{item.hint}</span>
+            </button>
+          );
+        })}
+      </nav>
 
-      {workflow && (
-        <WorkflowStepper
-          status={workflow.status}
-          currentNode={workflow.current_node}
-          error={workflow.error}
-          onRetry={retry}
-          retrying={retrying}
-        />
-      )}
-      {workflow && <WorkflowInsights workflow={workflow} />}
+      {workflow && <WorkflowInsights key={workflow.id} workflow={workflow} onRetry={retry} retrying={retrying} />}
 
-      {approved && (
-        <p className={`rise rounded-lg border px-4 py-2 text-sm ${storedDelegated ? "border-warn/40 bg-warn/10 text-warn" : "border-ok/40 bg-ok/10 text-ok"}`}>
-          该计划版本已{storedDelegated ? "托管" : ""}批准（{current?.approved_at}），{storedDelegated ? "关键假设未经人工逐项核验，结果仅供趋势参考。" : "可进入代码生成阶段。"}
-        </p>
-      )}
       {!approved && criticalPending.length > 0 && (
-        <p className="rise flex flex-wrap items-center gap-2 rounded-lg border border-bad/40 bg-bad/10 px-4 py-2 text-sm text-bad">
+        <p className="rise flex flex-wrap items-center gap-2 rounded-lg border border-bad/40 bg-bad/10 px-4 py-3 text-[14px] text-bad">
           <IconWarn className="h-4 w-4 shrink-0" />
-          还需确认 {criticalPending.length} 项关键假设后方可批准：
-          <span className="font-mono text-xs">{criticalPending.map((a) => a.field_path).join("、")}</span>
+          还需确认 {criticalPending.length} 项关键设置才能开始训练，详见下方「关键设置」：
+          <span className="text-[13px]">这些是会影响实验本质的取值，下方「关键设置」里已用红色标出</span>
         </p>
       )}
       {shownError && (
-        <div role="alert" className="rise space-y-2 rounded-lg border border-bad/40 bg-bad/10 px-4 py-2 text-sm text-bad">
+        <div role="alert" className="rise space-y-2 rounded-lg border border-bad/40 bg-bad/10 px-4 py-3 text-[14px] text-bad">
           <p>{shownError}</p>
-          {storedDelegated && <button className="btn btn-ghost btn-sm" disabled={operationBusy} onClick={() => setMode("expert")}>切换专家模式，人工审核</button>}
+          {storedDelegated && <button className="btn btn-ghost btn-sm" disabled={operationBusy} onClick={() => setMode("expert")}>切换人工逐项确认</button>}
         </div>
       )}
 
-      {plan && (
+      {view === "plan" && (
+      <details className="card px-4 py-3">
+        <summary className="cursor-pointer list-none text-[13.5px] text-fg-2">
+          审核方式：<span className="text-fg">{REVIEW_MODE_TEXT[mode] ?? mode}</span>
+          <span className="ml-2 text-fg-3">（点开可切换，一般用不到）</span>
+        </summary>
+        <div className="mt-3 space-y-3">
+          <ReviewModeSelector mode={mode} onChange={setMode} disabled={operationBusy || !current}
+            delegationDisabled={writeDisabled} onDelegate={() => { if (!writeDisabled) setDelegationTarget(current); }} />
+          {delegationTarget && <DelegationDialog version={delegationTarget.version} workflowDriven={workflowDriven}
+            budget={`${delegationTarget.plan.runtime_budget.max_seconds} 秒 · ${delegationTarget.plan.runtime_budget.device}`}
+            onConfirm={authorizeDelegation} onCancel={() => setDelegationTarget(null)}
+            onExpert={() => { setDelegationTarget(null); setMode("expert"); }} />}
+          {plan?.review_mode === "delegated" && <DelegationNotice delegatedAt={plan.delegated_at} delegatedBy={plan.delegated_by} />}
+          {reviewingDelegatedNormally && <p role="status" className="rounded-lg border border-warn/40 bg-warn/10 px-4 py-3 text-[13.5px] text-warn">
+            只切换了本页的显示方式，还没保存。原版本{savedApproved ? `已于 ${current?.approved_at} 按托管方式批准` : "的托管记录仍然有效"}，
+            不代表已按新模式审核。按新模式重新批准会重新校验关键设置并撤销原授权。
+          </p>}
+          {current && !isLatest && <p className="text-[13.5px] text-warn">你正在查看历史版本。要批准或让 AI 采纳建议，请先点上方「刷新」回到最新版。</p>}
+          {loading && <p role="status" className="text-[13px] text-fg-3">正在加载计划…</p>}
+        </div>
+      </details>
+      )}
+
+      {plan && view === "plan" && (
+        <>
         <div className="grid gap-5 lg:grid-cols-2">
           <section className="rise rise-1 space-y-5">
             <div className="card border-scale/30 bg-scale/8 p-4">
-              <span className="chip badge-scale mb-2">{plan.scaling_profile}</span>
-              <p className="text-[13px] leading-relaxed text-fg-2">{plan.rationale}</p>
+              <div className="mb-2 flex flex-wrap items-center gap-2">
+                <span className="chip badge-scale">缩小规模运行</span>
+                <span className="text-[12px] text-fg-3" title={plan.scaling_profile}>
+                  策略：{plan.scaling_profile}
+                </span>
+              </div>
+              <p className="text-[13.5px] leading-relaxed text-fg-2">{plan.rationale}</p>
             </div>
 
-            <Section title="训练配置 Training（点击编辑/确认）">
+            <Section title="训练设置（点一项即可修改或确认）">
+              {delegated && (
+                <p className="mb-1 text-[12.5px] leading-relaxed text-warn/90">
+                  以下取值由系统自动接受，没有人逐项看过；要改可以直接点开改。
+                </p>
+              )}
               {editables
                 .filter((e) => e.path.startsWith("training_config."))
                 .map((item) => (
@@ -689,12 +791,12 @@ function PlanInner({ experimentId }: { experimentId: string }) {
                     onClick={() => { setEditPrefill(null); setSelected(item); }}
                   />
                 ))}
-              <p className="font-mono text-[10.5px] text-fg-3">
+              <p className="font-mono text-[12px] text-fg-3">
                 seed = {plan.training_config.seed}（固定）
               </p>
             </Section>
 
-            <Section title="数据集 Dataset">
+            <Section title="数据集">
               {editables
                 .filter((e) => e.path.startsWith("dataset_config."))
                 .map((item) => (
@@ -706,7 +808,7 @@ function PlanInner({ experimentId }: { experimentId: string }) {
                     onClick={() => { setEditPrefill(null); setSelected(item); }}
                   />
                 ))}
-              <p className="font-mono text-[10.5px] text-fg-3">
+              <p className="font-mono text-[12px] text-fg-3">
                 {plan.dataset_config.name} · input {plan.dataset_config.input_shape.join("×")} ·{" "}
                 {plan.dataset_config.num_classes} classes · full train{" "}
                 {plan.dataset_config.full_train_size ?? "—"} / test{" "}
@@ -714,7 +816,7 @@ function PlanInner({ experimentId }: { experimentId: string }) {
               </p>
             </Section>
 
-            <Section title="模型 Model">
+            <Section title="模型结构">
               <div className="card px-3 py-2 text-sm">
                 <span className="font-mono text-[13px] text-fg">{plan.model_config.architecture}</span>
                 {plan.model_config.description && (
@@ -723,26 +825,30 @@ function PlanInner({ experimentId }: { experimentId: string }) {
               </div>
             </Section>
 
-            <Section title="预处理 Preprocessing">
-              {plan.preprocessing_config.steps.map((s) => (
-                <div key={s.name} className="card px-3 py-2 text-sm">
-                  <div className="flex items-center justify-between gap-2">
-                    <span className="text-fg">{s.name}</span>
-                    <SourceBadge source={s.source} by={assumptions.find((a) => a.field_path === `preprocessing_config.${s.name}`)?.confirmed_by} />
-                  </div>
-                  <span className="mt-0.5 block text-xs text-fg-3">{s.detail}</span>
+            <Section title="数据预处理">
+              {plan.preprocessing_config.steps.map((step) => (
+                <div key={step.name} className="card px-3 py-2.5 text-sm">
+                  <span className="text-[14px] text-fg">{fieldLabel(`preprocessing_config.${step.name}`)}</span>
+                  {step.detail && (
+                    <details className="mt-1">
+                      <summary className="cursor-pointer text-[12.5px] text-fg-3">
+                        看具体做法{step.detail.length > 40 ? "（论文原文）" : ""}
+                      </summary>
+                      <p className="mt-1 text-[12.5px] leading-relaxed text-fg-3">{step.detail}</p>
+                    </details>
+                  )}
                 </div>
               ))}
             </Section>
 
-            <Section title="评估 Evaluation">
+            <Section title="评估方式">
               <div className="card space-y-1.5 px-3 py-2 text-sm">
                 <p className="text-fg-2">
                   指标：<span className="font-mono text-[12px] text-fg">{plan.evaluation_config.metrics.join(", ")}</span>
                   {" · "}目标：<span className="font-mono text-[12px] text-brand">{plan.evaluation_config.target_metric}</span>
                 </p>
                 {plan.evaluation_config.reported_value != null && (
-                  <p className="font-mono text-[10.5px] text-fg-3">
+                  <p className="font-mono text-[12px] text-fg-3">
                     原文报告：{plan.evaluation_config.reported_value}
                     {plan.evaluation_config.reported_condition
                       ? `（${plan.evaluation_config.reported_condition}）`
@@ -754,8 +860,11 @@ function PlanInner({ experimentId }: { experimentId: string }) {
                 )}
                 <p className="text-xs text-warn/90">{plan.evaluation_config.comparison_note}</p>
               </div>
+              {!executableMetric(plan.evaluation_config.target_metric) && <p role="alert" className="rounded-lg bg-warn/10 p-3 text-sm text-warn">
+                当前指标无法在本执行器中计算。请修改下方「执行目标」，选择 accuracy（准确率）、error_rate（错误率）或 test_loss（测试损失），保存后再批准。
+              </p>}
               {editables
-                .filter((e) => e.path === "evaluation_config.tolerance")
+                .filter((e) => e.path.startsWith("evaluation_config."))
                 .map((item) => (
                   <EditRow
                     key={item.path}
@@ -767,7 +876,7 @@ function PlanInner({ experimentId }: { experimentId: string }) {
                 ))}
             </Section>
 
-            <Section title="运行预算 Runtime">
+            <Section title="运行预算">
               {editables
                 .filter((e) => e.path === "runtime_budget.max_seconds")
                 .map((item) => (
@@ -779,7 +888,7 @@ function PlanInner({ experimentId }: { experimentId: string }) {
                     onClick={() => { setEditPrefill(null); setSelected(item); }}
                   />
                 ))}
-              <div className="card px-3 py-2 font-mono text-[10.5px] leading-relaxed text-fg-3">
+              <div className="card px-3 py-2 font-mono text-[12px] leading-relaxed text-fg-3">
                 <p>
                   device {plan.runtime_budget.device} · est {plan.expected_runtime.estimated_seconds}s ·
                   mem ~{plan.resource_estimates.estimated_memory_mb ?? "—"}MB · disk ~
@@ -804,7 +913,7 @@ function PlanInner({ experimentId }: { experimentId: string }) {
                   <blockquote className="quote">
                     “{selected.param.evidence_quote}”
                     {selected.param.source_page != null && (
-                      <span className="ml-2 font-mono text-[10.5px] not-italic text-fg-3">
+                      <span className="ml-2 font-mono text-[12px] not-italic text-fg-3">
                         p.{selected.param.source_page}
                       </span>
                     )}
@@ -838,12 +947,15 @@ function PlanInner({ experimentId }: { experimentId: string }) {
               </div>
             ) : (
               <p className="rounded-xl border border-dashed border-line p-4 text-sm text-fg-3">
-                点击左侧参数可编辑或确认；每次修改都会生成新版本，旧版本保留。
+                点击左侧任意一项即可修改取值或确认。每次修改都会保存为新版本，旧版本不会被覆盖。
               </p>
             )}
 
             <div className="card space-y-3 p-4">
-              <h2 className="label text-info!">AI 辅助审核 · 当前版本</h2>
+              <h2 className="label text-info!">AI 可以帮你审一遍（可选）</h2>
+              <p className="text-[13px] leading-relaxed text-fg-3">
+                让 AI 解释每项设置在做什么，或直接给出建议值。采纳建议会生成新版本，不会替你批准。
+              </p>
               <ReviewRequestStatus label="通俗解读" loading={explanations.loading} error={explanations.error}
                 loaded={!!explanations.data} disabled={operationBusy || !hasPending} onLoad={explanations.load} onExpert={() => setMode("expert")} />
               <ReviewRequestStatus label="AI 推荐" loading={advice.loading} error={advice.error}
@@ -862,16 +974,22 @@ function PlanInner({ experimentId }: { experimentId: string }) {
                   </button>
                 </div>
               </>}
-              {!hasPending && <p className="text-xs text-fg-3">本版本没有待审核假设。</p>}
+              {!hasPending && <p className="text-xs text-fg-3">当前版本没有需要你确认的项。</p>}
             </div>
 
             <div className="space-y-4">
-              <Section title={`关键假设 Critical（${groups.critical.length}）`}>
+              <Section title={`必须你决定的设置（${groups.critical.length} 项）`}>
+                <p className="mb-2 text-[13px] leading-relaxed text-fg-3">
+                  这些取值会改变实验本质（例如换掉论文原本的优化器或损失函数）。确认前不会开始训练。
+                </p>
                 {groups.critical.length === 0 && <p className="text-sm text-fg-3">（无）</p>}
                 {groups.critical.map(renderAssumption)}
               </Section>
 
-              <Section title={`常规假设 Routine（${groups.routine.length}）`}>
+              <Section title={`影响较小的设置（${groups.routine.length} 项）`}>
+                <p className="mb-2 text-[13px] leading-relaxed text-fg-3">
+                  论文没写细节、但有安全默认值的项，可以一次性全部接受。
+                </p>
                 {routinePending.length > 0 && <p className="text-xs text-fg-3">人工批量确认当前值，不采用 AI 修改建议。</p>}
                 {routinePending.length > 0 && (
                   <button onClick={acceptRoutine} disabled={operationBusy} className="btn btn-info btn-sm w-full">
@@ -886,7 +1004,7 @@ function PlanInner({ experimentId }: { experimentId: string }) {
               {groups.info.length > 0 && (
                 <details>
                   <summary className="label cursor-pointer text-fg-2! focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-brand">
-                    说明 Info（{groups.info.length}）· 仅告知，不需确认
+                    仅作说明（{groups.info.length} 项）· 不需要操作
                   </summary>
                   <div className="mt-1.5 space-y-1.5">
                     {groups.info.map(renderAssumption)}
@@ -895,69 +1013,30 @@ function PlanInner({ experimentId }: { experimentId: string }) {
               )}
             </div>
 
-            <Section title={`与原文偏差 Deviations（${plan.deviations_from_paper.length}）`}>
-              {plan.deviations_from_paper.length === 0 && (
-                <p className="text-sm text-fg-3">（无）</p>
-              )}
-              {plan.deviations_from_paper.map((d) => (
-                <div key={d.field_path} className="card px-3 py-2 text-sm">
-                  <div className="flex items-center justify-between gap-2">
-                    <span className="truncate font-mono text-[10.5px] text-fg-3">{d.field_path}</span>
-                    <span className="shrink-0 font-mono text-[10.5px]">
-                      <span className="text-fg-3">原文 {d.paper_value ?? "—"}</span>
-                      <span className="mx-1 text-fg-3">→</span>
-                      <span className="text-scale">{d.plan_value}</span>
-                    </span>
-                  </div>
-                  <p className="mt-0.5 text-xs text-fg-3">{d.reason}</p>
-                </div>
-              ))}
-            </Section>
-
-            <Section title="版本历史 Versions">
-              <div className="space-y-1.5">
-                {versions.map((v) => (
-                  <button
-                    key={v.id}
-                    onClick={() => switchVersion(v.version)}
-                    disabled={operationBusy}
-                    className={`field-row cursor-pointer! ${current?.version === v.version ? "field-row-active" : ""}`}
-                  >
-                    <span className="min-w-0">
-                      <span className="block font-mono text-[12px] text-fg">
-                        v{v.version} · {ORIGIN_LABEL[v.origin] ?? v.origin}
-                      </span>
-                      {v.change_reason && (
-                        <span className="block truncate text-[11px] text-fg-3">{v.change_reason}</span>
-                      )}
-                    </span>
-                    {v.approved_at && <span className="chip badge-ok shrink-0">已批准</span>}
-                  </button>
-                ))}
-              </div>
-              {current && current.changes.length > 0 && (
-                <div className="card space-y-1 bg-ink-950/70 px-3 py-2 font-mono text-[10.5px] text-fg-2">
-                  <p className="label text-[9px]!">本版本改动（前 → 后）</p>
-                  {current.changes.map((c) => (
-                    <p key={c.id} className="break-all">
-                      {c.field_path}: {String(c.before)} → {String(c.after)}
-                      {c.confirmed_by && <> · <ConfirmationBadge by={c.confirmed_by} /></>}
-                      {c.review_mode && <span> · {c.review_mode === "delegated" ? "托管模式" : c.review_mode === "assisted" ? "辅助模式" : "专家模式"}</span>}
-                      {c.actor && <span> · 操作者 {c.actor}</span>}
-                      {c.timestamp && <span> · {c.timestamp}</span>}
-                      {c.recommendation_id && <span> · 推荐 {c.recommendation_id}</span>}
-                      {c.recommendation_confidence != null && <span> · 推荐置信度 {(c.recommendation_confidence * 100).toFixed(0)}%</span>}
-                      {c.preselection_threshold != null && <span> · 预选阈值 {(c.preselection_threshold * 100).toFixed(0)}%</span>}
-                    </p>
-                  ))}
-                  {current.related_error && (
-                    <p className="mt-1 text-bad">关联错误：{current.related_error}</p>
-                  )}
-                </div>
-              )}
-            </Section>
           </section>
         </div>
+        <Section title={`和论文不一样的地方（${plan.deviations_from_paper.length} 项）`}>
+          <p className="mb-2 text-[13px] leading-relaxed text-fg-3">
+            为了在几分钟内跑完而有意缩小的规模。这些改动会拉低数值，但不改变方法本身的正确性。
+          </p>
+          {plan.deviations_from_paper.length === 0 && (
+            <p className="text-sm text-fg-3">（无）</p>
+          )}
+          {plan.deviations_from_paper.map((d) => (
+            <div key={d.field_path} className="card px-3 py-2 text-sm">
+              <div className="flex items-center justify-between gap-2">
+                <span className="truncate font-mono text-[12px] text-fg-3">{d.field_path}</span>
+                <span className="shrink-0 font-mono text-[12px]">
+                  <span className="text-fg-3">原文 {d.paper_value ?? "—"}</span>
+                  <span className="mx-1 text-fg-3">→</span>
+                  <span className="text-scale">{d.plan_value}</span>
+                </span>
+              </div>
+              <p className="mt-0.5 text-xs text-fg-3">{d.reason}</p>
+            </div>
+          ))}
+        </Section>
+        </>
       )}
       {!plan && !error && (
         <div className="space-y-3">
@@ -966,7 +1045,7 @@ function PlanInner({ experimentId }: { experimentId: string }) {
         </div>
       )}
 
-      {plan && !approved && (
+      {plan && !approved && view === "plan" && (
         <div className="sticky bottom-0 z-20 -mx-5 mt-2 border-t border-line bg-ink-950/85 px-5 py-3 backdrop-blur">
           <div className="flex flex-wrap items-center gap-3">
             <span
@@ -981,10 +1060,10 @@ function PlanInner({ experimentId }: { experimentId: string }) {
                 ? `还需确认 ${criticalPending.length} 项关键假设`
                 : "关键假设已齐，可批准"}
             </span>
-            <span className="hidden font-mono text-[10.5px] text-fg-3 sm:inline">
+            <span className="hidden font-mono text-[12px] text-fg-3 sm:inline">
               关键 {groups.critical.length} · 常规 {groups.routine.length} · 说明 {groups.info.length}
             </span>
-            <span className="flex items-center gap-2 font-mono text-[10.5px] text-fg-3">
+            <span className="flex items-center gap-2 font-mono text-[12px] text-fg-3">
               已确认 {handledCount} / {decisionItems.length}
               <span
                 role="progressbar"
@@ -1024,12 +1103,118 @@ function PlanInner({ experimentId }: { experimentId: string }) {
         </div>
       )}
 
-      <RunPanel
-        experimentId={experimentId}
-        approved={approved}
-        workflowDriven={workflowDriven}
-        workflowStatus={wfStatus}
-      />
+      {view === "versions" && (
+        <section className="rise space-y-3">
+          <div className="card p-4">
+            <p className="text-[15px] font-semibold text-fg">
+              这份计划一共改过 {versions.length} 次
+            </p>
+            <p className="mt-1 text-[13.5px] leading-relaxed text-fg-2">
+              每次修改都会存成新版本，旧版本不会被覆盖，随时可以切回去看。
+              下面先列每一版的摘要，再说明这一版具体改了哪几项。
+            </p>
+          </div>
+
+          <div className="space-y-2">
+            {versions.map((v) => (
+              <button
+                key={v.id}
+                onClick={() => switchVersion(v.version)}
+                disabled={operationBusy}
+                className={`card w-full px-4 py-3 text-left transition ${
+                  current?.version === v.version ? "border-brand/50" : "hover:border-fg-3/30"
+                }`}
+              >
+                <div className="flex flex-wrap items-center gap-2">
+                  <span className="text-[15px] font-semibold text-fg">第 {v.version} 版</span>
+                  <span className="chip">{ORIGIN_LABEL[v.origin] ?? v.origin}</span>
+                  {v.approved_at && <span className="chip badge-ok">已批准</span>}
+                  <span className="ml-auto text-[12.5px] text-fg-3">{fmtDate(v.created_at)}</span>
+                </div>
+                <p className="mt-1 text-[13.5px] text-fg-2">
+                  {v.change_reason || "这一版没有填写修改说明"}
+                </p>
+              </button>
+            ))}
+          </div>
+
+          {current && current.changes.length > 0 && (
+            <div className="card p-4">
+              <p className="text-[15px] font-semibold text-fg">
+                第 {current.version} 版具体改了 {current.changes.length} 处
+              </p>
+              <p className="mt-1 text-[13px] text-fg-3">
+                只列「哪一项、从什么改成什么」。操作人、时间、推荐编号这些审计信息，收在每条的「技术信息」里。
+              </p>
+              <ul className="mt-3 space-y-2">
+                {current.changes.map((c) => (
+                  <li key={c.id} className="rounded-lg border border-line-soft bg-ink-950/50 px-3.5 py-3">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <span className="text-[14.5px] font-medium text-fg">
+                        {fieldLabel(c.field_path)}
+                      </span>
+                      {c.confirmed_by && <ConfirmationBadge by={c.confirmed_by} />}
+                    </div>
+                    <p className="mt-1.5 text-[13.5px] leading-relaxed text-fg-2">
+                      <span className="text-fg-3">原来：</span>
+                      {shortValue(c.before, 40)}
+                      <span className="mx-1.5 text-fg-3">→</span>
+                      <span className="text-fg">现在：{shortValue(c.after, 40)}</span>
+                    </p>
+                    <details className="mt-1.5">
+                      <summary className="cursor-pointer text-[12px] text-fg-3">技术信息</summary>
+                      <dl className="mt-1.5 grid gap-1 text-[12px] text-fg-3 sm:grid-cols-2">
+                        <div>
+                          <dt className="inline">字段：</dt>
+                          <dd className="inline font-mono">{c.field_path}</dd>
+                        </div>
+                        {c.actor && (
+                          <div>
+                            <dt className="inline">操作人：</dt>
+                            <dd className="inline break-all font-mono">{c.actor}</dd>
+                          </div>
+                        )}
+                        {c.timestamp && (
+                          <div>
+                            <dt className="inline">时间：</dt>
+                            <dd className="inline">{c.timestamp}</dd>
+                          </div>
+                        )}
+                        {c.recommendation_id && (
+                          <div>
+                            <dt className="inline">推荐编号：</dt>
+                            <dd className="inline break-all font-mono">{c.recommendation_id}</dd>
+                          </div>
+                        )}
+                        {c.recommendation_confidence != null && (
+                          <div>
+                            <dt className="inline">AI 置信度：</dt>
+                            <dd className="inline">
+                              {(c.recommendation_confidence * 100).toFixed(0)}%
+                            </dd>
+                          </div>
+                        )}
+                      </dl>
+                    </details>
+                  </li>
+                ))}
+              </ul>
+              {current.related_error && (
+                <p className="mt-2 text-[13px] text-bad">关联错误：{current.related_error}</p>
+              )}
+            </div>
+          )}
+        </section>
+      )}
+
+      {view === "run" && (
+        <RunPanel
+          experimentId={experimentId}
+          approved={approved}
+          workflowDriven={workflowDriven}
+          workflowStatus={wfStatus}
+        />
+      )}
     </main>
   );
 }

@@ -3,7 +3,8 @@
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { useEffect, useState } from "react";
-import { IconArrowLeft, IconLock, IconQuote, LogoMark } from "@/components/icons";
+import { IconArrowLeft, LogoMark } from "@/components/icons";
+import { isStaticSite } from "@/lib/site";
 import { supabase } from "@/lib/supabase";
 
 type Mode = "signin" | "signup" | "reset" | "update";
@@ -23,59 +24,15 @@ const SUBMIT_LABEL: Record<Mode, string> = {
 };
 
 function BrandPanel() {
-  return (
-    <div className="relative hidden overflow-hidden border-r border-line-soft bg-ink-900/70 lg:flex lg:flex-col lg:justify-between lg:p-10">
-      <div className="ambient absolute!" />
-      <div className="relative">
-        <Link href="/" className="flex items-center gap-3">
-          <LogoMark className="h-9 w-9" />
-          <span className="display text-lg font-bold tracking-wide">
-            REPRO<span className="text-brand">/</span>AGENT
-          </span>
-        </Link>
-        <p className="label mt-2">Evidence Lab · Phase 1</p>
-      </div>
-
-      <div className="relative my-10">
-        <div className="card relative mx-auto max-w-sm overflow-hidden p-6">
-          <div className="pointer-events-none absolute inset-x-0 h-10 animate-scan bg-gradient-to-b from-transparent via-brand/12 to-transparent" />
-          <p className="label mb-4 flex items-center gap-2">
-            <IconQuote className="h-3.5 w-3.5 text-brand" /> Reproduction Card
-          </p>
-          <div className="space-y-3 font-mono text-[11px]">
-            {[
-              ["method", "paper_explicit", "bg-ok"],
-              ["learning_rate", "inferred", "bg-warn"],
-              ["weight_decay", "missing", "bg-fg-3"],
-            ].map(([field, status, dot]) => (
-              <div key={field} className="flex items-center justify-between gap-3 border-b border-line-soft pb-2 last:border-0 last:pb-0">
-                <span className="text-fg-2">{field}</span>
-                <span className="flex items-center gap-2 text-fg-3">
-                  <span className={`h-1.5 w-1.5 rounded-full ${dot}`} />
-                  {status}
-                </span>
-              </div>
-            ))}
-          </div>
-          <p className="mt-4 text-[11px] leading-relaxed text-fg-3">
-            每个字段都带原文引文与页码；推断值需人工确认，缺失信息绝不伪造。
-          </p>
-        </div>
-      </div>
-
-      <div className="relative space-y-2">
-        <p className="display text-xl font-semibold leading-snug">
-          从论文到可追溯的
-          <br />
-          复现报告。
-        </p>
-        <p className="flex items-center gap-2 text-xs text-fg-3">
-          <IconLock className="h-3.5 w-3.5 text-scale" />
-          全表 RLS 行级安全 · 无密钥沙箱执行
-        </p>
-      </div>
+  return <aside className="auth-side">
+    <Link href="/" className="wordmark"><LogoMark />ReproAgent</Link>
+    <div>
+      <p className="paper-citation"><span aria-hidden="true" />LeNet-5 × MNIST</p>
+      <h2>每个参数，<br />都有来处可查。</h2>
+      <p>从论文原文开始，记录训练中的假设和调整，再对照实际运行的结果。</p>
+      <Link href="/examples/lenet-mnist#conditions" className="text-action">先看看公开实验的参数对照表</Link>
     </div>
-  );
+  </aside>;
 }
 
 export default function LoginPage() {
@@ -108,6 +65,11 @@ export default function LoginPage() {
 
   async function submit(e: React.FormEvent) {
     e.preventDefault();
+    if (isStaticSite) {
+      setError(null);
+      setNotice("当前为静态演示版，账号与复现工作台需后端服务支持；可先体验公开实验。");
+      return;
+    }
     setBusy(true);
     setError(null);
     setNotice(null);
@@ -144,18 +106,18 @@ export default function LoginPage() {
       <BrandPanel />
 
       <div className="relative flex items-center justify-center p-6">
-        <div className="ambient" />
-        <form onSubmit={submit} className="card rise relative w-full max-w-sm space-y-4 p-7">
-          <div className="mb-1 flex items-center gap-3 lg:hidden">
-            <LogoMark className="h-8 w-8" />
-            <span className="display text-base font-bold tracking-wide">
-              REPRO<span className="text-brand">/</span>AGENT
-            </span>
-          </div>
+
+        <form onSubmit={submit} className="card relative w-full max-w-md space-y-5 p-6 sm:p-9">
+          <Link href="/" className="wordmark lg:hidden"><LogoMark />ReproAgent</Link>
           <div>
-            <p className="label mb-1.5">Access · 账户</p>
             <h1 className="display text-2xl font-bold">{TITLES[mode]}</h1>
           </div>
+
+          {isStaticSite && (
+            <p className="rounded-lg border border-info/40 bg-info/10 px-3 py-2 text-xs text-info">
+              静态演示版未连接后端服务，登录与工作台暂未开放。
+            </p>
+          )}
 
           {(mode === "signin" || mode === "signup") && (
             <div className="flex gap-1 rounded-lg border border-line-soft bg-ink-950/60 p-1">
@@ -163,7 +125,8 @@ export default function LoginPage() {
                 <button
                   key={m}
                   type="button"
-                  onClick={() => setMode(m)}
+                  aria-pressed={mode === m}
+                  onClick={() => { setMode(m); setError(null); setNotice(null); }}
                   className={`tab flex-1 text-xs! ${mode === m ? "tab-active" : ""}`}
                 >
                   {m === "signin" ? "登录" : "注册"}
@@ -174,9 +137,10 @@ export default function LoginPage() {
 
           {mode !== "update" && (
             <label className="block space-y-1.5">
-              <span className="label">Email</span>
+              <span className="label">邮箱</span>
               <input
                 type="email"
+                autoComplete="email"
                 required
                 placeholder="you@lab.edu"
                 value={email}
@@ -187,9 +151,10 @@ export default function LoginPage() {
           )}
           {mode !== "reset" && (
             <label className="block space-y-1.5">
-              <span className="label">Password</span>
+              <span className="label">密码</span>
               <input
                 type="password"
+                autoComplete={mode === "signin" ? "current-password" : "new-password"}
                 required
                 minLength={6}
                 placeholder={mode === "update" ? "新密码（至少 6 位）" : "密码（至少 6 位）"}
@@ -201,12 +166,12 @@ export default function LoginPage() {
           )}
 
           {error && (
-            <p className="rounded-lg border border-bad/40 bg-bad/10 px-3 py-2 text-xs text-bad">
+            <p role="alert" className="rounded-lg border border-bad/40 bg-bad/10 px-3 py-2 text-xs text-bad">
               {error}
             </p>
           )}
           {notice && (
-            <p className="rounded-lg border border-ok/40 bg-ok/10 px-3 py-2 text-xs text-ok">
+            <p role="status" className="rounded-lg border border-ok/40 bg-ok/10 px-3 py-2 text-xs text-ok">
               {notice}
             </p>
           )}
@@ -241,6 +206,7 @@ export default function LoginPage() {
               <IconArrowLeft className="h-3.5 w-3.5" /> 返回登录
             </button>
           )}
+          <Link href="/examples/lenet-mnist" className="text-action lg:hidden">免登录体验公开实验</Link>
         </form>
       </div>
     </main>

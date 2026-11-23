@@ -1,0 +1,131 @@
+[
+  {
+    "key": "training_samples",
+    "label": "训练样本数",
+    "paper": "60,000",
+    "plan": "4096",
+    "actual": "4096",
+    "paper_evidence": {
+      "kind": "paper",
+      "source_page": 10
+    },
+    "actual_evidence": {
+      "kind": "metrics",
+      "file_path": "metrics.json"
+    },
+    "note": "只使用 MNIST 训练集的前一部分。"
+  },
+  {
+    "key": "test_samples",
+    "label": "测试样本数",
+    "paper": "10,000",
+    "plan": "1024",
+    "actual": "1024",
+    "paper_evidence": {
+      "kind": "paper",
+      "source_page": 10
+    },
+    "actual_evidence": {
+      "kind": "metrics",
+      "file_path": "metrics.json"
+    },
+    "note": "测试顺序固定，前 12 张用于互动。"
+  },
+  {
+    "key": "architecture",
+    "label": "模型结构",
+    "paper": "LeNet-5，含卷积和下采样",
+    "plan": "LeNet-5 简化实现",
+    "actual": "卷积、ReLU、最大池化、线性分类器",
+    "paper_evidence": {
+      "kind": "paper",
+      "source_page": 6
+    },
+    "actual_evidence": {
+      "kind": "code",
+      "file_path": "model.py"
+    },
+    "note": "论文包含可训练下采样和径向基输出；本次实现采用现代简化结构。"
+  },
+  {
+    "key": "epochs",
+    "label": "训练轮数",
+    "paper": null,
+    "plan": "4",
+    "actual": "4",
+    "paper_evidence": null,
+    "actual_evidence": {
+      "kind": "metrics",
+      "file_path": "metrics.json"
+    },
+    "note": "案例选择的设置；本次没有逐项核验对应原文数值。"
+  },
+  {
+    "key": "batch_size",
+    "label": "批大小",
+    "paper": null,
+    "plan": "64",
+    "actual": "64",
+    "paper_evidence": null,
+    "actual_evidence": {
+      "kind": "config",
+      "file_path": "config.yaml"
+    },
+    "note": "案例选择的设置；本次没有逐项核验对应原文数值。"
+  },
+  {
+    "key": "learning_rate",
+    "label": "学习率",
+    "paper": null,
+    "plan": "0.03",
+    "actual": "0.03",
+    "paper_evidence": null,
+    "actual_evidence": {
+      "kind": "config",
+      "file_path": "config.yaml"
+    },
+    "note": "案例选择的设置；本次没有逐项核验对应原文数值。"
+  },
+  {
+    "key": "optimizer",
+    "label": "优化器",
+    "paper": null,
+    "plan": "sgd",
+    "actual": "sgd",
+    "paper_evidence": null,
+    "actual_evidence": {
+      "kind": "config",
+      "file_path": "config.yaml"
+    },
+    "note": "案例选择的设置；本次没有逐项核验对应原文数值。"
+  },
+  {
+    "key": "loss_function",
+    "label": "损失函数",
+    "paper": null,
+    "plan": "cross entropy",
+    "actual": "cross entropy",
+    "paper_evidence": null,
+    "actual_evidence": {
+      "kind": "config",
+      "file_path": "config.yaml"
+    },
+    "note": "案例选择的设置；本次没有逐项核验对应原文数值。"
+  },
+  {
+    "key": "target_metric",
+    "label": "测试错误率",
+    "paper": "0.95%（无形变训练）",
+    "plan": "error_rate",
+    "actual": "11.23%",
+    "paper_evidence": {
+      "kind": "paper",
+      "source_page": 11
+    },
+    "actual_evidence": {
+      "kind": "metrics",
+      "file_path": "metrics.json"
+    },
+    "note": "训练规模、模型细节与测试集不同；单次运行无法归因。"
+  }
+]

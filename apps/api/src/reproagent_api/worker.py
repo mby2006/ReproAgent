@@ -31,6 +31,7 @@ from .clients.agent import AgentClient
 from .clients.runner import RunnerClient
 from .clients.supabase import make_service_client
 from .config import ApiSettings
+from .services.comparisons import execute_comparison
 from .services.runs import load_execution_plan
 from .workflow import (
     WorkflowContext,
@@ -292,12 +293,37 @@ async def recover_workflow_task(ctx: dict, workflow_id: str) -> None:
             await wctx.runner.aclose()
 
 
+async def run_comparison_task(ctx: dict, comparison_id: str) -> None:
+    """Drive a paired comparison: paired runs, verification, report.
+
+    Idempotent by construction: an advisory lock guarantees a single driver per
+    comparison (duplicate submits, restart recovery), and groups that already
+    have a succeeded -- or still in-flight -- run are reused instead of retrained.
+    """
+    settings: ApiSettings = ctx["settings"]
+    admin = make_service_client(settings)
+    with _drive_lock(settings, comparison_id) as acquired:
+        if not acquired:
+            logger.info(
+                "comparison %s: another driver holds the thread; skipping", comparison_id
+            )
+            return
+        agent = AgentClient(settings, transport=ctx.get("agent_transport"))
+        runner = RunnerClient(settings, transport=ctx.get("runner_transport"))
+        try:
+            await execute_comparison(admin, agent, runner, comparison_id)
+        finally:
+            await agent.aclose()
+            await runner.aclose()
+
+
 class WorkerSettings:
     functions = [
         run_workflow_task,
         resume_workflow_task,
         run_experiment_task,
         recover_workflow_task,
+        run_comparison_task,
     ]
     max_tries = 1
     job_timeout = 1200
@@ -318,6 +344,11 @@ class WorkerSettings:
         for row in rows:
             if row["status"] not in TERMINAL and row["status"] not in AWAITING and redis:
                 await redis.enqueue_job("recover_workflow_task", row["id"])
+        # Comparisons resume the same way: completed groups are skipped, so a
+        # crash mid-pair only re-runs what is missing.
+        for row in admin.table("comparisons").select("id,status").execute().data:
+            if row["status"] in ("queued", "running") and redis:
+                await redis.enqueue_job("run_comparison_task", row["id"])
 
     @staticmethod
     async def on_shutdown(ctx: dict) -> None:

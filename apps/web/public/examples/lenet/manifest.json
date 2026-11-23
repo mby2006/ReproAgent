@@ -1,0 +1,17 @@
+{
+  "run": "01993dd36ff17102",
+  "model_sha256": "01993dd36ff1710272c3c50e16a0ffb10dc2015c08e8080b22b7e480b2c83b47",
+  "image": "sha256:fa1fd2bb702a373743724232390fddbb450765771490f7160618a2cb91be0f99",
+  "finished_at": "2026-11-21T08:02:35.867905+00:00",
+  "files": {
+    "train.py.txt": "6d65b11375f2ece21de1f57be13b20543526a2d1782c74d78fa4e1f87635734b",
+    "model.py.txt": "0185e5588ea1862ebb60f752c530426d2416ff379b3802cc925bf87579889c06",
+    "evaluate.py.txt": "d41e1630b8ef4261d3d024ce21a46ace53b226c7d8d7b86a1cdeb3804a6379f0",
+    "config.yaml": "b9c15362a92f2eeb19e11c30fb593a700137f013ffea45922c66cc83ce41c5a8",
+    "metrics.json": "f936de3a4da28e59061e5649a5fef0c51866b67fe91550495d8677ddc0367f47",
+    "prediction_examples.json": "c97b3d6db4ed63f4d2200cab0d21d1a0f3daacea577e9978903ed66a25f0db8b",
+    "eval_metrics.json": "bca9831169a500d516eff15d78a476ba7a470ff3e8dfa23c3f2e5346cd47b2b9",
+    "conditions.json": "614066d900f2e4f6dce40451295d4ce141cae7743ef30fe517560cfbb0f0bc44",
+    "report.md": "8e20529747189a7483ff4a913486f3bd6afdf82d96f736a56e51aa4e8b2526d7"
+  }
+}

@@ -1,8 +1,9 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { IconPlay, IconStop } from "@/components/icons";
 import { apiFetch } from "@/lib/api";
+import { PrivatePredictions } from "@/components/PredictionReader";
 import ReportPanel from "./ReportPanel";
 import type {
   ArtifactRecord,
@@ -32,18 +33,18 @@ function StatusBadge({ status }: { status: RunStatus }) {
 function AuditField({ label, value }: { label: string; value: React.ReactNode }) {
   return (
     <div className="rounded-lg border border-line-soft bg-ink-950/60 px-3 py-2">
-      <span className="label block text-[9px]!">{label}</span>
-      <span className="block truncate font-mono text-[11px] text-fg-2" title={String(value)}>
+      <span className="label block text-[11px]!">{label}</span>
+      <span className="block truncate font-mono text-[12px] text-fg-2" title={String(value)}>
         {value}
       </span>
     </div>
   );
 }
 
-function MetricTile({ name, value, target }: { name: string; value: unknown; target: boolean }) {
+function MetricTile({ name, value, target, unitKey }: { unitKey: string; name: string; value: unknown; target: boolean }) {
   const numeric = typeof value === "number";
   const isRatio =
-    numeric && (name === "accuracy" || name === "metric_value") && value >= 0 && value <= 1;
+    numeric && (unitKey === "accuracy" || unitKey === "error_rate") && value >= 0 && value <= 1;
   const display = numeric
     ? isRatio
       ? `${(value * 100).toFixed(2)}%`
@@ -59,7 +60,7 @@ function MetricTile({ name, value, target }: { name: string; value: unknown; tar
           : "border-line-soft bg-ink-950/60"
       }`}
     >
-      <span className="label flex items-center gap-1.5 text-[9px]!">
+      <span className="label flex items-center gap-1.5 text-[11px]!">
         {name}
         {target && <span className="chip badge-brand px-1! py-0! text-[8.5px]!">target</span>}
       </span>
@@ -81,7 +82,7 @@ function LossBars({ train, test }: { train: number; test: number }) {
   ];
   return (
     <div className="card space-y-2 p-3">
-      <p className="label text-[9px]!">Loss Overview</p>
+      <p className="label text-[11px]!">Loss Overview</p>
       {rows.map((r) => (
         <div key={r.label} className="space-y-1">
           <div className="flex items-center justify-between font-mono text-[10px] text-fg-3">
@@ -125,13 +126,16 @@ export default function RunPanel({
     return list;
   }, [experimentId]);
 
+  const requestVersion = useRef(0);
   const loadDetail = useCallback(async (runId: string) => {
+    const version = ++requestVersion.current;
     const [d, l, a, f] = await Promise.all([
       apiFetch<RunDetail>(`/v1/runs/${runId}`),
       apiFetch<RunLogs>(`/v1/runs/${runId}/logs`).catch(() => ({ stdout: "", stderr: "" })),
       apiFetch<ArtifactRecord[]>(`/v1/runs/${runId}/artifacts`).catch(() => []),
       apiFetch<CodeFileRecord[]>(`/v1/runs/${runId}/files`).catch(() => []),
     ]);
+    if (version !== requestVersion.current) return;
     setDetail(d);
     setLogs(l);
     setArtifacts(a);
@@ -148,7 +152,10 @@ export default function RunPanel({
 
   useEffect(() => {
     if (!selectedId) return;
+    setDetail(null);
+    setOpenFile(null);
     loadDetail(selectedId).catch((err) => setError(err.message));
+    return () => { requestVersion.current++; };
   }, [selectedId, loadDetail]);
 
   useEffect(() => {
@@ -212,6 +219,7 @@ export default function RunPanel({
   const metrics = detail?.metrics_json ?? {};
   const audit = detail?.audit_json ?? {};
   const targetMetric = typeof metrics.target_metric === "string" ? metrics.target_metric : null;
+  const legacyTarget = metrics.schema_version !== "1.1" && targetMetric != null && !["accuracy", "test accuracy"].includes(targetMetric.toLowerCase());
   const trainLoss = typeof metrics.train_loss === "number" ? metrics.train_loss : null;
   const testLoss = typeof metrics.test_loss === "number" ? metrics.test_loss : null;
 
@@ -220,7 +228,7 @@ export default function RunPanel({
       <div className="flex flex-wrap items-center gap-3">
         <div>
           <p className="label mb-0.5">Execution · 沙箱容器</p>
-          <h2 className="display text-base font-bold">执行 Run</h2>
+          <h2 className="display text-lg font-bold">训练执行</h2>
         </div>
         {!workflowDriven && (
           <button onClick={execute} disabled={!approved || starting} className="btn btn-primary btn-sm">
@@ -265,7 +273,7 @@ export default function RunPanel({
         </p>
       )}
 
-      {detail && (
+      {detail && detail.id === selectedId && (
         <div className="space-y-4">
           <div className="flex flex-wrap items-center gap-2">
             <StatusBadge status={detail.status} />
@@ -291,13 +299,14 @@ export default function RunPanel({
 
           <div className="grid gap-4 lg:grid-cols-[1.2fr_1fr]">
             <div className="space-y-2">
-              <h3 className="label">Metrics · 指标</h3>
+              <h3 className="label">训练指标</h3>
               {Object.keys(metrics).length === 0 ? (
                 <p className="text-sm text-fg-3">（暂无指标输出）</p>
               ) : (
                 <div className="grid grid-cols-2 gap-2 sm:grid-cols-3">
-                  {Object.entries(metrics).map(([k, v]) => (
-                    <MetricTile key={k} name={k} value={v} target={k === targetMetric || k === "metric_value"} />
+                  {legacyTarget && <p className="text-sm text-warn">旧版目标值的单位无法核实，请参阅独立记录的准确率。</p>}
+                  {Object.entries(metrics).filter(([k]) => !(legacyTarget && k === "metric_value")).map(([k, v]) => (
+                    <MetricTile key={k} unitKey={k === "metric_value" ? targetMetric ?? "" : k} name={k} value={v} target={k === targetMetric || k === "metric_value"} />
                   ))}
                 </div>
               )}
@@ -305,17 +314,20 @@ export default function RunPanel({
                 <LossBars train={trainLoss} test={testLoss} />
               )}
             </div>
-            <div className="space-y-2">
-              <h3 className="label">Audit · 审计</h3>
-              <div className="grid grid-cols-1 gap-1.5 sm:grid-cols-2">
-                <AuditField label="Python" value={audit.python_version ?? "—"} />
-                <AuditField label="seed" value={audit.seed ?? "—"} />
-                <AuditField label="image digest" value={audit.image_digest ?? "—"} />
-                <AuditField label="dep lock hash" value={audit.dependency_lock_hash ?? "—"} />
-                <AuditField label="dataset fingerprint" value={audit.dataset_fingerprint ?? "—"} />
-                <AuditField label="code hash" value={audit.code_hash ?? detail.code_hash ?? "—"} />
+            <details className="space-y-2">
+              <summary className="label cursor-pointer">
+                环境审计（技术细节）
+                <span className="ml-2 font-normal text-fg-3">核对这次跑的环境和数据集是否和记录一致</span>
+              </summary>
+              <div className="mt-2 grid grid-cols-1 gap-1.5 sm:grid-cols-2">
+                <AuditField label="Python 版本" value={audit.python_version ?? "—"} />
+                <AuditField label="随机种子" value={audit.seed ?? "—"} />
+                <AuditField label="执行镜像指纹" value={audit.image_digest ?? "—"} />
+                <AuditField label="依赖锁指纹" value={audit.dependency_lock_hash ?? "—"} />
+                <AuditField label="数据集指纹" value={audit.dataset_fingerprint ?? "—"} />
+                <AuditField label="代码指纹" value={audit.code_hash ?? detail.code_hash ?? "—"} />
               </div>
-            </div>
+            </details>
           </div>
 
           <div className="terminal">
@@ -337,7 +349,7 @@ export default function RunPanel({
               )}
             </div>
             {tab !== "files" ? (
-              <pre className="max-h-80 overflow-auto px-3 py-2 font-mono text-[11px] leading-relaxed text-fg-2">
+              <pre className="max-h-80 overflow-auto px-3 py-2 font-mono text-[12px] leading-relaxed text-fg-2">
                 {(tab === "stdout" ? logs?.stdout : logs?.stderr) || "（空）"}
                 {running && <span className="animate-blink text-brand">▍</span>}
               </pre>
@@ -345,7 +357,7 @@ export default function RunPanel({
               <div className="space-y-1.5 p-3">
                 {files.length === 0 && <p className="text-sm text-fg-3">（无代码文件）</p>}
                 {files.map((f) => (
-                  <div key={`${f.path}-${f.version}`} className="rounded-lg border border-line-soft bg-ink-900/80 px-3 py-2 text-sm">
+                  <div id={`run-file-${f.path}`} key={`${f.path}-${f.version}`} className="rounded-lg border border-line-soft bg-ink-900/80 px-3 py-2 text-sm">
                     <button
                       onClick={() => setOpenFile(openFile === f.path ? null : f.path)}
                       className="flex w-full items-center justify-between gap-2 text-left"
@@ -362,7 +374,7 @@ export default function RunPanel({
                       <span className="block text-xs text-bad">关联错误：{f.related_error}</span>
                     )}
                     {openFile === f.path && f.content && (
-                      <pre className="mt-2 max-h-72 overflow-auto rounded-lg bg-ink-950 px-3 py-2 font-mono text-[10.5px] leading-relaxed text-fg-2">
+                      <pre className="mt-2 max-h-72 overflow-auto rounded-lg bg-ink-950 px-3 py-2 font-mono text-[12px] leading-relaxed text-fg-2">
                         {f.content}
                       </pre>
                     )}
@@ -374,7 +386,7 @@ export default function RunPanel({
 
           {artifacts.length > 0 && (
             <div className="space-y-1.5">
-              <h3 className="label">Artifacts · 产物（{artifacts.length}）</h3>
+              <h3 className="label">训练产物（{artifacts.length}）</h3>
               <div className="flex flex-wrap gap-1.5">
                 {artifacts.map((a) => (
                   <span key={a.id} className="chip" title={a.storage_path}>
@@ -385,7 +397,16 @@ export default function RunPanel({
             </div>
           )}
 
-          {RUN_TERMINAL.includes(detail.status) && <ReportPanel runId={detail.id} />}
+          {detail.status === "succeeded" && <section className="space-y-3">
+            <h2 className="display text-xl font-semibold">这次实验认对了多少张？</h2>
+            {typeof metrics.correct_count === "number" && typeof metrics.evaluated_count === "number" &&
+              <p>在 {metrics.evaluated_count} 张测试图片中，模型认对了 {metrics.correct_count} 张。下方展示按测试顺序保存的样本。</p>}
+            <PrivatePredictions key={detail.id} runId={detail.id}/>
+          </section>}
+          {RUN_TERMINAL.includes(detail.status) && <ReportPanel key={detail.id} runId={detail.id} onFile={path => {
+            setTab("files"); setOpenFile(path);
+            requestAnimationFrame(() => document.getElementById(`run-file-${path}`)?.scrollIntoView({block:"center"}));
+          }} />}
         </div>
       )}
     </section>

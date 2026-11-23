@@ -486,7 +486,21 @@ export interface ReportReferences {
   review_trace_ids?: string[];
 }
 
+export interface ParameterComparison {
+  key: string;
+  label: string;
+  paper?: string | null;
+  plan?: string | null;
+  actual?: string | null;
+  paper_evidence?: EvidenceRef | null;
+  actual_evidence?: EvidenceRef | null;
+  decision?: string | null;
+  note: string;
+}
+
 export interface EvaluationReport {
+  target_metric?: string | null;
+  parameter_comparisons?: ParameterComparison[];
   review_mode?: ReviewMode | null;
   delegated_at?: string | null;
   delegated_by?: string | null;

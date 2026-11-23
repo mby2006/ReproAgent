@@ -2,13 +2,14 @@
 
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { apiFetch } from "@/lib/api";
 import { supabase } from "@/lib/supabase";
 import type { WorkflowDetail } from "@/lib/types";
 import { TONE_DOT, WF_META } from "@/lib/ui";
 import {
   IconGrid,
+  IconFlask,
   IconLogout,
   IconMenu,
   IconPapers,
@@ -18,13 +19,17 @@ import {
 } from "./icons";
 
 const NAV = [
-  { href: "/", label: "总览", en: "OVERVIEW", icon: IconGrid },
-  { href: "/papers", label: "论文库", en: "PAPERS", icon: IconPapers },
-  { href: "/health", label: "服务健康", en: "HEALTH", icon: IconPulse },
+  { href: "/", label: "首页", icon: IconGrid },
+  { href: "/examples/lenet-mnist", label: "公开实验", icon: IconFlask },
+  { href: "/papers", label: "论文库", icon: IconPapers },
+  { href: "/health", label: "服务健康", icon: IconPulse },
 ];
 
 function isActive(pathname: string, href: string) {
   if (href === "/") return pathname === "/";
+  if (href === "/papers") {
+    return ["/papers", "/experiments", "/comparison"].some((p) => pathname.startsWith(p));
+  }
   return pathname.startsWith(href);
 }
 
@@ -58,22 +63,17 @@ function SidebarBody({ onNavigate }: { onNavigate?: () => void }) {
 
   return (
     <div className="flex h-full flex-col gap-6 overflow-y-auto p-4">
-      <Link href="/" onClick={onNavigate} className="flex items-center gap-3 px-1 pt-1">
-        <LogoMark className="h-9 w-9 shrink-0" />
-        <span className="min-w-0">
-          <span className="display block text-[17px] font-bold leading-tight tracking-wide">
-            REPRO<span className="text-brand">/</span>AGENT
-          </span>
-          <span className="label block text-[9.5px]!">Evidence Lab · Phase 1</span>
-        </span>
+      <Link href="/" onClick={onNavigate} className="wordmark px-1 pt-1">
+        <LogoMark />ReproAgent
       </Link>
 
-      <nav className="space-y-1">
+      <nav className="space-y-1" aria-label="工作台导航">
         {NAV.map((item) => {
           const active = isActive(pathname, item.href);
           const Icon = item.icon;
           return (
             <Link
+              aria-current={active ? "page" : undefined}
               key={item.href}
               href={item.href}
               onClick={onNavigate}
@@ -81,14 +81,13 @@ function SidebarBody({ onNavigate }: { onNavigate?: () => void }) {
             >
               <Icon className="h-4 w-4 shrink-0" />
               <span className="flex-1">{item.label}</span>
-              <span className="label text-[9px]! opacity-70">{item.en}</span>
             </Link>
           );
         })}
       </nav>
 
       <div className="min-h-0 flex-1">
-        <p className="label mb-2 px-1">Live Workflows</p>
+        <p className="label mb-2 px-1">最近的实验</p>
         {workflows === null ? (
           <p className="px-1 text-xs text-fg-3">登录后可见实时工作流。</p>
         ) : workflows.length === 0 ? (
@@ -100,7 +99,7 @@ function SidebarBody({ onNavigate }: { onNavigate?: () => void }) {
               return (
                 <li key={wf.id}>
                   <Link
-                    href={`/papers/${wf.paper_id}?workflow=${wf.id}`}
+                    href={`/papers?id=${wf.paper_id}&workflow=${wf.id}`}
                     onClick={onNavigate}
                     className="group flex items-center gap-2.5 rounded-lg border border-transparent px-2 py-1.5 transition hover:border-line hover:bg-ink-800"
                     title={`${meta.label} · ${wf.current_node ?? wf.status}`}
@@ -136,7 +135,7 @@ function SidebarBody({ onNavigate }: { onNavigate?: () => void }) {
             </span>
             <button
               onClick={() => supabase.auth.signOut().then(() => router.replace("/login"))}
-              className="link-quiet shrink-0"
+              className="link-quiet grid size-11 shrink-0 place-items-center"
               title="退出登录"
             >
               <IconLogout className="h-4 w-4" />
@@ -153,16 +152,24 @@ function SidebarBody({ onNavigate }: { onNavigate?: () => void }) {
 }
 
 export default function Shell({ children }: { children: React.ReactNode }) {
+  const drawer = useRef<HTMLDialogElement>(null);
+  const closeButton = useRef<HTMLButtonElement>(null);
   const [open, setOpen] = useState(false);
-  const pathname = usePathname();
 
   useEffect(() => {
-    setOpen(false);
-  }, [pathname]);
+    const desktop = window.matchMedia("(min-width: 1024px)");
+    const closeOnDesktop = () => { if (desktop.matches) drawer.current?.close(); };
+    desktop.addEventListener("change", closeOnDesktop);
+    return () => desktop.removeEventListener("change", closeOnDesktop);
+  }, []);
+
+  useEffect(() => {
+    if (open) closeButton.current?.focus();
+  }, [open]);
 
   return (
     <div className="relative min-h-dvh">
-      <div className="ambient" />
+      <a className="skip-link" href="#workspace-content">跳到工作区</a>
 
       <aside className="fixed inset-y-0 left-0 z-30 hidden w-64 border-r border-line-soft bg-ink-900/85 backdrop-blur-md lg:block">
         <SidebarBody />
@@ -170,38 +177,28 @@ export default function Shell({ children }: { children: React.ReactNode }) {
 
       <header className="sticky top-0 z-30 flex items-center gap-3 border-b border-line-soft bg-ink-950/85 px-4 py-2.5 backdrop-blur-md lg:hidden">
         <button
-          onClick={() => setOpen(true)}
+          onClick={() => { drawer.current?.showModal(); setOpen(true); }}
+          aria-controls="workspace-navigation"
+          aria-expanded={open}
           className="btn btn-ghost btn-sm px-2!"
           aria-label="打开导航"
         >
           <IconMenu className="h-4 w-4" />
         </button>
-        <LogoMark className="h-6 w-6" />
-        <span className="display text-sm font-bold tracking-wide">
-          REPRO<span className="text-brand">/</span>AGENT
-        </span>
+        <Link href="/" className="wordmark"><LogoMark />ReproAgent</Link>
       </header>
 
-      {open && (
-        <div className="fixed inset-0 z-40 lg:hidden">
-          <div
-            className="absolute inset-0 bg-ink-950/70 backdrop-blur-sm"
-            onClick={() => setOpen(false)}
-          />
-          <aside className="rise absolute inset-y-0 left-0 w-72 border-r border-line bg-ink-900 shadow-2xl">
-            <button
-              onClick={() => setOpen(false)}
-              className="absolute right-3 top-3 z-10 text-fg-3 hover:text-fg"
-              aria-label="关闭导航"
-            >
-              <IconX className="h-4 w-4" />
-            </button>
-            <SidebarBody onNavigate={() => setOpen(false)} />
-          </aside>
-        </div>
-      )}
+      <dialog ref={drawer} id="workspace-navigation" className="workspace-drawer" aria-label="工作台导航"
+        onClose={() => setOpen(false)} onClick={event => { if (event.target === event.currentTarget) drawer.current?.close(); }}>
+        {open && <div className="relative h-full">
+          <button ref={closeButton} type="button" className="drawer-close" aria-label="关闭导航" onClick={() => drawer.current?.close()}>
+            <IconX />
+          </button>
+          <SidebarBody onNavigate={() => drawer.current?.close()} />
+        </div>}
+      </dialog>
 
-      <div className="relative z-10 lg:pl-64">{children}</div>
+      <div id="workspace-content" tabIndex={-1} className="relative z-10 lg:pl-64">{children}</div>
     </div>
   );
 }

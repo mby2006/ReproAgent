@@ -213,6 +213,17 @@ class ResourceEstimates(SchemaModel):
     note: str | None = None
 
 
+def execution_metric(name: str) -> str | None:
+    key = name.strip().lower().replace("_", " ")
+    if key in {"accuracy", "test accuracy", "top1 accuracy", "top-1 accuracy"}:
+        return "accuracy"
+    if key in {"error", "error rate", "test error", "test error rate", "misclassification rate"}:
+        return "error_rate"
+    if key in {"loss", "test loss", "cross entropy loss"}:
+        return "test_loss"
+    return None
+
+
 class ExperimentPlan(_PlanModel):
     review_mode: ReviewMode = ReviewMode.ASSISTED
     delegated_at: datetime | None = None
@@ -236,6 +247,8 @@ class ExperimentPlan(_PlanModel):
         return self
 
     def approval_ready(self, actor: UUID | None = None) -> bool:
+        if execution_metric(self.evaluation_config.target_metric) is None:
+            return False
         if self.review_mode is not ReviewMode.DELEGATED:
             return not self.unconfirmed_critical()
         if self.delegated_at is None or self.delegated_by is None:

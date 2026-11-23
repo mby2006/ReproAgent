@@ -1,5 +1,6 @@
 "use client";
 
+import ParameterTable from "@/components/ParameterTable";
 import { useCallback, useEffect, useState } from "react";
 import MetricChart from "@/components/MetricChart";
 import { IconDownload, IconRefresh, IconWarn } from "@/components/icons";
@@ -11,6 +12,7 @@ import type {
   RunReport,
 } from "@/lib/types";
 import { CHECK_META, FINAL_META, TONE_BADGE, fmtNum } from "@/lib/ui";
+import { fieldLabel, missingGloss, shortValue } from "@/lib/fieldLabels";
 
 const METHOD_ITEM_LABEL: Record<string, string> = {
   architecture: "架构",
@@ -119,20 +121,101 @@ function evidenceTitle(ref: { source_page?: number | null; quote?: string | null
   return parts.join(" · ") || "无证据";
 }
 
-function Section({ title, count, children }: { title: string; count?: number; children: React.ReactNode }) {
+function Section({
+  title,
+  count,
+  hint,
+  collapsed,
+  children,
+}: {
+  title: string;
+  count?: number;
+  hint?: string;
+  collapsed?: boolean;
+  children: React.ReactNode;
+}) {
+  const heading = (
+    <>
+      <h3 className="label">{title}</h3>
+      {count != null && <span className="chip py-0! font-mono">{count}</span>}
+      <span className="h-px flex-1 bg-line-soft" />
+    </>
+  );
+  if (collapsed) {
+    return (
+      <details className="group">
+        <summary className="flex cursor-pointer list-none items-center gap-2 [&::-webkit-details-marker]:hidden">
+          {heading}
+          <span className="text-[12.5px] text-fg-3 group-open:hidden">展开</span>
+          <span className="hidden text-[12.5px] text-fg-3 group-open:inline">收起</span>
+        </summary>
+        <div className="mt-2 space-y-2">{children}</div>
+      </details>
+    );
+  }
   return (
     <div className="space-y-2">
-      <div className="flex items-center gap-2">
-        <h3 className="label">{title}</h3>
-        {count != null && <span className="chip py-0! font-mono">{count}</span>}
-        <span className="h-px flex-1 bg-line-soft" />
-      </div>
+      <div className="flex items-center gap-2">{heading}</div>
+      {hint && <p className="text-[13px] leading-relaxed text-fg-3">{hint}</p>}
       {children}
     </div>
   );
 }
 
-export default function ReportPanel({ runId }: { runId: string }) {
+function metricText(value: number | null | undefined, unit?: string | null) {
+  if (value == null) return "—";
+  if (unit === "fraction") return `${(value * 100).toFixed(2)}%`;
+  return fmtNum(value);
+}
+
+export function FinalSummary({ data }: { data: EvaluationReport }) {
+  const meta = FINAL_META[data.final_status];
+  const targetName = data.target_metric ?? data.parameter_comparisons?.find(row => row.key === "target_metric")?.plan;
+  const target = data.metric_comparisons.find(row => row.metric === targetName);
+  const box =
+    meta.tone === "ok" ? "border-ok/35 bg-ok/8"
+    : meta.tone === "bad" ? "border-bad/35 bg-bad/8"
+    : meta.tone === "warn" ? "border-warn/35 bg-warn/8"
+    : meta.tone === "info" ? "border-info/35 bg-info/8"
+    : "border-line bg-ink-900";
+  return (
+    <div className={`rounded-xl border px-5 py-4 ${box}`}>
+      <p className="text-[12.5px] text-fg-3">结论</p>
+      <p className="display mt-1 text-2xl font-semibold text-fg">{meta.label}</p>
+
+      {target ? <>
+        <p className="mt-3 text-sm">主指标 <strong>{target.metric}</strong>（{target.unit === "fraction" ? "%" : target.unit}）</p>
+        <dl className="mt-4 grid grid-cols-3 gap-3">
+          {[
+            ["论文报告", metricText(target.paper_value, target.unit), "text-info"],
+            ["本次实验", metricText(target.experiment_value, target.unit), "text-brand"],
+            [
+              target.percentage_point_difference == null ? "绝对差" : "百分点差",
+              target.percentage_point_difference == null
+                ? metricText(target.absolute_difference, target.unit)
+                : `${target.percentage_point_difference >= 0 ? "+" : ""}${target.percentage_point_difference.toFixed(2)} 个百分点`,
+              "text-fg",
+            ],
+          ].map(([label, value, tone]) => (
+            <div key={label} className="rounded-lg border border-line/70 bg-ink-950/40 px-3 py-2">
+              <dt className="text-[12px] text-fg-3">{label}</dt>
+              <dd className={`mt-0.5 font-mono text-[15px] font-semibold ${tone}`}>{value}</dd>
+            </div>
+          ))}
+        </dl>
+      </> : <p className="mt-3 text-sm text-fg-3">
+        {targetName ? `报告缺少主指标 ${targetName} 的对比记录。` : "历史报告未记录主指标。"} 可重新生成报告核查。
+      </p>}
+
+      <p className="mt-4 text-[14.5px] leading-relaxed text-fg-2">{data.summary}</p>
+      <p className="mt-2 text-[13px] leading-relaxed text-fg-3">
+        判定顺序：先看实验有没有跑成功，再看代码实现是否和论文一致，最后才比较数值是否落在允许范围内。
+      </p>
+    </div>
+  );
+}
+
+export default function ReportPanel({ runId, onFile }: { runId: string; onFile: (path: string) => void }) {
   const [report, setReport] = useState<RunReport | null>(null);
   const [missing, setMissing] = useState(false);
   const [busy, setBusy] = useState(false);
@@ -188,12 +271,22 @@ export default function ReportPanel({ runId }: { runId: string }) {
   }
 
   const data: EvaluationReport | null = report?.report_json ?? null;
+  const paperId = data?.references.paper_id;
+  const [pdfUrl, setPdfUrl] = useState<string | null>(null);
+  useEffect(() => {
+    if (!paperId) return;
+    const controller = new AbortController();
+    apiFetch<{url: string}>(`/v1/papers/${paperId}/pdf`, {signal:controller.signal})
+      .then(result => { if (!controller.signal.aborted) setPdfUrl(result.url); })
+      .catch(() => {});
+    return () => controller.abort();
+  }, [paperId]);
   const finalMeta = data ? FINAL_META[data.final_status] : null;
 
   return (
     <section className="card space-y-4 p-4">
       <div className="flex flex-wrap items-center gap-3">
-        <h2 className="label">复现报告 Report</h2>
+        <h2 className="display text-xl font-semibold">复现报告</h2>
         {data && finalMeta && (
           <span className={`chip ${TONE_BADGE[finalMeta.tone]}`}>
             {data.final_status} · {finalMeta.label}
@@ -202,12 +295,12 @@ export default function ReportPanel({ runId }: { runId: string }) {
         <div className="ml-auto flex flex-wrap gap-2">
           {report && (
             <>
-              <button onClick={() => setShowMarkdown((v) => !v)} className="btn btn-ghost btn-sm">
+              <button aria-pressed={showMarkdown} onClick={() => setShowMarkdown((v) => !v)} className="btn btn-ghost btn-sm">
                 {showMarkdown ? "结构化视图" : "Markdown 原文"}
               </button>
               <button onClick={download} className="btn btn-ghost btn-sm">
                 <IconDownload className="h-3.5 w-3.5" />
-                下载 .md
+                下载报告
               </button>
             </>
           )}
@@ -232,18 +325,14 @@ export default function ReportPanel({ runId }: { runId: string }) {
 
       {data && finalMeta && !showMarkdown && (
         <div className="space-y-5">
-          <div className={`rounded-lg border px-4 py-3 ${
-            finalMeta.tone === "ok" ? "border-ok/30 bg-ok/8"
-            : finalMeta.tone === "bad" ? "border-bad/30 bg-bad/8"
-            : finalMeta.tone === "warn" ? "border-warn/30 bg-warn/8"
-            : finalMeta.tone === "info" ? "border-info/30 bg-info/8"
-            : "border-line bg-ink-900"
-          }`}>
-            <p className="display text-lg font-semibold text-fg">{finalMeta.label}</p>
-            <p className="mt-1 text-sm leading-relaxed text-fg-2">{data.summary}</p>
-          </div>
+          <FinalSummary data={data} />
+          {!!data.parameter_comparisons?.length && <ParameterTable rows={data.parameter_comparisons} pdfUrl={pdfUrl} onFile={onFile}/>}
 
-          <Section title="结果对比 Results Comparison" count={data.metric_comparisons.length}>
+          <Section
+            title="关键指标：论文 vs 本次"
+            count={data.metric_comparisons.length}
+            hint="“论文报告”来自论文原文（附页码证据），“本次实验”来自本次运行日志。“百分点差”比相对百分比更直观：99% 降到 90% 是差 9 个百分点。"
+          >
             <MetricChart comparisons={data.metric_comparisons} />
             <div className="overflow-x-auto rounded-lg border border-line">
               <table className="table-lab">
@@ -264,9 +353,11 @@ export default function ReportPanel({ runId }: { runId: string }) {
                     <tr key={c.metric} title={c.note ?? undefined}>
                       <td className="font-mono">{c.metric}</td>
                       <td className="font-mono text-info" title={evidenceTitle(c.paper_evidence)}>
-                        {fmtNum(c.paper_value)}
+                        {metricText(c.paper_value, c.unit)}
                       </td>
-                      <td className="font-mono text-brand">{fmtNum(c.experiment_value)}</td>
+                      <td className="font-mono text-brand">
+                        {metricText(c.experiment_value, c.unit)}
+                      </td>
                       <td className="font-mono">{fmtNum(c.absolute_difference)}</td>
                       <td className="font-mono">{fmtNum(c.relative_difference)}</td>
                       <td className="font-mono">
@@ -285,7 +376,12 @@ export default function ReportPanel({ runId }: { runId: string }) {
             </div>
           </Section>
 
-          <Section title="方法验证 Method Validation" count={data.method_checks.length}>
+          <Section
+            title="代码实现是否和论文一致"
+            count={data.method_checks.length}
+            hint="逐项比较论文写的和代码里真正实现的。“论文没写清”表示论文未给出该细节，无法判断对错。"
+            collapsed
+          >
             <div className="overflow-x-auto rounded-lg border border-line">
               <table className="table-lab">
                 <thead>
@@ -318,7 +414,12 @@ export default function ReportPanel({ runId }: { runId: string }) {
             </div>
           </Section>
 
-          <Section title="实验验证 Experiment Validation" count={data.experiment_checks.length}>
+          <Section
+            title="计划要跑的 vs 实际跑的"
+            count={data.experiment_checks.length}
+            hint="确认实际训练规模、优化器等与批准的计划完全一致，防止“说一套跑一套”。"
+            collapsed
+          >
             <div className="overflow-x-auto rounded-lg border border-line">
               <table className="table-lab">
                 <thead>
@@ -350,11 +451,14 @@ export default function ReportPanel({ runId }: { runId: string }) {
           </Section>
 
           {data.scaling_deviations.length > 0 && (
-            <Section title="缩放偏差 Scaling Deviations">
+            <Section
+            title="为跑得动而缩小的部分"
+            hint="这些是有意调整，用来把实验压缩到几分钟。它们会拉低数值，但不影响方法本身的正确性。"
+          >
               <ul className="space-y-1.5">
                 {data.scaling_deviations.map((d) => (
                   <li key={d.field_path} className="rounded-lg border border-scale/25 bg-scale/6 px-3 py-2 text-xs text-fg-2">
-                    <span className="font-mono text-scale">{d.field_path}</span>
+                    <span className="text-[13px] font-medium text-scale">{fieldLabel(d.field_path)}</span>
                     <span className="mx-1.5 font-mono">{d.paper_value ?? "—"}</span>→
                     <span className="ml-1.5 font-mono text-fg">{d.plan_value}</span>
                     <span className="ml-2 text-fg-3">（{d.reason}）</span>
@@ -365,12 +469,20 @@ export default function ReportPanel({ runId }: { runId: string }) {
           )}
 
           {data.missing_information.length > 0 && (
-            <Section title="缺失信息 Missing Information">
+            <Section
+            title="论文没写清的地方"
+            hint="论文常见“只给结论不给细节”，这些空缺只能靠假设补齐，也是结果不确定的主要来源。"
+          >
               <ul className="space-y-1.5">
                 {data.missing_information.map((m, i) => (
-                  <li key={i} className="flex items-start gap-2 rounded-lg border border-warn/25 bg-warn/6 px-3 py-2 text-xs text-warn">
-                    <IconWarn className="mt-0.5 h-3.5 w-3.5 shrink-0" />
-                    {m}
+                  <li key={i} className="rounded-lg border border-warn/25 bg-warn/6 px-3 py-2">
+                    <p className="flex items-start gap-2 text-[13px] text-warn">
+                      <IconWarn className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+                      <span className="break-words">{shortValue(m, 110)}</span>
+                    </p>
+                    <p className="mt-1 pl-5 text-[12.5px] leading-relaxed text-fg-3">
+                      {missingGloss(m)}
+                    </p>
                   </li>
                 ))}
               </ul>
@@ -378,11 +490,16 @@ export default function ReportPanel({ runId }: { runId: string }) {
           )}
 
           {data.assumptions.length > 0 && (
-            <Section title="Agent 假设 Assumptions" count={data.assumptions.length}>
+            <Section
+            title="系统补上的假设"
+            count={data.assumptions.length}
+            hint="论文没写、由系统补上的取值。右侧标签说明它是人工确认、AI 建议后采纳，还是系统自动接受。"
+            collapsed
+          >
               <ul className="space-y-1.5">
                 {data.assumptions.map((a, i) => (
                   <li key={i} className="rounded-lg border border-line bg-ink-900 px-3 py-2 text-xs text-fg-2">
-                    <span className="font-mono text-info">{a.field_path}</span>
+                    <span className="text-[13px] font-medium text-fg">{fieldLabel(a.field_path)}</span>
                     <span className="chip mx-1.5 py-0!">{a.kind}</span>=
                     <span className="ml-1.5 font-mono text-fg">{String(a.value)}</span>
                     <span className="ml-2 text-fg-3">— {a.rationale}</span>
@@ -395,11 +512,18 @@ export default function ReportPanel({ runId }: { runId: string }) {
             </Section>
           )}
 
-          <Section title="审核 Trace（已脱敏）" count={(data.review_decisions ?? []).length}>
+          <Section
+            title="谁在什么时候改了什么（已脱敏）"
+            count={(data.review_decisions ?? []).length}
+            collapsed
+          >
             <ReviewAudit decisions={data.review_decisions ?? []} />
           </Section>
 
-          <Section title="已知局限 Known Limitations">
+          <Section
+            title="这份报告的限制"
+            hint="这些限制决定了结论能被用到什么程度，请和上面的结论一起读。"
+          >
             <ul className="space-y-1 text-xs leading-relaxed text-fg-3">
               {data.limitations.map((l, i) => (
                 <li key={i} className="flex gap-2">
@@ -410,7 +534,7 @@ export default function ReportPanel({ runId }: { runId: string }) {
             </ul>
           </Section>
 
-          <Section title="追溯引用 Trace References">
+          <Section title="技术追溯信息" collapsed>
             <div className="grid grid-cols-1 gap-1.5 text-xs sm:grid-cols-2 lg:grid-cols-4">
               {[
                 ["Paper ID", data.references.paper_id],
@@ -423,7 +547,7 @@ export default function ReportPanel({ runId }: { runId: string }) {
                 ["固定代码文件", `${data.references.generated_file_ids.length} 个`],
               ].map(([label, value]) => (
                 <div key={label} className="rounded-lg border border-line bg-ink-900 px-3 py-2">
-                  <span className="label block text-[9px]!">{label}</span>
+                  <span className="label block text-[11px]!">{label}</span>
                   <span className="mt-0.5 block break-all font-mono text-fg-2">{value}</span>
                 </div>
               ))}
@@ -447,7 +571,7 @@ export default function ReportPanel({ runId }: { runId: string }) {
             <span className="terminal-dot bg-bad/70" />
             <span className="terminal-dot bg-warn/70" />
             <span className="terminal-dot bg-ok/70" />
-            <span className="font-mono text-[11px] text-fg-3">reproduction-report-{runId.slice(0, 8)}.md</span>
+            <span className="font-mono text-[12px] text-fg-3">reproduction-report-{runId.slice(0, 8)}.md</span>
           </div>
           <pre className="max-h-[32rem] overflow-auto px-4 py-3 text-xs leading-relaxed text-fg-2">
             {report.markdown}

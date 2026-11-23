@@ -1,5 +1,6 @@
 "use client";
 
+import WorkflowStepper from "@/components/WorkflowStepper";
 import { useEffect, useState } from "react";
 import { getWorkflowTraces } from "@/lib/api";
 import type { NodeTrace, WorkflowDetail } from "@/lib/types";
@@ -11,19 +12,41 @@ function num(budget: Record<string, unknown>, key: string): number {
 }
 
 function BudgetBar({ budget }: { budget: Record<string, unknown> }) {
+  // Every number here answers a question a non-specialist actually asks:
+  // how much AI was used, how long the training took, how much self-repair happened.
   const items = [
-    { label: "LLM 调用", value: String(num(budget, "llm_calls")) },
-    { label: "Tokens", value: num(budget, "total_tokens").toLocaleString() },
-    { label: "实验时长", value: `${num(budget, "experiment_seconds").toFixed(1)}s` },
-    { label: "自动修复", value: String(num(budget, "repair_count")) },
-    { label: "重新规划", value: String(num(budget, "replan_count")) },
+    {
+      label: "AI 调用次数",
+      value: String(num(budget, "llm_calls")),
+      hint: "读论文、给建议时调用大模型的次数",
+    },
+    {
+      label: "AI 用量",
+      value: num(budget, "total_tokens").toLocaleString(),
+      hint: "消耗的 token 数，越大花费越高",
+    },
+    {
+      label: "训练耗时",
+      value: `${num(budget, "experiment_seconds").toFixed(1)} 秒`,
+      hint: "沙箱里真实跑训练花的时间",
+    },
+    {
+      label: "自动修复次数",
+      value: String(num(budget, "repair_count")),
+      hint: "代码报错后自动重试的次数",
+    },
+    {
+      label: "重新规划次数",
+      value: String(num(budget, "replan_count")),
+      hint: "计划被推翻重做的次数",
+    },
   ];
   return (
     <div className="grid grid-cols-2 gap-px overflow-hidden rounded-xl border border-line bg-line sm:grid-cols-5">
       {items.map((item) => (
-        <div key={item.label} className="bg-ink-900/90 px-3 py-2">
-          <p className="label text-[9px]!">{item.label}</p>
-          <p className="display mt-0.5 truncate text-lg font-semibold text-fg" title={item.value}>
+        <div key={item.label} className="bg-ink-900/90 px-3.5 py-3" title={item.hint}>
+          <p className="text-[12px] text-fg-3">{item.label}</p>
+          <p className="display mt-1 truncate text-xl font-semibold text-fg" title={item.value}>
             {item.value}
           </p>
         </div>
@@ -59,12 +82,12 @@ export function TraceRow({ trace }: { trace: NodeTrace }) {
         <span className="font-mono text-[12px] text-fg">{review ? "审核决策" : trace.node_name}</span>
         {review && <span className="break-all text-xs text-fg-2">{traceValue(trace.input_json.field_path)} · {source}</span>}
         {trace.duration_ms !== null && (
-          <span className="font-mono text-[10.5px] text-fg-3">{trace.duration_ms}ms</span>
+          <span className="font-mono text-[12px] text-fg-3">{trace.duration_ms}ms</span>
         )}
         {trace.model_name && (
-          <span className="truncate font-mono text-[10.5px] text-fg-3">{trace.model_name}</span>
+          <span className="truncate font-mono text-[12px] text-fg-3">{trace.model_name}</span>
         )}
-        {tokens && <span className="font-mono text-[10.5px] text-fg-3">{tokens} tok</span>}
+        {tokens && <span className="font-mono text-[12px] text-fg-3">{tokens} tok</span>}
         {trace.retry_count > 0 && (
           <span className="chip badge-warn py-0!">retry {trace.retry_count}</span>
         )}
@@ -94,14 +117,14 @@ export function TraceRow({ trace }: { trace: NodeTrace }) {
           </dl>
         ) : <div className="grid gap-2 lg:grid-cols-2">
           <div>
-            <p className="label mb-1 text-[9px]!">input（已脱敏）</p>
-            <pre className="max-h-48 overflow-auto rounded-lg bg-ink-950 p-2 font-mono text-[10.5px] leading-relaxed text-fg-2">
+            <p className="label mb-1 text-[11px]!">input（已脱敏）</p>
+            <pre className="max-h-48 overflow-auto rounded-lg bg-ink-950 p-2 font-mono text-[12px] leading-relaxed text-fg-2">
               {JSON.stringify(trace.input_json, null, 2)}
             </pre>
           </div>
           <div>
-            <p className="label mb-1 text-[9px]!">output（已脱敏）</p>
-            <pre className="max-h-48 overflow-auto rounded-lg bg-ink-950 p-2 font-mono text-[10.5px] leading-relaxed text-fg-2">
+            <p className="label mb-1 text-[11px]!">output（已脱敏）</p>
+            <pre className="max-h-48 overflow-auto rounded-lg bg-ink-950 p-2 font-mono text-[12px] leading-relaxed text-fg-2">
               {JSON.stringify(trace.output_json, null, 2)}
             </pre>
           </div>
@@ -111,7 +134,9 @@ export function TraceRow({ trace }: { trace: NodeTrace }) {
   );
 }
 
-export default function WorkflowInsights({ workflow }: { workflow: WorkflowDetail }) {
+export default function WorkflowInsights({ workflow, onRetry, retrying }: {
+  workflow: WorkflowDetail; onRetry?: () => void; retrying?: boolean;
+}) {
   const [traces, setTraces] = useState<NodeTrace[]>([]);
   const [error, setError] = useState<string | null>(null);
 
@@ -131,6 +156,8 @@ export default function WorkflowInsights({ workflow }: { workflow: WorkflowDetai
 
   return (
     <section className="rise space-y-2">
+      <WorkflowStepper status={workflow.status} currentNode={workflow.current_node}
+        error={workflow.error} onRetry={onRetry} retrying={retrying} traces={traces} />
       <BudgetBar budget={workflow.budget_json} />
       <details className="card group overflow-hidden">
         <summary className="flex cursor-pointer list-none items-center gap-2 px-4 py-2 text-sm text-fg-2 [&::-webkit-details-marker]:hidden">

@@ -7,10 +7,11 @@ The API process never executes generated code.
 """
 
 from datetime import datetime
-from typing import Annotated
+from typing import Annotated, Literal
 from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
+from pydantic import Field, ValidationError
 from reproagent_schemas import (
     ErrorCategory,
     RunAccepted,
@@ -226,6 +227,38 @@ async def get_artifacts(
         .data
     )
     return [ArtifactRecord.model_validate(row) for row in rows]
+
+
+class PredictionExample(SchemaModel):
+    index: int = Field(ge=0)
+    pixels: str = Field(pattern=r"^[0-9a-f]{1568}$")
+    label: int = Field(ge=0, le=9)
+    prediction: int = Field(ge=0, le=9)
+
+
+class PredictionExamples(SchemaModel):
+    version: Literal[1]
+    samples: list[PredictionExample] = Field(min_length=1, max_length=12)
+
+
+@router.get("/runs/{run_id}/prediction-examples", response_model=PredictionExamples)
+async def get_prediction_examples(
+    request: Request, run_id: UUID, user_id: Annotated[UUID, Depends(get_current_user_id)]
+) -> PredictionExamples:
+    admin = _admin(request)
+    run = _get_run(admin, run_id, user_id)
+    if run["status"] != RunStatus.SUCCEEDED.value:
+        raise HTTPException(404, "本次运行没有预测样本")
+    path = f"{run_id}/attempt-{run['repair_attempt']}/artifacts/prediction_examples.json"
+    rows = (admin.table("execution_artifacts").select("storage_path")
+            .eq("run_id", str(run_id)).eq("storage_path", path).execute().data)
+    if not rows:
+        raise HTTPException(404, "这次运行未保存逐样本预测")
+    data = admin.storage.from_("runs").download(path)
+    try:
+        return PredictionExamples.model_validate_json(data)
+    except ValidationError as exc:
+        raise HTTPException(502, "该运行的预测样本格式无效") from exc
 
 
 @router.get("/runs/{run_id}/files", response_model=list[CodeFileRecord])

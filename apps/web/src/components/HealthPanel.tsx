@@ -95,7 +95,7 @@ export default function HealthPanel() {
   return (
     <section className="card space-y-4 p-5">
       <div className="flex flex-wrap items-center gap-3">
-        <h2 className="label">Service Health</h2>
+        <h2 className="label">服务连接</h2>
         <span className={`chip ${okCount === cards.length ? "badge-ok" : okCount > 1 ? "badge-warn" : "badge-bad"}`}>
           {okCount}/{cards.length} 正常
         </span>

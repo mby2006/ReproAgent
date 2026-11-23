@@ -7,7 +7,16 @@ from .graph.build import build_graph, build_planning_graph, build_understanding_
 from .llm.base import LLMAdapter
 from .llm.factory import get_llm_adapter
 from .review import ReviewService
-from .routers import codegen, evaluation, health, plans, reproductions, review, understand
+from .routers import (
+    codegen,
+    comparisons,
+    evaluation,
+    health,
+    plans,
+    reproductions,
+    review,
+    understand,
+)
 
 
 def create_app(settings: AgentSettings | None = None, llm: LLMAdapter | None = None) -> FastAPI:
@@ -32,6 +41,7 @@ def create_app(settings: AgentSettings | None = None, llm: LLMAdapter | None = N
     app.include_router(codegen.router)
     app.include_router(evaluation.router)
     app.include_router(review.router)
+    app.include_router(comparisons.router)
     return app
 
 

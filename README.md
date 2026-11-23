@@ -4,6 +4,12 @@
 
 **当前进度**：各模块已整合为**统一 LangGraph 工作流**（15 节点 + 12 态状态机 + Postgres checkpoint + 预算/重试/Trace harness），上传 → 确认 Card → 批准计划 → 真实训练 → 报告的全流程可**完全从前端闭环操作**。Paper Understanding、Experiment Planner、代码生成/执行与 **Reproduction Evaluator / 报告系统**已实现。理解链路：上传 PDF → PyMuPDF 解析（页码/章节/表格/OCR 扩展接口）→ Qwen 提取 Reproduction Card → 证据落地校验（页码/引文由解析器回填，LLM 无法伪造）→ 前端双栏证据审阅 + 追加式版本管理。规划链路：Reproduction Card → 确定性规则引擎生成缩小规模实验计划（无 LLM，每个参数带来源溯源）→ 关键假设人工确认门 → 追加式计划版本管理（用户修改 / OOM 降批大小）→ 前端审批 UI。执行链路：已审批计划 → Agent 确定性模板生成代码（train/evaluate/model/config/requirements，无 LLM）→ AST 静态校验 → Worker 驱动 Runner 在**独立锁定 Docker 容器**中真实训练 → 采集 stdout/stderr/指标/审计 → 错误分类 + 最多 3 次自动修复（OOM 触发新计划版本而非私改训练目标）→ 前端运行面板（指标/审计/日志/代码版本/产物）。评估链路：运行终态 → **全确定性 Evaluator（无 LLM）**从本次运行固定的代码版本 AST 提取实现事实 → 方法验证（8 项）/实验验证（9 项）/结果对比（含百分点差）→ 6 态最终判定 → 14 节 Markdown 报告自动落库 → 前端结构化报告面板 + Markdown 查看/下载。复现目标仅 LeNet-5 + MNIST；**缩放实验永远不会被标记为完整复现（Full Reproduction）**。
 
+## 访客案例与实验工作台
+
+在首页选择「用一张手写数字读懂论文」，或访问 `/examples/lenet-mnist`。无需登录即可猜数字、核对真实预测、跳到论文页和下载条件对照报告。案例快照来自一次独立的 CPU 容器运行，训练 4,096 张、测试 1,024 张，认对 909 张。页面上的 12 张图片按测试顺序选取。公开文件及 SHA-256 清单位于 `apps/web/public/examples/lenet/`。
+
+工作台仍按用户权限读取私人实验。成功运行的 `GET /v1/runs/{run_id}/prediction-examples` 返回本次尝试的样本。未留存样本的旧运行仍可查看指标和报告。新报告在 `parameter_comparisons` 中区分原文证据、计划选择、实际观测和代码或配置来源。已存在的报告可以从报告面板重新生成。
+
 ## 架构
 
 ```
@@ -126,6 +132,37 @@ evaluating / completed / failed`。
 `resume(spec)` → 查看 Experiment Plan → 确认关键假设并批准（`/plans` + `/plans/{v}/approve`）→
 `resume(plan)` → 工作流自动执行 → 实时日志 / 训练指标 / 自动修复记录 / Reproduction Report。
 工作流驱动模式下执行由图自动发起，前端运行面板轮询展示，无需手动点击执行。
+
+## 优化器对照（成对实验）
+
+除单组复现外，平台支持回答论文中的一个**对照问题**：两组只在优化器（及其学习率）上不同，
+其余条件必须相同。范围仍为 MNIST + 现有 LeNet-5 模板 + 两种已支持优化器；超出范围时上传页
+直接列出缺项（数据集/模型/优化器/主指标/损失/预算），不会进入执行。
+
+**流程**：论文 Card 确认后 → `POST /v1/papers/{id}/comparison-candidates` 定位原文中的两组
+（结果按"同一行内的优化器"归属，同名指标不会串组）→ `POST /v1/papers/{id}/comparison-plans`
+生成计划 v1 → 待确认项可"一键采用建议"或补充依据/页码，保存为 v(n+1)（原版本不可改）→
+`.../versions/{v}/approve` → `.../versions/{v}/start`（`Idempotency-Key` 保证重复提交只入队一次）
+→ Worker 按种子逐对执行 → 自动核验 + 报告。
+
+**硬性保证**（由代码而非文案）：
+
+- 缺参不静默默认：`PendingParam` 带建议值、来源与"可能改变排名"的影响说明，未处理不能批准；
+  状态随计划版本持久化，刷新/离开后可恢复。
+- 差值只在配对通过后计算：两组都成功且**数据划分 / 初始权重 / 样本顺序 / 训练预算 /
+  评估条件 / 代码模板**六项实测一致，才产生 `delta`；任一项缺失记为"未核实"，不视为通过。
+- 准确率独立重算：`correct_count / evaluated_count`，训练脚本自报的 `metric_value` 只作交叉对照。
+- 失败只补跑失败组（同一配置最多 2 次）；需要改共同批大小等条件时，必须新建计划版本并整对重跑，
+  原成绩保留。
+- 训练代码自报摘要：`metrics.json.reproducibility` 含 split / init weights / sample order /
+  template 四个 sha256，由沙箱内的训练脚本计算，编排器无法代填。
+
+**报告与产物**：Markdown 报告 11 节（问题、论文依据、共同条件、两组差异、待确认处理、缩放授权、
+实测结果、配对核验、关键假设、局限、产物引用）；`GET /v1/comparisons/{id}/export` 返回 zip
+（manifest / plan / report / 每对运行的代码、日志、metrics、model.pt、审计）。重跑沿用获批配置与
+种子；原镜像缺失时明确提示缺项，可另建使用当前环境的对照。
+
+设计与测试矩阵见 `docs/comparison-design.md`。
 
 ## 数据模型
 
@@ -311,6 +348,7 @@ Worker 执行/修复循环（成功/IMPORT_ERROR 自动修复/OOM 降批大小/�
 | `GET /v1/papers` / `GET /v1/papers/{id}` | 论文列表 / 详情（ownership 校验） |
 | `GET /v1/papers/{id}/pdf` | Storage 签名 URL（1 小时有效） |
 | `GET /v1/papers/{id}/card?version=` | Reproduction Card（默认最新版） |
+| `GET /v1/papers/{id}/card.md?version=` | Card 的 Markdown 导出（`text/markdown` + attachment，含证据/页码/缺失清单/审核留痕；确定性渲染，无 LLM） |
 | `GET /v1/papers/{id}/versions` | 版本列表（extraction / user_edit） |
 | `POST /v1/papers/{id}/card/edits` | 字段确认/修改 → 追加新版本（`base_version` 乐观校验） |
 | `POST /v1/papers/{id}/card/confirm` | 将最新 Card 原样确认为 `confirmed` 版本（解锁 spec 人工门），`201` |

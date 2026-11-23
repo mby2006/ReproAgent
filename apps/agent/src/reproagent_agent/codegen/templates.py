@@ -9,6 +9,7 @@ and auditable while the plan drives behavior.
 
 import yaml
 from reproagent_schemas import DEPENDENCY_WHITELIST, ExperimentPlan
+from reproagent_schemas.plan import execution_metric
 
 from ..planning.assumptions import normalize_loss, normalize_optimizer
 from ..planning.scaling import MNIST_NORMALIZE_MEAN, MNIST_NORMALIZE_STD
@@ -46,12 +47,49 @@ def build_model(num_classes: int = 10) -> nn.Module:
     return LeNet5(num_classes)
 '''
 
-TRAIN_PY = '''"""Train LeNet-5 on a MNIST subset and emit deterministic metrics.json."""
+_EVALUATION = '''def evaluate(model, loader, criterion, output, target):
+    model.eval()
+    correct = 0
+    total = 0
+    loss_sum = 0.0
+    samples = []
+    subset = loader.dataset
+    with torch.no_grad():
+        for features, labels in loader:
+            outputs = model(features)
+            predictions = outputs.argmax(1)
+            loss_sum += criterion(outputs, labels).item() * labels.size(0)
+            correct += (predictions == labels).sum().item()
+            for offset in range(min(len(labels), 12 - len(samples))):
+                index = subset.indices[total + offset]
+                pixels = subset.dataset.data[index].flatten().tolist()
+                samples.append({"index": index, "pixels": bytes(pixels).hex(),
+                                "label": int(labels[offset]), "prediction": int(predictions[offset])})
+            total += labels.size(0)
+    values = {"accuracy": correct / total, "error_rate": (total - correct) / total,
+              "test_loss": loss_sum / total}
+    (output / "prediction_examples.json").write_text(
+        json.dumps({"version": 1, "samples": samples}), encoding="utf-8"
+    )
+    return {**values, "target_metric": target, "metric_value": values[target],
+            "correct_count": correct, "evaluated_count": total}
 
+
+'''
+
+TRAIN_PY = '''"""Train LeNet-5 on a MNIST subset and emit deterministic metrics.json.
+
+Fixed seed -> fixed initial weights -> fixed sample order. The run writes a
+reproducibility fingerprint of all three so two paired runs can prove they were
+actually comparable instead of asserting it.
+"""
+
+import hashlib
 import json
 import time
 from pathlib import Path
 
+import numpy as np
 import torch
 import yaml
 from torch.utils.data import DataLoader, Subset
@@ -75,6 +113,35 @@ def load_config() -> dict:
         return yaml.safe_load(handle)
 
 
+def text_fingerprint(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def indices_fingerprint(indices) -> str:
+    return text_fingerprint(",".join(str(int(index)) for index in indices))
+
+
+def source_fingerprint() -> str:
+    digest = hashlib.sha256()
+    for name in ("model.py", "train.py", "evaluate.py"):
+        path = Path(name)
+        if not path.exists():
+            continue
+        digest.update(name.encode("utf-8"))
+        digest.update(path.read_bytes())
+    return digest.hexdigest()
+
+
+def weights_fingerprint(model) -> str:
+    digest = hashlib.sha256()
+    state = model.state_dict()
+    for name in sorted(state):
+        digest.update(name.encode("utf-8"))
+        array = np.ascontiguousarray(state[name].detach().cpu().numpy())
+        digest.update(array.tobytes())
+    return digest.hexdigest()
+
+
 def build_loaders(cfg: dict):
     data = cfg["data"]
     transform = transforms.Compose(
@@ -85,37 +152,28 @@ def build_loaders(cfg: dict):
     )
     train_full = datasets.MNIST(data["dir"], train=True, download=False, transform=transform)
     test_full = datasets.MNIST(data["dir"], train=False, download=False, transform=transform)
-    train_set = Subset(train_full, range(data["train_subset_size"]))
-    test_set = Subset(test_full, range(data["test_subset_size"]))
+    train_indices = list(range(data["train_subset_size"]))
+    test_indices = list(range(data["test_subset_size"]))
+    train_set = Subset(train_full, train_indices)
+    test_set = Subset(test_full, test_indices)
     batch_size = cfg["training"]["batch_size"]
-    train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True)
     test_loader = DataLoader(test_set, batch_size=batch_size, shuffle=False)
-    return train_loader, test_loader, train_set, test_set
+    return train_set, test_loader, train_indices, test_indices
 
 
-def evaluate(model, loader, criterion):
-    model.eval()
-    correct = 0
-    total = 0
-    loss_sum = 0.0
-    with torch.no_grad():
-        for features, labels in loader:
-            outputs = model(features)
-            loss_sum += criterion(outputs, labels).item() * labels.size(0)
-            correct += (outputs.argmax(1) == labels).sum().item()
-            total += labels.size(0)
-    return correct / max(total, 1), loss_sum / max(total, 1)
-
-
-def main() -> None:
+''' + _EVALUATION + '''def main() -> None:
     cfg = load_config()
     seed = cfg["seed"]
+    # One seed fixes both the initial weights and the sampling stream, so a
+    # paired run with the same seed starts from byte-identical parameters.
     torch.manual_seed(seed)
     output = Path(cfg["output"]["dir"])
     output.mkdir(parents=True, exist_ok=True)
 
-    train_loader, test_loader, train_set, test_set = build_loaders(cfg)
+    train_set, test_loader, train_indices, test_indices = build_loaders(cfg)
     model = build_model(cfg["data"]["num_classes"])
+    init_fingerprint = weights_fingerprint(model)
+
     training = cfg["training"]
     optimizer = OPTIMIZERS[training["optimizer"].lower()](
         model.parameters(),
@@ -123,15 +181,23 @@ def main() -> None:
         weight_decay=training.get("weight_decay", 0.0),
     )
     criterion = torch.nn.CrossEntropyLoss()
+    batch_size = training["batch_size"]
+    generator = torch.Generator()
+    generator.manual_seed(seed)
+    first_order = None
 
     started = time.time()
     log = []
     train_loss = 0.0
     for epoch in range(training["epochs"]):
+        order = torch.randperm(len(train_set), generator=generator).tolist()
+        if first_order is None:
+            first_order = order
+        loader = DataLoader(train_set, batch_size=batch_size, sampler=order)
         model.train()
         running = 0.0
         seen = 0
-        for features, labels in train_loader:
+        for features, labels in loader:
             optimizer.zero_grad()
             loss = criterion(model(features), labels)
             loss.backward()
@@ -141,28 +207,44 @@ def main() -> None:
         train_loss = running / max(seen, 1)
         log.append({"epoch": epoch + 1, "train_loss": train_loss})
 
-    accuracy, test_loss = evaluate(model, test_loader, criterion)
+    results = evaluate(model, test_loader, criterion, output, cfg["evaluation"]["target_metric"])
     runtime = time.time() - started
-    target = cfg["evaluation"]["target_metric"]
+    reproducibility = {
+        "dataset_split_sha256": text_fingerprint(
+            "train:" + indices_fingerprint(train_indices)
+            + "|test:" + indices_fingerprint(test_indices)
+        ),
+        "init_weights_sha256": init_fingerprint,
+        "sample_order_sha256": indices_fingerprint(first_order or train_indices),
+        "template_sha256": source_fingerprint(),
+        "batch_size": batch_size,
+        "epochs": training["epochs"],
+        "train_subset_size": len(train_set),
+        "test_subset_size": len(test_set),
+        "loss_function": training["loss_function"],
+        "optimizer": training["optimizer"],
+        "learning_rate": training["learning_rate"],
+    }
     metrics = {
-        "schema_version": "1.0",
-        "target_metric": target,
-        "metric_value": accuracy,
-        "accuracy": accuracy,
+        "schema_version": "1.2",
+        **results,
         "train_loss": train_loss,
-        "test_loss": test_loss,
         "epochs_completed": training["epochs"],
         "train_samples": len(train_set),
         "test_samples": len(test_set),
         "seed": seed,
         "runtime_seconds": runtime,
+        "reproducibility": reproducibility,
     }
     (output / cfg["output"]["metrics_filename"]).write_text(
         json.dumps(metrics, indent=2), encoding="utf-8"
     )
     (output / "training_log.json").write_text(json.dumps(log, indent=2), encoding="utf-8")
+    (output / "reproducibility.json").write_text(
+        json.dumps(reproducibility, indent=2), encoding="utf-8"
+    )
     torch.save(model.state_dict(), output / "model.pt")
-    print(json.dumps({"status": "ok", "accuracy": accuracy, "epochs": training["epochs"]}))
+    print(json.dumps({"status": "ok", "accuracy": results["accuracy"], "epochs": training["epochs"]}))
 
 
 if __name__ == "__main__":
@@ -184,7 +266,7 @@ from model import build_model
 CONFIG_PATH = "config.yaml"
 
 
-def main() -> None:
+''' + _EVALUATION + '''def main() -> None:
     with open(CONFIG_PATH, encoding="utf-8") as handle:
         cfg = yaml.safe_load(handle)
     torch.manual_seed(cfg["seed"])
@@ -202,24 +284,10 @@ def main() -> None:
     output = Path(cfg["output"]["dir"])
     model = build_model(data["num_classes"])
     model.load_state_dict(torch.load(output / "model.pt", weights_only=True))
-    model.eval()
-    criterion = torch.nn.CrossEntropyLoss()
-    correct = 0
-    total = 0
-    loss_sum = 0.0
-    with torch.no_grad():
-        for features, labels in loader:
-            outputs = model(features)
-            loss_sum += criterion(outputs, labels).item() * labels.size(0)
-            correct += (outputs.argmax(1) == labels).sum().item()
-            total += labels.size(0)
-    accuracy = correct / max(total, 1)
+    results = evaluate(model, loader, torch.nn.CrossEntropyLoss(), output, cfg["evaluation"]["target_metric"])
     report = {
-        "schema_version": "1.0",
-        "target_metric": cfg["evaluation"]["target_metric"],
-        "metric_value": accuracy,
-        "accuracy": accuracy,
-        "test_loss": loss_sum / max(total, 1),
+        "schema_version": "1.1",
+        **results,
         "epochs_completed": 0,
         "train_samples": 0,
         "test_samples": len(test_set),
@@ -227,7 +295,7 @@ def main() -> None:
         "runtime_seconds": 0.0,
     }
     (output / "eval_metrics.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
-    print(json.dumps({"status": "ok", "accuracy": accuracy}))
+    print(json.dumps({"status": "ok", "accuracy": results["accuracy"]}))
 
 
 if __name__ == "__main__":
@@ -252,6 +320,9 @@ def build_config(plan: ExperimentPlan) -> dict:
         # the train template implements cross-entropy only; refuse to generate
         # code that would silently run a different loss than the approved plan
         raise ValueError(f"unsupported loss_function: {training.loss_function.value!r}")
+    target = execution_metric(plan.evaluation_config.target_metric)
+    if target is None:
+        raise ValueError("执行目标请选择准确率、错误率或测试损失")
     return {
         "seed": training.seed,
         "data": {
@@ -273,7 +344,7 @@ def build_config(plan: ExperimentPlan) -> dict:
             "epochs": training.epochs.value,
         },
         "evaluation": {
-            "target_metric": plan.evaluation_config.target_metric,
+            "target_metric": target,
             "tolerance": plan.evaluation_config.tolerance,
         },
         "output": {"dir": "/output", "metrics_filename": "metrics.json"},

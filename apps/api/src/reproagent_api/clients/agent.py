@@ -1,8 +1,14 @@
 import httpx
 from reproagent_schemas import (
+    CandidateRequest,
+    CandidateResponse,
     ClassifyRequest,
     CodegenRequest,
     CodegenResponse,
+    ComparisonPlanRequest,
+    ComparisonPlanResponse,
+    ComparisonReportRequest,
+    ComparisonReportResponse,
     ErrorClassification,
     EvaluateRequest,
     EvaluateResponse,
@@ -25,6 +31,8 @@ from reproagent_schemas import (
     UnderstandRequest,
     UnderstandResponse,
     ValidationReport,
+    VerifyPairRequest,
+    VerifyPairResponse,
 )
 
 from ..config import ApiSettings
@@ -136,3 +144,35 @@ class AgentClient:
 
     async def aclose(self) -> None:
         await self._client.aclose()
+
+    # --- paired comparison (deterministic agent endpoints) ---
+
+    async def comparison_candidates(self, request: CandidateRequest) -> CandidateResponse:
+        response = await self._client.post(
+            "/v1/comparisons/candidates", json=request.model_dump(mode="json"), timeout=60.0
+        )
+        response.raise_for_status()
+        return CandidateResponse.model_validate(response.json())
+
+    async def comparison_plan(self, request: ComparisonPlanRequest) -> ComparisonPlanResponse:
+        response = await self._client.post(
+            "/v1/comparisons/plan", json=request.model_dump(mode="json"), timeout=60.0
+        )
+        response.raise_for_status()
+        return ComparisonPlanResponse.model_validate(response.json())
+
+    async def comparison_verify(self, request: VerifyPairRequest) -> VerifyPairResponse:
+        response = await self._client.post(
+            "/v1/comparisons/verify", json=request.model_dump(mode="json"), timeout=60.0
+        )
+        response.raise_for_status()
+        return VerifyPairResponse.model_validate(response.json())
+
+    async def comparison_report(
+        self, request: ComparisonReportRequest
+    ) -> ComparisonReportResponse:
+        response = await self._client.post(
+            "/v1/comparisons/report", json=request.model_dump(mode="json"), timeout=60.0
+        )
+        response.raise_for_status()
+        return ComparisonReportResponse.model_validate(response.json())

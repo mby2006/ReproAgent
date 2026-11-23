@@ -26,6 +26,10 @@ DEPENDENCY_WHITELIST: dict[str, str] = {
     "pyyaml": "6.0.2",
 }
 
+# The optimizers the deterministic training template can instantiate. Single
+# source of truth shared by the planner, the comparison planner and the API.
+OPTIMIZER_NAMES = frozenset({"sgd", "adam", "adamw", "adagrad", "adadelta", "rmsprop"})
+
 _SAFE_PATH = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_./-]*$")
 
 
@@ -126,6 +130,17 @@ class RunAudit(SchemaModel):
     code_version: int | None = None
 
 
+class ExecImageStatus(SchemaModel):
+    """Whether the pinned execution image a rerun depends on still exists."""
+
+    image: str
+    available: bool
+    digest: str | None = None
+    dataset_fingerprint: str | None = None
+    built_at: str | None = None
+    error: str | None = None
+
+
 class RunLogs(SchemaModel):
     # raw log text: leading/trailing whitespace is content, not noise
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=False)
@@ -148,6 +163,27 @@ class RunResult(SchemaModel):
     audit: RunAudit | None = None
 
 
+class ReproducibilityReport(SchemaModel):
+    """What a run must prove it shared with a paired run.
+
+    Emitted by the generated training code itself, from the live tensors and
+    index order -- not asserted by the orchestrator. A paired comparison reads
+    these to decide whether two runs are actually comparable.
+    """
+
+    dataset_split_sha256: str | None = None
+    init_weights_sha256: str | None = None
+    sample_order_sha256: str | None = None
+    template_sha256: str | None = None
+    batch_size: int | None = None
+    epochs: int | None = None
+    train_subset_size: int | None = None
+    test_subset_size: int | None = None
+    loss_function: str | None = None
+    optimizer: str | None = None
+    learning_rate: float | None = None
+
+
 class MetricsReport(SchemaModel):
     """Deterministic metrics.json schema written by generated training code."""
 
@@ -155,6 +191,9 @@ class MetricsReport(SchemaModel):
     target_metric: str = Field(min_length=1)
     metric_value: float
     accuracy: float | None = None
+    correct_count: int | None = Field(default=None, ge=0)
+    evaluated_count: int | None = Field(default=None, gt=0)
+    error_rate: float | None = Field(default=None, ge=0, le=1)
     train_loss: float | None = None
     test_loss: float | None = None
     epochs_completed: int = Field(ge=0)
@@ -162,3 +201,4 @@ class MetricsReport(SchemaModel):
     test_samples: int = Field(ge=0)
     seed: int
     runtime_seconds: float = Field(ge=0)
+    reproducibility: ReproducibilityReport | None = None

@@ -1,11 +1,12 @@
 "use client";
 
 import Link from "next/link";
-import { useRouter } from "next/navigation";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useRouter, useSearchParams } from "next/navigation";
+import { Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import AuthGate from "@/components/AuthGate";
 import DeletePaperButton from "@/components/DeletePaperButton";
 import Shell from "@/components/Shell";
+import PaperClient from "./PaperClient";
 import {
   IconArrowRight,
   IconLink,
@@ -71,7 +72,7 @@ function PapersInner() {
         title || (file ? file.name : ""),
         file ? undefined : url.trim()
       );
-      router.push(`/papers/${result.paper_id}?workflow=${result.workflow_id}`);
+      router.push(`/papers?id=${result.paper_id}&workflow=${result.workflow_id}`);
     } catch (err) {
       setError(err instanceof Error ? err.message : "上传失败");
       setBusy(false);
@@ -96,11 +97,11 @@ function PapersInner() {
     <main className="mx-auto w-full max-w-6xl space-y-6 px-5 py-7">
       <header className="rise flex flex-wrap items-end justify-between gap-3">
         <div>
-          <p className="label mb-1.5">Library · 论文库</p>
           <h1 className="display flex items-center gap-3 text-3xl font-bold">
             我的论文
             <span className="chip badge-brand">{papers.length}</span>
           </h1>
+          <p className="mt-2 text-sm text-fg-2">添加论文以提取实验条件，或打开已有论文继续复现。</p>
         </div>
         <button onClick={load} className="btn btn-ghost btn-sm">
           <IconRefresh className="h-3.5 w-3.5" /> 刷新
@@ -124,7 +125,10 @@ function PapersInner() {
           role="button"
           tabIndex={0}
           onKeyDown={(e) => {
-            if (e.key === "Enter" || e.key === " ") fileInput.current?.click();
+            if (e.target === e.currentTarget && (e.key === "Enter" || e.key === " ")) {
+              e.preventDefault();
+              fileInput.current?.click();
+            }
           }}
         >
           <input
@@ -161,6 +165,7 @@ function PapersInner() {
                 <IconUpload className="h-6 w-6" />
               </span>
               <p className="text-sm font-medium text-fg-2">拖拽 PDF 到此处</p>
+              <p className="text-sm text-fg-3">当前真实训练支持 LeNet-5 × MNIST。</p>
               <p className="text-xs text-brand">或点击选择文件</p>
             </>
           )}
@@ -210,6 +215,7 @@ function PapersInner() {
         <div className="relative min-w-52 flex-1">
           <IconSearch className="pointer-events-none absolute left-3 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-fg-3" />
           <input
+            aria-label="搜索论文标题或 ID"
             type="search"
             placeholder="搜索标题或 ID…"
             value={query}
@@ -256,7 +262,7 @@ function PapersInner() {
             const meta = STATUS_META[paper.status];
             return (
               <li key={paper.id} className="card card-hover rise flex flex-col" style={{ animationDelay: `${Math.min(i, 8) * 0.05}s` }}>
-                <Link href={`/papers/${paper.id}`} className="group flex flex-1 flex-col p-4">
+                <Link href={`/papers?id=${paper.id}`} className="group flex flex-1 flex-col p-4">
                   <div className="mb-3 flex items-center justify-between gap-2">
                     <span className="chip">
                       {paper.source === "upload" ? (
@@ -300,12 +306,26 @@ function PapersInner() {
   );
 }
 
-export default function PapersPage() {
+function PapersWorkspace() {
   return (
     <AuthGate>
       <Shell>
         <PapersInner />
       </Shell>
     </AuthGate>
+  );
+}
+
+// 静态托管下没有动态段：同一篇论文的详情用 /papers?id= 打开，列表保持 /papers。
+function PapersRoute() {
+  const id = useSearchParams().get("id");
+  return id ? <PaperClient paperId={id} /> : <PapersWorkspace />;
+}
+
+export default function PapersPage() {
+  return (
+    <Suspense fallback={<div className="p-6 font-mono text-sm text-fg-3">加载中…</div>}>
+      <PapersRoute />
+    </Suspense>
   );
 }

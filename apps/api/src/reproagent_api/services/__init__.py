@@ -1,4 +1,5 @@
 from .card_edits import EditError, apply_edits, delegate_card
+from .card_markdown import render_card_markdown
 from .plan_edits import PlanEditError, apply_delegated_review, apply_plan_edits, apply_tier_override
 from .reports import build_evaluate_request, generate_and_store_report
 from .runs import (
@@ -26,4 +27,5 @@ __all__ = [
     "insert_code_version",
     "insert_versioned",
     "pin_run_files",
+    "render_card_markdown",
 ]

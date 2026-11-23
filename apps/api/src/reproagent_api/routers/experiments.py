@@ -33,6 +33,7 @@ from reproagent_schemas import (
     SchemaModel,
     TierOverrideRequest,
 )
+from reproagent_schemas.plan import execution_metric
 
 from ..auth import get_current_user_id
 from ..clients.agent import AgentClient
@@ -585,6 +586,8 @@ async def approve_plan(
                 change_reason=f"以 {body.review_mode.value} 模式批准计划",
             ), actor=user_id,
         )
+    if execution_metric(plan.evaluation_config.target_metric) is None:
+        raise HTTPException(409, "请将执行目标改为 accuracy、error_rate 或 test_loss 后批准")
     if not plan.approval_ready(user_id):
         paths = ", ".join(a.field_path for a in plan.unconfirmed_critical())
         raise HTTPException(

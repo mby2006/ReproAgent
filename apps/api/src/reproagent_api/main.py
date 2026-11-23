@@ -6,7 +6,15 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from .config import ApiSettings, get_settings
-from .routers import experiments, health, papers, reproductions, runs, workflows
+from .routers import (
+    comparisons,
+    experiments,
+    health,
+    papers,
+    reproductions,
+    runs,
+    workflows,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -40,6 +48,7 @@ def create_app(settings: ApiSettings | None = None) -> FastAPI:
     app.include_router(experiments.router)
     app.include_router(runs.router)
     app.include_router(workflows.router)
+    app.include_router(comparisons.router)
     return app
 
 

@@ -517,6 +517,21 @@ def test_get_run_detail_and_ownership(env):
     assert client.get(f"/v1/runs/{run_id}", headers=BOB_AUTH).status_code == 404
 
 
+def test_prediction_examples_are_private_versioned_run_artifacts(env):
+    client, admin, _ = env
+    run_id = _seed_run(admin)
+    url = f"/v1/runs/{run_id}/prediction-examples"
+    assert client.get(url, headers=AUTH).status_code == 404
+    path = f"{run_id}/attempt-0/artifacts/prediction_examples.json"
+    admin.tables["execution_artifacts"].append({"run_id": run_id, "storage_path": path})
+    sample = {"index": 0, "label": 7, "prediction": 1, "pixels": "00" * 784}
+    admin.storage.files[path] = json.dumps({"version": 1, "samples": [sample]}).encode()
+    assert client.get(url, headers=BOB_AUTH).status_code == 404
+    assert client.get(url, headers=AUTH).json()["samples"] == [sample]
+    admin.storage.files[path] = b"{}"
+    assert client.get(url, headers=AUTH).status_code == 502
+
+
 def test_list_runs(env):
     client, admin, _ = env
     _seed_run(admin)

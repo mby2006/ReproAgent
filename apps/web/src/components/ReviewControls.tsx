@@ -12,8 +12,8 @@ export function ReviewModeSelector({ mode, onChange, onDelegate, disabled, deleg
 }) {
   return (
     <div className="card flex flex-wrap items-center gap-3 p-4">
-      <label className="flex items-center gap-2 text-sm text-fg">
-        审核模式
+      <label className="flex items-center gap-2 text-[14px] text-fg">
+        这些设置谁来定
         <select className="select" value={mode} disabled={disabled}
           onChange={(event) => {
             if (event.target.value === "delegated") {
@@ -24,20 +24,21 @@ export function ReviewModeSelector({ mode, onChange, onDelegate, disabled, deleg
               onChange(event.target.value as OrdinaryReviewMode);
             }
           }}>
-          <option value="assisted">辅助模式（默认）</option>
-          <option value="expert">专家模式</option>
-          <option value="delegated" disabled={delegationDisabled}>托管模式（需明确授权）</option>
+          <option value="assisted">AI 给建议，我来确认（默认）</option>
+          <option value="expert">每一项都由我确认</option>
+          <option value="delegated" disabled={delegationDisabled}>全部交给系统（需单独授权）</option>
         </select>
       </label>
-      <p className="text-xs leading-relaxed text-fg-3">
-        普通模式切换仅在本地生效；本次编辑、确认、采纳或批准保存后才记录。托管须另行授权，选择不会自动提交。
-        {mode === "delegated" && " 人工编辑或普通采纳将按辅助模式保存并撤销新版本授权。"}
+      <p className="text-[13px] leading-relaxed text-fg-3">
+        这里只是切换页面的建议方式，真正生效要等你保存或批准。
+        选择“全部交给系统”会先弹窗单独授权，不会自动提交。
+        {mode === "delegated" && " 如果之后手动改动了任何一项，原授权会失效，需要重新确认。"}
       </p>
     </div>
   );
 }
 
-const DELEGATION_STATEMENT = "自动接受全部 AI 推荐与安全默认，关键假设未经人工逐项核验；结果仅供趋势参考；授权仅限本次版本及其工作流，人工修改后需重新授权";
+const DELEGATION_STATEMENT = "系统会自动接受全部 AI 建议和安全默认值，关键设置不会经过人工逐项核验；结果只能当趋势参考；授权只对本次版本有效，手动改动后需要重新授权";
 
 // Mount only while requesting consent. Native dialog supplies focus trapping and Escape handling.
 export function DelegationDialog({ version, workflowDriven, budget, onConfirm, onCancel, onExpert }: {
@@ -125,7 +126,7 @@ export function DelegationNotice({ delegatedAt, delegatedBy }: {
 }) {
   return (
     <div role="status" className="space-y-2 rounded-lg border border-warn/40 bg-warn/10 px-4 py-3 text-sm text-warn">
-      <p className="font-medium">托管版本 · 未经人工逐项核验</p>
+      <p className="font-medium">该版本由系统自动批准，没有人逐项看过</p>
       <p className="leading-relaxed">{DELEGATION_STATEMENT}。</p>
       <p className="break-words text-xs">授权人：{delegatedBy ?? "未记录（授权无效）"} · 授权时间：{delegatedAt ?? "未记录（授权无效）"}</p>
     </div>

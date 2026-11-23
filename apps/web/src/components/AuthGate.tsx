@@ -23,9 +23,9 @@ export default function AuthGate({ children }: { children: React.ReactNode }) {
   if (!ready) {
     return (
       <div className="flex min-h-dvh flex-col items-center justify-center gap-4 bg-ink-950">
-        <div className="ambient" />
+
         <LogoMark className="pulse-dot h-12 w-12" />
-        <p className="label animate-blink">Initializing session…</p>
+        <p role="status" className="label">正在确认登录状态…</p>
       </div>
     );
   }

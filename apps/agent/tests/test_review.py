@@ -124,6 +124,23 @@ def subset(body, *paths):
 
 
 @pytest.mark.parametrize("operation", ["explain", "recommend"])
+async def test_paper_defined_field_names_stay_in_user_payload(operation):
+    llm = StubLLM()
+    body = review_request(with_plan=operation == "recommend")
+    key = "paper supplied key\nwith second line"
+    body.card.hyperparameters[key] = evidence(3, inferred=True)
+    path = f"hyperparameters.{key}"
+    if body.plan is not None:
+        body.plan.assumptions.append(Assumption(
+            field_path=path, value=3, kind=AssumptionKind.INFERRED, rationale="待确认的论文参数",
+        ))
+    await getattr(service(llm), operation)(subset(body, path))
+    system, user = llm.calls[0]
+    assert key not in system.content
+    assert [item["field_path"] for item in json.loads(user.content)["fields"]] == [path]
+
+
+@pytest.mark.parametrize("operation", ["explain", "recommend"])
 async def test_batches_once_cache_hits_and_originals_untouched(operation):
     llm = StubLLM()
     reviewer = service(llm)

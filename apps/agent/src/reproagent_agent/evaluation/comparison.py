@@ -6,6 +6,8 @@ Percentages and error rates are normalized to accuracy fractions deterministical
 A within-tolerance match is a trend observation, never a full-reproduction claim.
 """
 
+import math
+
 from reproagent_schemas import (
     CheckStatus,
     EvidenceRef,
@@ -14,7 +16,7 @@ from reproagent_schemas import (
     ReproductionCard,
     RunStatus,
 )
-from reproagent_schemas.plan import ExperimentPlan
+from reproagent_schemas.plan import ExperimentPlan, execution_metric
 
 _ACCURACY_NAMES = {"accuracy", "test accuracy", "train accuracy", "top-1 accuracy", "top1 accuracy"}
 _ERROR_NAMES = {"error", "error rate", "test error", "test error rate", "misclassification rate"}
@@ -39,8 +41,8 @@ def _to_fraction(value: float) -> float:
     return value / 100.0 if value > 1.0 else value
 
 
-def _paper_accuracy(result) -> tuple[float, str] | None:
-    """Normalize a reported accuracy/error-rate value to an accuracy fraction.
+def _paper_fraction(result) -> tuple[float, str] | None:
+    """Normalize a rate to a fraction while preserving the reported direction.
 
     Returns None when an error rate is ambiguous: a value in (0, 1] with no
     percent sign in the quote could be either a percentage (0.8 -> 0.8%) or a
@@ -55,7 +57,7 @@ def _paper_accuracy(result) -> tuple[float, str] | None:
         if 0 < value <= 1 and not percent_hint:
             return None
         fraction = value / 100.0 if value > 1.0 or percent_hint else value
-        return 1.0 - fraction, f"原文报告错误率 {value}，换算为 accuracy = 1 - {fraction}"
+        return fraction, f"原文报告错误率 {value}，换算为 accuracy = 1 - {fraction}"
     fraction = _to_fraction(value)
     note = f"原文报告 accuracy {value}" + ("（百分制，换算为小数）" if value > 1.0 else "")
     return fraction, note
@@ -68,10 +70,12 @@ def compare_results(
     run_status: RunStatus,
 ) -> list[MetricComparison]:
     tolerance = plan.evaluation_config.tolerance
+    target = execution_metric(plan.evaluation_config.target_metric)
     succeeded = run_status is RunStatus.SUCCEEDED
 
     paper_accuracy: list[tuple[float, EvidenceRef, str]] = []
     ambiguous_errors: list[tuple[float, EvidenceRef]] = []
+    paper_error: tuple[float | None, EvidenceRef] | None = None
     paper_other: dict[str, tuple[float, EvidenceRef]] = {}
     for result in card.reported_results:
         if result.value is None or result.status not in (
@@ -88,14 +92,17 @@ def compare_results(
         )
         kind = _classify_metric(result.metric)
         if kind in ("accuracy", "error_rate"):
-            normalized = _paper_accuracy(result)
+            normalized = _paper_fraction(result)
+            if kind == "error_rate" and paper_error is None:
+                paper_error = (normalized[0] if normalized else None, ref)
             if normalized is None:
                 ambiguous_errors.append((float(result.value), ref))
             else:
                 value, note = normalized
-                paper_accuracy.append((value, ref, note))
+                accuracy = 1 - value if kind == "error_rate" else value
+                paper_accuracy.append((accuracy, ref, note))
         elif kind in ("test_loss", "runtime_seconds"):
-            paper_other[kind] = (float(result.value), ref)
+            paper_other.setdefault(kind, (float(result.value), ref))
 
     comparisons: list[MetricComparison] = []
 
@@ -113,12 +120,13 @@ def compare_results(
         paper_ref: EvidenceRef | None,
         apply_tolerance: bool,
         note: str | None,
+        source_key: str | None = None,
     ) -> MetricComparison:
         abs_diff = rel_diff = pp_diff = None
         if paper_value is not None and experiment_value is not None:
             abs_diff = abs(experiment_value - paper_value)
             rel_diff = abs_diff / abs(paper_value) if paper_value != 0 else None
-            if metric == "accuracy":
+            if unit == "fraction":
                 pp_diff = (experiment_value - paper_value) * 100.0
         if paper_value is None:
             status = CheckStatus.NOT_APPLICABLE
@@ -127,7 +135,7 @@ def compare_results(
             status = CheckStatus.UNKNOWN
             note = note or "真实运行未产出该指标（运行未成功或指标缺失）"
         elif apply_tolerance:
-            within = abs_diff is not None and abs_diff <= tolerance
+            within = abs_diff <= tolerance or math.isclose(abs_diff, tolerance, rel_tol=1e-12)
             status = CheckStatus.MATCHED if within else CheckStatus.DEVIATED
             note = (
                 f"绝对差 {abs_diff:.4f} ≤ tolerance {tolerance}（仅趋势参考，非论文等价判定）"
@@ -151,8 +159,8 @@ def compare_results(
             experiment_evidence=(
                 EvidenceRef(
                     kind="metrics",
-                    field_path=f"metrics_json.{metric}",
-                    detail=str(experiment_value),
+                    field_path=f"metrics_json.{source_key or metric}",
+                    detail=str(metrics.get(source_key or metric)),
                 )
                 if experiment_value is not None
                 else None
@@ -168,7 +176,8 @@ def compare_results(
             None,
             _experiment_value("accuracy"),
             ambiguous_errors[0][1],
-            apply_tolerance=True,
+            apply_tolerance=target != "test_loss",
+            source_key="accuracy",
             note=(
                 f"原文报告错误率 {raw} 未标注百分号，无法确定是百分比还是小数；"
                 "为避免误判不做换算，目标指标对比证据不足"
@@ -187,7 +196,8 @@ def compare_results(
                     value,
                     _experiment_value("accuracy"),
                     ref,
-                    apply_tolerance=True,
+                    apply_tolerance=target != "test_loss",
+                    source_key="accuracy",
                     note=None if index == 0 else conversion_note,
                 )
             )
@@ -205,10 +215,32 @@ def compare_results(
                 None,
                 _experiment_value("accuracy"),
                 None,
-                apply_tolerance=True,
+                apply_tolerance=target != "test_loss",
                 note="论文证据未报告 accuracy/错误率，目标指标对比证据不足",
             )
         )
+
+    if target == "error_rate":
+        paper_value, paper_ref = paper_error or (None, None)
+        if paper_ref is None and paper_accuracy:
+            accuracy, paper_ref, _ = paper_accuracy[0]
+            paper_value = 1 - accuracy
+        actual_error = _experiment_value("error_rate")
+        source_key = "error_rate"
+        accuracy = _experiment_value("accuracy")
+        if actual_error is None and accuracy is not None:
+            actual_error = 1 - accuracy
+            source_key = "accuracy"
+        row = _build(
+            "error_rate", "fraction", paper_value, actual_error, paper_ref,
+            apply_tolerance=True, note=None, source_key=source_key,
+        )
+        if paper_ref is not None and paper_value is None:
+            row.comparison_status = CheckStatus.UNKNOWN
+            row.note = "原文错误率单位不明确，无法换算为可比的错误率。"
+        if source_key == "accuracy" or (paper_error is None and paper_ref is not None):
+            row.note = f"{row.note}；错误率与准确率按 error_rate = 1 - accuracy 换算。"
+        comparisons.append(row)
 
     comparisons.append(
         _build(
@@ -217,7 +249,7 @@ def compare_results(
             paper_other.get("test_loss", (None, None))[0],
             _experiment_value("test_loss"),
             paper_other.get("test_loss", (None, None))[1],
-            apply_tolerance=False,
+            apply_tolerance=target == "test_loss",
             note=None,
         )
     )

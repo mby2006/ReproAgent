@@ -203,9 +203,12 @@ def validate_experiment(
                 item=ExperimentItem.RANDOM_SEED,
                 status=CheckStatus.MATCHED if equal else CheckStatus.DEVIATED,
                 plan_value=training.seed,
-                actual_value=", ".join(str(v) for v in seed_values),
+                actual_value=", ".join(dict.fromkeys(str(v) for v in seed_values)),
                 plan_evidence=_plan_ref("training_config.seed", training.seed),
-                actual_evidence=_metrics_ref("seed", metric_seed),
+                actual_evidence=(
+                    _metrics_ref("seed", metric_seed) if metric_seed is not None
+                    else _audit_ref("seed", audit_seed)
+                ),
                 note=(
                     f"种子计划 {training.seed} 与 metrics/audit 记录一致"
                     if equal

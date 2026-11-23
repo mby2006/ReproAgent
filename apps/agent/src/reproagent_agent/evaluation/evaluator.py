@@ -7,12 +7,14 @@ from reproagent_schemas import (
     EvaluationReport,
 )
 from reproagent_schemas.common import ConfirmationSource, ReviewMode
+from reproagent_schemas.plan import execution_metric
 
 from .comparison import compare_results
 from .experiment import validate_experiment
 from .facts import extract_facts
 from .markdown import render_markdown
 from .method import validate_method
+from .parameters import parameter_comparisons
 from .verdict import build_summary, decide_final_status
 
 
@@ -34,7 +36,7 @@ def _limitations(request: EvaluateRequest) -> list[str]:
     plan = request.plan
     dc = plan.dataset_config
     return [
-        f"缩放实验：训练子集 {dc.train_subset_size}/{dc.full_train_size}、"
+        f"缩放计划：训练子集 {dc.train_subset_size}/{dc.full_train_size}、"
         f"测试子集 {dc.test_subset_size}/{dc.full_test_size}、"
         f"{plan.training_config.epochs.value} epoch，非论文全量训练；"
         "结果不能与论文全量结果直接等价。",
@@ -99,14 +101,12 @@ def evaluate_run(request: EvaluateRequest) -> EvaluateResponse:
         request.plan, facts, request.metrics, request.audit, request.execution_time
     )
     comparisons = compare_results(request.card, request.plan, request.metrics, request.run_status)
-    target = request.plan.evaluation_config.target_metric.strip().lower().replace("_", " ")
-    target_key = (
-        "accuracy" if target in ("accuracy", "test accuracy", "error", "error rate") else target
-    )
+    requested = request.plan.evaluation_config.target_metric
+    target = execution_metric(requested) or requested
     status = decide_final_status(
-        request.run_status, method_checks, experiment_checks, comparisons, target_key
+        request.run_status, method_checks, experiment_checks, comparisons, target
     )
-    summary = build_summary(status, comparisons, method_checks, experiment_checks)
+    summary = build_summary(status, comparisons, method_checks, experiment_checks, target)
     parts = {
         "method_checks": method_checks,
         "experiment_checks": experiment_checks,
@@ -118,6 +118,8 @@ def evaluate_run(request: EvaluateRequest) -> EvaluateResponse:
     })
     report = EvaluationReport(
         references=references,
+        target_metric=target,
+        parameter_comparisons=parameter_comparisons(request, method_checks, experiment_checks),
         final_status=status,
         summary=summary,
         scaling_deviations=request.plan.deviations_from_paper,

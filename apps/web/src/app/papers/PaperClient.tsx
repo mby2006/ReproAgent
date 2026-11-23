@@ -7,16 +7,16 @@ import AuthGate from "@/components/AuthGate";
 import DeletePaperButton from "@/components/DeletePaperButton";
 import Shell from "@/components/Shell";
 import WorkflowInsights from "@/components/WorkflowInsights";
-import WorkflowStepper from "@/components/WorkflowStepper";
 import {
   IconArrowLeft,
   IconArrowRight,
   IconCheck,
+  IconDownload,
   IconPdf,
   IconQuote,
   IconRefresh,
 } from "@/components/icons";
-import { apiFetch, confirmCard, confirmCardBatch, delegateCard, explainCard, getPaperWorkflow, resumeWorkflow, retryWorkflow } from "@/lib/api";
+import { apiFetch, confirmCard, confirmCardBatch, delegateCard, explainCard, fetchCardMarkdown, getPaperWorkflow, resumeWorkflow, retryWorkflow } from "@/lib/api";
 import { ConfirmationBadge, DelegationDialog, DelegationNotice, ExplanationCard, PreselectionHint, ReviewModeSelector, ReviewRequestStatus } from "@/components/ReviewControls";
 import { hasDelegation, isReviewHandled, isRoutineCardPath, ordinaryReviewMode, useReviewMode, useReviewRequest, useReviewSelection } from "@/lib/useReview";
 import { useWorkflow } from "@/lib/useWorkflow";
@@ -84,6 +84,7 @@ function PaperInner({ paperId }: { paperId: string }) {
   const [confirmedVersionId, setConfirmedVersionId] = useState<string | null>(null);
   const [continuing, setContinuing] = useState(false);
   const [retrying, setRetrying] = useState(false);
+  const [downloading, setDownloading] = useState(false);
   const [loading, setLoading] = useState(true);
   const loadSequence = useRef(0);
   const editInput = useRef<HTMLInputElement>(null);
@@ -306,6 +307,26 @@ function PaperInner({ paperId }: { paperId: string }) {
     }
   }
 
+  async function downloadCardMarkdown() {
+    if (!cardVersion || downloading) return;
+    setDownloading(true);
+    setError(null);
+    try {
+      const markdown = await fetchCardMarkdown(paperId, cardVersion.version);
+      const blob = new Blob([markdown], { type: "text/markdown;charset=utf-8" });
+      const url = URL.createObjectURL(blob);
+      const anchor = document.createElement("a");
+      anchor.href = url;
+      anchor.download = `reproduction-card-${paperId.slice(0, 8)}-v${cardVersion.version}.md`;
+      anchor.click();
+      URL.revokeObjectURL(url);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "导出 Markdown 失败");
+    } finally {
+      setDownloading(false);
+    }
+  }
+
   const card = cardVersion?.card;
   const rows: { title: string; items: Selection[] }[] = [];
   if (card) {
@@ -390,13 +411,13 @@ function PaperInner({ paperId }: { paperId: string }) {
 
   return (
     <main className="mx-auto w-full max-w-7xl space-y-4 px-5 py-6">
-      <header className="rise flex flex-wrap items-center gap-3">
-        <Link href="/papers" className="btn btn-ghost btn-sm px-2!" title="返回论文库">
+      <header className="workspace-heading flex flex-wrap items-center gap-3">
+        <Link href="/papers" className="btn btn-ghost btn-sm" aria-label="返回论文库">
           <IconArrowLeft className="h-4 w-4" />
         </Link>
-        <div className="min-w-0 flex-1">
-          <p className="label mb-0.5">Paper · Reproduction Card</p>
-          <h1 className="display truncate text-xl font-bold">{paper?.title ?? "论文"}</h1>
+        <div className="workspace-title">
+          <p className="label mb-1">论文复现卡</p>
+          <h1 className="display text-2xl font-bold">{paper?.title ?? "论文"}</h1>
         </div>
         {versions.length > 0 && (
           <select
@@ -404,7 +425,7 @@ function PaperInner({ paperId }: { paperId: string }) {
             disabled={operationBusy}
             onChange={(e) => switchVersion(Number(e.target.value))}
             className="select w-44!"
-            aria-label="Card 版本"
+            aria-label="复现卡版本"
           >
             {versions.map((v) => (
               <option key={v.id} value={v.version}>
@@ -412,6 +433,17 @@ function PaperInner({ paperId }: { paperId: string }) {
               </option>
             ))}
           </select>
+        )}
+        {cardVersion && (
+          <button
+            onClick={downloadCardMarkdown}
+            disabled={downloading}
+            className="btn btn-ghost btn-sm"
+            title="导出当前版本的 Reproduction Card 为 Markdown（含证据与页码）"
+          >
+            <IconDownload className="h-3.5 w-3.5" />
+            {downloading ? "导出中…" : "下载复现卡"}
+          </button>
         )}
         <button onClick={reparse} disabled={operationBusy} className="btn btn-ghost btn-sm">
           <IconRefresh className="h-3.5 w-3.5" /> 重新解析
@@ -431,10 +463,15 @@ function PaperInner({ paperId }: { paperId: string }) {
         )}
         {workflow?.experiment_id && (
           <Link
-            href={`/experiments/${workflow.experiment_id}?workflow=${workflow.id}`}
+            href={`/experiments?id=${workflow.experiment_id}&workflow=${workflow.id}`}
             className="btn btn-primary btn-sm"
           >
             查看实验计划 <IconArrowRight className="h-3.5 w-3.5" />
+          </Link>
+        )}
+        {(confirmedVersionId === cardVersion?.id || workflow?.spec_version_id) && (
+          <Link href={`/comparison?id=${paperId}`} className="btn btn-ghost btn-sm">
+            建立优化器对照 <IconArrowRight className="h-3.5 w-3.5" />
           </Link>
         )}
       </header>
@@ -455,16 +492,7 @@ function PaperInner({ paperId }: { paperId: string }) {
         Promise.all([loadVersions(), loadCard(null)]).catch((err) => setError(err.message));
       }}>加载最新版本</button>
 
-      {workflow && (
-        <WorkflowStepper
-          status={workflow.status}
-          currentNode={workflow.current_node}
-          error={workflow.error}
-          onRetry={retry}
-          retrying={retrying}
-        />
-      )}
-      {workflow && <WorkflowInsights workflow={workflow} />}
+      {workflow && <WorkflowInsights key={workflow.id} workflow={workflow} onRetry={retry} retrying={retrying} />}
 
       {busy && (
         <p className="rise flex items-center gap-2 rounded-lg border border-info/40 bg-info/10 px-4 py-2 text-sm text-info">

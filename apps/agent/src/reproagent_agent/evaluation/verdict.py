@@ -63,8 +63,9 @@ def build_summary(
     comparisons: list[MetricComparison],
     method_checks: list[MethodCheck],
     experiment_checks: list[ExperimentCheck],
+    target_metric: str = "accuracy",
 ) -> str:
-    target = next((c for c in comparisons if c.metric == "accuracy"), None)
+    target = next((c for c in comparisons if c.metric == target_metric), None)
     numbers = ""
     if (
         target is not None
@@ -72,7 +73,7 @@ def build_summary(
         and target.experiment_value is not None
     ):
         numbers = (
-            f"accuracy：论文 {target.paper_value:.4f} vs 实验 {target.experiment_value:.4f}"
+            f"{target.metric}（{target.unit}）：论文 {target.paper_value:.4f} vs 实验 {target.experiment_value:.4f}"
             f"（绝对差 {target.absolute_difference:.4f}"
             + (
                 f"，{target.percentage_point_difference:+.2f} 个百分点"

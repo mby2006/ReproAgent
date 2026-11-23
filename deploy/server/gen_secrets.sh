@@ -54,21 +54,8 @@ SB_ORIGIN="https://$SB_HOST"
 
 # anon / service_role key：HS256 自签，iss 必须与 GOTRUE_JWT_ISSUER 完全一致
 # （= API_EXTERNAL_URL，见官方 compose 的 auth 段），GoTrue 会逐字校验 iss。
-make_key() {
-  JWT_SECRET="$JWT_SECRET" API_EXTERNAL_URL="$API_EXTERNAL_URL" python3 - "$1" <<'PY'
-import base64, hashlib, hmac, json, os, sys, time
-def b64(raw): return base64.urlsafe_b64encode(raw).rstrip(b"=").decode()
-now = int(time.time())
-header = {"alg": "HS256", "typ": "JWT"}
-claims = {"role": sys.argv[1], "iss": os.environ["API_EXTERNAL_URL"],
-          "iat": now, "exp": now + 10 * 365 * 86400}
-signing = (b64(json.dumps(header, separators=(",", ":")).encode()) + "." +
-           b64(json.dumps(claims, separators=(",", ":")).encode()))
-secret = os.environ["JWT_SECRET"].encode()
-sig = b64(hmac.new(secret, signing.encode(), hashlib.sha256).digest())
-print(f"{signing}.{sig}")
-PY
-}
+# claim 的唯一定义在 jwt_key.py —— set_domain.sh 换域名时也走它。
+make_key() { python3 "$HERE/jwt_key.py" "$JWT_SECRET" "$API_EXTERNAL_URL" "$1"; }
 ANON_KEY=$(make_key anon)
 SERVICE_ROLE_KEY=$(make_key service_role)
 

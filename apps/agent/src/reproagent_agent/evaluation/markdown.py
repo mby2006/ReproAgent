@@ -198,41 +198,33 @@ def _is_random_guess(request: EvaluateRequest, comparison) -> bool:
     return abs(comparison.experiment_value - 1 / classes) <= 0.03
 
 
-def _plain_conclusion(
-    request: EvaluateRequest, report: EvaluationReport, comparison
-) -> str:
-    status = report.final_status
-    if status is FinalStatus.EXECUTION_FAILED:
-        return "这次实验没有跑成功，因此无法用本次结果判断论文结论是否成立。"
-    if comparison is None:
-        return "缺少主指标的对比记录，请核查论文证据和运行指标。"
-    if _is_random_guess(request, comparison):
-        classes = request.plan.dataset_config.num_classes
-        measured = _metric(comparison.experiment_value, comparison.unit)
-        return (
-            f"本次准确率 {measured}"
-            f"，接近 {classes} 类均匀猜测的参考值（{100 / classes:.2f}%）。"
-            "单次运行无法确定差距由训练规模、模型设置或其他因素造成。"
-        )
-    if status is FinalStatus.METHOD_VALIDATED:
-        return (
-            f"实现方式与论文一致，指标 {_metric(comparison.experiment_value, comparison.unit)} "
-            f"也已落在允许范围内（论文 {_metric(comparison.paper_value, comparison.unit)}）。"
-            "这支持“这套实现能复现论文趋势”，但仍是缩小规模运行，不等于完整复现。"
-        )
-    if status is FinalStatus.SCALED_RUN_COMPLETED:
-        return (
-            f"流程已跑通，主指标实测 {_metric(comparison.experiment_value, comparison.unit)}，"
-            f"论文参考值为 {_metric(comparison.paper_value, comparison.unit)}。差异超出计划容差。"
-        )
-    if status is FinalStatus.PARTIAL_MATCH:
-        return "部分指标与论文吻合、部分偏离，需要逐项看差异原因。"
-    if status is FinalStatus.INSUFFICIENT_EVIDENCE:
-        return "现有证据不足以判定复现结果，具体缺项请查看逐项比对明细。"
-    return (
-        "实现方式与论文存在实质差异，本次结果只说明“按我们的实现跑出来是多少”，"
-        "不能当作论文结论的验证。"
-    )
+def reader_summary(request: EvaluateRequest, report: EvaluationReport) -> str:
+    if report.final_status is FinalStatus.EXECUTION_FAILED:
+        return "这次实验没有顺利完成，还没有可以用来核对论文结论的完整测试成绩。"
+    correct = request.metrics.get("correct_count")
+    total = request.metrics.get("evaluated_count")
+    lines = []
+    if type(correct) is int and type(total) is int and 0 <= correct <= total and total > 0:
+        lines.append(f"模型做了 {total:,} 道识别题，答对 {correct:,} 道，答错 {total - correct:,} 道。")
+    target = next((c for c in report.metric_comparisons if c.metric == report.target_metric), None)
+    if target and target.metric in {"accuracy", "error_rate"} and target.unit == "fraction":
+        action = "答对" if target.metric == "accuracy" else "答错"
+        if target.experiment_value is not None:
+            lines.append(f"按每 100 道题折算，本次平均{action} {100 * target.experiment_value:.1f} 道。")
+        if target.paper_value is not None:
+            lines.append(f"按同一指标折算，论文平均每 100 道{action} {100 * target.paper_value:.1f} 道。")
+    elif target and target.metric == "test_loss" and target.experiment_value is not None:
+        lines.append(f"本次给预测错误程度打出的平均分是 {_metric(target.experiment_value, target.unit)}。"
+                     "评分规则相同时，分数越低越好。")
+    interpretations = {
+        FinalStatus.DEVIATION_FOUND: "核对时发现，代码与论文的做法或实际运行与计划之间有出入。请在条件表中查看具体差别。",
+        FinalStatus.INSUFFICIENT_EVIDENCE: "还有关键设置或成绩缺少证据，现有记录不足以判断两次实验是否吻合。",
+        FinalStatus.METHOD_VALIDATED: "已核对的关键做法与论文相符，主要成绩也落在计划允许的差距内。这个判断只适用于本次缩小规模的实验。",
+        FinalStatus.SCALED_RUN_COMPLETED: "小规模实验跑完了，主要成绩与论文的差距超过计划允许的范围。单次比较无法定位原因。",
+        FinalStatus.PARTIAL_MATCH: "有些成绩接近论文，有些超出了计划允许的差距。需要分别查看各项成绩。",
+    }
+    lines.append(interpretations[report.final_status])
+    return "".join(lines)
 
 
 def _what_it_answers(request: EvaluateRequest, report: EvaluationReport, comparison):
@@ -266,7 +258,9 @@ def render_markdown(
     headline = [
         f"# 复现报告：{title}",
         "",
-        f"> **结论：{_STATUS_LABELS[status]}** — {_plain_conclusion(request, report, comparison)}",
+        report.reader_summary or reader_summary(request, report),
+        "",
+        f"> **结论：{_STATUS_LABELS[status]}**",
     ]
     if comparison is not None:
         headline += [
@@ -282,9 +276,7 @@ def render_markdown(
     headline += ["", "> **这份报告不能回答**"]
     headline += [f"> - {line}" for line in cannot]
     counts = request.metrics
-    if counts.get("correct_count") is not None and counts.get("evaluated_count"):
-        headline.append(f"本次测试 {counts['evaluated_count']} 张，模型认对 {counts['correct_count']} 张。")
-    elif counts.get("target_metric") in {"error_rate", "error rate"}:
+    if counts.get("correct_count") is None and counts.get("target_metric") in {"error_rate", "error rate"}:
         headline.append("旧版运行未记录正确样本数，原始目标值不可独立核验。")
     sections.append("\n".join(headline))
 

@@ -50,67 +50,82 @@
   {
     "key": "epochs",
     "label": "训练轮数",
-    "paper": null,
+    "paper": "20 轮",
     "plan": "4",
     "actual": "4",
-    "paper_evidence": null,
+    "paper_evidence": {
+      "kind": "paper",
+      "source_page": 10
+    },
     "actual_evidence": {
       "kind": "metrics",
       "file_path": "metrics.json"
     },
-    "note": "案例选择的设置；本次没有逐项核验对应原文数值。"
+    "note": "一轮指看完一遍训练集。论文图 5 的错误率约在第 10 轮趋稳，整次训练仍是 20 轮。本次每轮看的图片也更少。"
   },
   {
     "key": "batch_size",
     "label": "批大小",
-    "paper": null,
+    "paper": "每看 1 张就更新一次",
     "plan": "64",
     "actual": "64",
-    "paper_evidence": null,
+    "paper_evidence": {
+      "kind": "paper",
+      "source_page": 42
+    },
     "actual_evidence": {
       "kind": "config",
       "file_path": "config.yaml"
     },
-    "note": "案例选择的设置；本次没有逐项核验对应原文数值。"
+    "note": "附录 C 说明作者逐张调整权重。本次累积 64 张的结果才调整一次。"
   },
   {
     "key": "learning_rate",
     "label": "学习率",
-    "paper": null,
+    "paper": "全局步长分五段递减，另按权重调整",
     "plan": "0.03",
     "actual": "0.03",
-    "paper_evidence": null,
+    "paper_evidence": {
+      "kind": "paper",
+      "source_page": 10
+    },
     "actual_evidence": {
       "kind": "config",
       "file_path": "config.yaml"
     },
-    "note": "案例选择的设置；本次没有逐项核验对应原文数值。"
+    "note": "第 1–2 轮为 0.0005，第 3–5 轮为 0.0002，第 6–8 轮为 0.0001，第 9–12 轮为 0.00005，随后为 0.00001。附录 C 说明每个权重的实际步长还会调整。本次 SGD 使用固定步长。"
   },
   {
     "key": "optimizer",
     "label": "优化器",
-    "paper": null,
+    "paper": "随机对角 Levenberg–Marquardt",
     "plan": "sgd",
     "actual": "sgd",
-    "paper_evidence": null,
+    "paper_evidence": {
+      "kind": "paper",
+      "source_page": 42
+    },
     "actual_evidence": {
       "kind": "config",
       "file_path": "config.yaml"
     },
-    "note": "案例选择的设置；本次没有逐项核验对应原文数值。"
+    "note": "优化器决定模型每次怎样改正错误。原方法为各个权重分别计算步长，本次用普通随机梯度下降（SGD）。"
   },
   {
     "key": "loss_function",
     "label": "损失函数",
-    "paper": null,
+    "paper": "第 II.C 节讨论两种评分方式，图 5 这一组的具体选用未确认",
     "plan": "cross entropy",
     "actual": "cross entropy",
-    "paper_evidence": null,
+    "paper_evidence": {
+      "kind": "paper",
+      "source_page": 9
+    },
     "actual_evidence": {
       "kind": "config",
       "file_path": "config.yaml"
     },
-    "note": "案例选择的设置；本次没有逐项核验对应原文数值。"
+    "note": "原文给出均方误差及带类别竞争项的准则。本次代码用交叉熵给预测的错误程度打分。"
   },
   {
     "key": "target_metric",

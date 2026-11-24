@@ -153,6 +153,7 @@ class EvaluationReport(SchemaModel):
     parameter_comparisons: list[ParameterComparison] = Field(default_factory=list)
     final_status: FinalStatus
     summary: str = Field(min_length=1)
+    reader_summary: str | None = None
     method_checks: list[MethodCheck] = Field(default_factory=list)
     experiment_checks: list[ExperimentCheck] = Field(default_factory=list)
     metric_comparisons: list[MetricComparison] = Field(default_factory=list)

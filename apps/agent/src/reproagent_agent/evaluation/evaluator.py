@@ -12,7 +12,7 @@ from reproagent_schemas.plan import execution_metric
 from .comparison import compare_results
 from .experiment import validate_experiment
 from .facts import extract_facts
-from .markdown import render_markdown
+from .markdown import reader_summary, render_markdown
 from .method import validate_method
 from .parameters import parameter_comparisons
 from .verdict import build_summary, decide_final_status
@@ -129,4 +129,5 @@ def evaluate_run(request: EvaluateRequest) -> EvaluateResponse:
         **review,
         **parts,
     )
+    report.reader_summary = reader_summary(request, report)
     return EvaluateResponse(report=report, markdown=render_markdown(request, report, facts))

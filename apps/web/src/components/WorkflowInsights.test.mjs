@@ -25,7 +25,7 @@ function loadComponent(relativePath) {
 }
 
 const { TraceRow } = loadComponent("./WorkflowInsights.tsx");
-const { FinalSummary, ReportReview, ReviewAudit } = loadComponent("../app/experiments/[id]/ReportPanel.tsx");
+const { FinalSummary, ReportReview, ReviewAudit } = loadComponent("../app/experiments/ReportPanel.tsx");
 const render = (component, props) => renderToStaticMarkup(React.createElement(component, props));
 const disclaimer = "本实验关键假设由系统自动接受，未经人工逐项核验；结果仅供趋势参考。";
 const decision = {
@@ -43,6 +43,7 @@ test("report headline uses the approved metric even when a different row is comp
     ],
   };
   const html = render(FinalSummary, { data });
+  assert.ok(render(FinalSummary, { data: { ...data, reader_summary: "本次答对了九道题。" } }).includes("本次答对了九道题。"));
   for (const text of ["test_loss", "nats", "0.0500", "0.1200", "0.0700", "绝对差"]) assert.ok(html.includes(text));
   assert.ok(!html.includes("99.00%"));
   data.metric_comparisons[1].experiment_value = null;

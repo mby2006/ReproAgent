@@ -28,7 +28,7 @@ const METHOD_ITEM_LABEL: Record<string, string> = {
 const EXPERIMENT_ITEM_LABEL: Record<string, string> = {
   training_samples: "训练样本数",
   test_samples: "测试样本数",
-  epochs: "Epochs",
+  epochs: "训练轮数",
   batch_size: "批大小",
   optimizer: "优化器",
   learning_rate: "学习率",
@@ -182,6 +182,7 @@ export function FinalSummary({ data }: { data: EvaluationReport }) {
     <div className={`rounded-xl border px-5 py-4 ${box}`}>
       <p className="text-[12.5px] text-fg-3">结论</p>
       <p className="display mt-1 text-2xl font-semibold text-fg">{meta.label}</p>
+      {data.reader_summary && <p className="mt-3 text-base leading-relaxed">{data.reader_summary}</p>}
 
       {target ? <>
         <p className="mt-3 text-sm">主指标 <strong>{target.metric}</strong>（{target.unit === "fraction" ? "%" : target.unit}）</p>
@@ -207,7 +208,10 @@ export function FinalSummary({ data }: { data: EvaluationReport }) {
         {targetName ? `报告缺少主指标 ${targetName} 的对比记录。` : "历史报告未记录主指标。"} 可重新生成报告核查。
       </p>}
 
-      <p className="mt-4 text-[14.5px] leading-relaxed text-fg-2">{data.summary}</p>
+      <details className="mt-4 text-sm text-fg-2" open={!data.reader_summary}>
+        <summary className="cursor-pointer">查看技术判定依据</summary>
+        <p className="mt-2">{data.summary}</p>
+      </details>
       <p className="mt-2 text-[13px] leading-relaxed text-fg-3">
         判定顺序：先看实验有没有跑成功，再看代码实现是否和论文一致，最后才比较数值是否落在允许范围内。
       </p>
@@ -453,7 +457,7 @@ export default function ReportPanel({ runId, onFile }: { runId: string; onFile: 
           {data.scaling_deviations.length > 0 && (
             <Section
             title="为跑得动而缩小的部分"
-            hint="这些是有意调整，用来把实验压缩到几分钟。它们会拉低数值，但不影响方法本身的正确性。"
+            hint="这些调整减少了运行时间，也改变了比较条件。单次运行无法判断每项调整对成绩的影响。"
           >
               <ul className="space-y-1.5">
                 {data.scaling_deviations.map((d) => (

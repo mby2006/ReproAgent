@@ -499,6 +499,7 @@ export interface ParameterComparison {
 }
 
 export interface EvaluationReport {
+  reader_summary?: string | null;
   target_metric?: string | null;
   parameter_comparisons?: ParameterComparison[];
   review_mode?: ReviewMode | null;

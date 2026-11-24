@@ -686,6 +686,18 @@ def test_markdown_has_exactly_fourteen_sections_in_order():
     assert "r/stdout.txt" in response.markdown
 
 
+def test_reader_summary_uses_observed_counts_and_omits_incomplete_results():
+    request = make_request()
+    request.metrics.update(correct_count=909, evaluated_count=1024, accuracy=909 / 1024)
+    result = evaluate_run(request)
+    assert "答对 909 道，答错 115 道" in result.report.reader_summary
+    assert result.report.reader_summary in result.markdown.split("## 1.")[0]
+    del request.metrics["correct_count"]
+    assert "答错 115 道" not in evaluate_run(request).report.reader_summary
+    request.run_status = RunStatus.FAILED
+    assert "没有顺利完成" in evaluate_run(request).report.reader_summary
+
+
 def test_markdown_escapes_pipes_in_evidence():
     card = make_card(method=explicit("LeNet-5", quote="a|b|c"))
     request = make_request(card=card)

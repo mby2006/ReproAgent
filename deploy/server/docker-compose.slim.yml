@@ -28,13 +28,27 @@
 services:
   db:
     mem_limit: 1024m
+    logging: &default-logging
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "postgres", "-d", "postgres"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
     command:
       [
         "postgres",
         "-c",
         "config_file=/etc/postgresql/postgresql.conf",
         "-c",
-        "log_min_messages=fatal",
+        "log_min_messages=warning",
+        "-c",
+        "log_min_duration_statement=1000",
+        "-c",
+        "log_lock_waits=on",
         # 4GB 机器上的默认值偏大（shared_buffers 128MB 是官方镜像给的），
         # 这里不覆盖 shared_buffers，只把最大连接压下来：连接数才是内存的大头，
         # api/worker 各持一个池，加上 psql 运维会话，100 已经宽裕。
@@ -43,6 +57,7 @@ services:
       ]
 
   api-gw:
+    logging: *default-logging
     # 不发布任何端口：只有同一个 docker 网络里的服务能用 `kong` 这个名字访问它。
     ports: !override []
     mem_limit: 256m
@@ -60,12 +75,16 @@ services:
 
   auth:
     mem_limit: 256m
+    logging: *default-logging
 
   rest:
     mem_limit: 192m
+    logging: *default-logging
 
   storage:
     mem_limit: 256m
+    logging: *default-logging
 
   imgproxy:
     mem_limit: 192m
+    logging: *default-logging

@@ -5,11 +5,12 @@ verification, report). Only the HTTP boundaries and Postgres are faked, so the
 orchestration, pairing rules and persistence contract are genuinely exercised.
 """
 
+import asyncio
 import io
 import json
 import zipfile
 from types import SimpleNamespace
-from uuid import UUID, uuid4
+from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
 import httpx
 import pytest
@@ -708,15 +709,21 @@ async def test_common_config_change_reruns_both_groups(env):
 # --------------------------------------------------------------------------
 
 
-def test_duplicate_start_enqueues_one_job(env):
-    client, _admin, app, _settings = env
+def test_duplicate_start_keeps_one_comparison_and_retryable_deliveries(env):
+    client, admin, app, _settings = env
     detail = create_plan(client)
     approve_latest(client, detail["id"])
     first = start(client, detail["id"], "same-key")
     second = start(client, detail["id"], "same-key")
     assert first.json()["comparison_id"] == second.json()["comparison_id"]
-    jobs = [job for job in app.state.arq.jobs if job[0] == "run_comparison_task"]
-    assert len(jobs) == 1
+    comparison_id = first.json()["comparison_id"]
+    assert len(admin.tables["comparisons"]) == 1
+    # Retained arq results must not suppress a later delivery. The advisory lock
+    # and comparison state guards prevent these deliveries from executing twice.
+    assert app.state.arq.enqueued == [
+        ("run_comparison_task", (comparison_id,), None),
+        ("run_comparison_task", (comparison_id,), None),
+    ]
 
 
 def test_worker_skips_when_another_driver_holds_the_lock(env, monkeypatch):
@@ -893,6 +900,185 @@ def test_question_change_keeps_batch_size_and_rejects_mixed_edits(env):
 
 
 @pytest.mark.asyncio
+async def test_comparison_requests_use_stable_run_attempt_identity(env):
+    client, admin, app, settings = env
+    base = runner_transport()
+    requests: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST" and request.url.path == "/runs":
+            requests.append(json.loads(request.content))
+        return base.handler(request)
+
+    app.state.runner_transport = httpx.MockTransport(handler)
+    detail = create_plan(client)
+    approve_latest(client, detail["id"])
+    comparison_id = start(client, detail["id"]).json()["comparison_id"]
+    await run_job(app, settings, comparison_id)
+
+    assert len(requests) == 2
+    runs = admin.tables["execution_runs"]
+    assert {item["request_id"] for item in requests} == {
+        str(uuid5(NAMESPACE_URL, f"reproagent:execution:{row['id']}:attempt:0"))
+        for row in runs
+    }
+
+
+@pytest.mark.asyncio
+async def test_comparison_persistence_failure_preserves_polled_success(env, monkeypatch):
+    from reproagent_api.services import comparisons
+
+    def fail_persistence(*args, **kwargs):
+        raise RuntimeError("audit storage unavailable")
+
+    monkeypatch.setattr(comparisons, "async_persist_result", fail_persistence)
+    client, admin, app, settings = env
+    detail = create_plan(client)
+    approve_latest(client, detail["id"])
+    comparison_id = start(client, detail["id"]).json()["comparison_id"]
+
+    await run_job(app, settings, comparison_id)
+
+    assert len(admin.tables["execution_runs"]) == 2
+    assert all(row["status"] == "succeeded" for row in admin.tables["execution_runs"])
+    assert len(admin.tables["comparison_runs"]) == 2
+
+
+@pytest.mark.asyncio
+async def test_comparison_persistence_failure_preserves_concurrent_cancellation(env, monkeypatch):
+    from reproagent_api.services import comparisons
+
+    async def cancel_during_persistence(admin, run_id, *args, **kwargs):
+        admin.table("execution_runs").update({"status": "cancelled"}).eq(
+            "id", run_id
+        ).execute()
+        raise RuntimeError("audit storage unavailable")
+
+    monkeypatch.setattr(comparisons, "async_persist_result", cancel_during_persistence)
+    client, admin, app, settings = env
+    detail = create_plan(client)
+    approve_latest(client, detail["id"])
+    comparison_id = start(client, detail["id"]).json()["comparison_id"]
+
+    await run_job(app, settings, comparison_id)
+
+    assert len(admin.tables["comparison_runs"]) == 2
+    assert all(row["status"] == "cancelled" for row in admin.tables["execution_runs"])
+
+
+@pytest.mark.asyncio
+async def test_comparison_task_cancellation_cancels_runner_and_finalizes_run(env, monkeypatch):
+    from reproagent_api.services import comparisons
+
+    client, admin, app, settings = env
+    detail = create_plan(client)
+    approve_latest(client, detail["id"])
+    comparison_id = start(client, detail["id"]).json()["comparison_id"]
+    polling = asyncio.Event()
+    cancelled: list[str] = []
+    base = runner_transport()
+
+    async def blocked_poll(runner, runner_run_id):
+        polling.set()
+        await asyncio.Future()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST" and request.url.path.endswith("/cancel"):
+            cancelled.append(request.url.path.split("/")[2])
+        return base.handler(request)
+
+    monkeypatch.setattr(comparisons, "_poll", blocked_poll)
+    app.state.runner_transport = httpx.MockTransport(handler)
+    task = asyncio.create_task(run_job(app, settings, comparison_id))
+    await asyncio.wait_for(polling.wait(), timeout=2)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert len(admin.tables["execution_runs"]) == 1
+    assert admin.tables["execution_runs"][0]["status"] == "cancelled"
+    assert cancelled == [admin.tables["execution_runs"][0]["runner_run_id"]]
+
+
+@pytest.mark.asyncio
+async def test_comparison_poll_exhaustion_cancels_and_persists_timeout(env, monkeypatch):
+    from reproagent_api.services import comparisons
+
+    monkeypatch.setattr(comparisons, "POLL_INTERVAL_SECONDS", 0)
+    client, admin, app, settings = env
+    cancelled: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/images/status":
+            return httpx.Response(
+                200, json={"image": "i", "available": True, "digest": "img-v1"}
+            )
+        if request.method == "POST" and request.url.path == "/runs":
+            return httpx.Response(202, json={"run_id": str(uuid4()), "status": "queued"})
+        if request.method == "GET" and request.url.path.startswith("/runs/"):
+            run_id = request.url.path.split("/")[2]
+            return httpx.Response(
+                200,
+                json=RunResult(run_id=UUID(run_id), status=RunStatus.RUNNING).model_dump(
+                    mode="json"
+                ),
+            )
+        if request.method == "POST" and request.url.path.endswith("/cancel"):
+            cancelled.append(request.url.path.split("/")[2])
+            return httpx.Response(
+                200,
+                json=RunResult(
+                    run_id=UUID(request.url.path.split("/")[2]), status=RunStatus.CANCELLED
+                ).model_dump(mode="json"),
+            )
+        return httpx.Response(404, json={"detail": "unexpected"})
+
+    app.state.runner_transport = httpx.MockTransport(handler)
+    detail = create_plan(client)
+    approve_latest(client, detail["id"])
+    comparison_id = start(client, detail["id"]).json()["comparison_id"]
+    await run_job(app, settings, comparison_id)
+
+    assert cancelled
+    assert all(row["status"] == "timeout" for row in admin.tables["execution_runs"])
+    assert all(row["error_category"] == "TIMEOUT" for row in admin.tables["execution_runs"])
+    comparison_experiment_ids = {row["experiment_id"] for row in admin.tables["execution_runs"]}
+    assert all(
+        row["status"] == "failed"
+        for row in admin.tables["experiments"]
+        if row["id"] in comparison_experiment_ids
+    )
+
+
+def test_stale_comparison_finalization_cannot_overwrite_newer_experiment_state(env):
+    from reproagent_api.services.comparisons import _finalize_execution
+
+    _, admin, _, _ = env
+    experiment_id = str(uuid4())
+    old_run_id = str(uuid4())
+    new_run_id = str(uuid4())
+    admin.tables["experiments"].append({"id": experiment_id, "status": "running"})
+    admin.tables["execution_runs"].extend([
+        {
+            "id": old_run_id, "experiment_id": experiment_id, "status": "running",
+            "created_at": "2026-01-01T00:00:00+00:00",
+        },
+        {
+            "id": new_run_id, "experiment_id": experiment_id, "status": "succeeded",
+            "created_at": "2026-01-02T00:00:00+00:00", "error": "newer real result",
+        },
+    ])
+    _finalize_execution(
+        admin,
+        {"id": old_run_id, "experiment_id": experiment_id},
+        RunResult(run_id=UUID(old_run_id), status=RunStatus.FAILED, error="stale"),
+    )
+    old_run = next(row for row in admin.tables["execution_runs"] if row["id"] == old_run_id)
+    assert old_run["status"] == "running"
+    assert admin.tables["experiments"][-1]["status"] == "running"
+
+
+@pytest.mark.asyncio
 async def test_attempts_are_capped_and_each_attempt_is_recorded_before_training(env):
     client, admin, app, settings = env
 
@@ -1037,6 +1223,136 @@ async def test_recovery_reattaches_to_an_inflight_run_instead_of_retraining(env)
 
 
 @pytest.mark.asyncio
+async def test_recovery_missing_runner_id_reattaches_without_duplicate_training(env):
+    from reproagent_api.services.runs import execution_request_id
+
+    client, admin, app, settings = env
+    detail = create_plan(client)
+    approve_latest(client, detail["id"])
+    comparison_id = start(client, detail["id"]).json()["comparison_id"]
+    experiment_id = str(uuid4())
+    run_id = str(uuid4())
+    deterministic_id = execution_request_id(UUID(run_id), 0)
+    file_id = str(uuid4())
+    admin.tables["experiments"].append(
+        {
+            "id": experiment_id,
+            "project_id": str(PROJECT_ID),
+            "paper_id": str(PAPER_ID),
+            "spec_id": str(SPEC_ID),
+            "status": "running",
+            "name": "对照接受后失联",
+        }
+    )
+    admin.tables["execution_runs"].append(
+        {
+            "id": run_id,
+            "experiment_id": experiment_id,
+            "plan_id": str(uuid4()),
+            "status": "running",
+            "runner_run_id": None,
+            "code_version": 1,
+            "plan_version": 1,
+            "metrics_json": {},
+            "audit_json": {},
+            "code_hash": "code-v1",
+            "repair_attempt": 0,
+        }
+    )
+    admin.tables["comparison_runs"].append(
+        {
+            "id": str(uuid4()),
+            "comparison_id": comparison_id,
+            "seed": 42,
+            "group_key": "a",
+            "run_id": run_id,
+            "attempt": 1,
+        }
+    )
+    admin.tables["generated_files"].append(
+        {
+            "id": file_id,
+            "experiment_id": experiment_id,
+            "version": 1,
+            "path": "train.py",
+            "content": "print('recovered')",
+            "sha256": "code-v1",
+        }
+    )
+    admin.tables["execution_run_files"].append(
+        {"run_id": run_id, "generated_file_id": file_id}
+    )
+    base = runner_transport()
+    seen: list[str] = []
+    posted: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST" and request.url.path == "/runs":
+            posted.append(json.loads(request.content)["request_id"])
+        if request.method == "GET" and request.url.path == f"/runs/{deterministic_id}":
+            seen.append(str(deterministic_id))
+            recovered = RunResult(
+                run_id=deterministic_id,
+                status=RunStatus.SUCCEEDED,
+                exit_code=0,
+                stdout="ok",
+                execution_time=2.0,
+                metrics={
+                    "schema_version": "1.2",
+                    "target_metric": "accuracy",
+                    "metric_value": 0.86,
+                    "accuracy": 0.86,
+                    "correct_count": 8600,
+                    "evaluated_count": 10000,
+                    "test_loss": 0.2,
+                    "epochs_completed": 3,
+                    "train_samples": 10000,
+                    "test_samples": 10000,
+                    "seed": 42,
+                    "runtime_seconds": 2.0,
+                    "reproducibility": {
+                        "dataset_split_sha256": "split-fixed",
+                        "init_weights_sha256": "init-fixed",
+                        "sample_order_sha256": "order-fixed",
+                        "template_sha256": "template-fixed",
+                        "batch_size": 64,
+                        "epochs": 3,
+                        "train_subset_size": 10000,
+                        "test_subset_size": 10000,
+                        "loss_function": "cross_entropy",
+                        "optimizer": "sgd",
+                        "learning_rate": 0.01,
+                    },
+                },
+                audit=RunAudit(image_digest="img-v1", seed=42, code_hash="code-v1"),
+                artifacts=[],
+            )
+            return httpx.Response(200, json=recovered.model_dump(mode="json"))
+        return base.handler(request)
+
+    app.state.runner_transport = httpx.MockTransport(handler)
+    await run_job(app, settings, comparison_id)
+
+    assert seen == [str(deterministic_id)]
+    assert str(deterministic_id) not in posted
+    recovered = next(row for row in admin.tables["execution_runs"] if row["id"] == run_id)
+    assert recovered["status"] == "succeeded"
+    assert recovered["runner_run_id"] == str(deterministic_id)
+    attempts_a = [
+        row["attempt"]
+        for row in admin.tables["comparison_runs"]
+        if row["group_key"] == "a"
+    ]
+    assert attempts_a == [1]
+    versions = [
+        row["version"]
+        for row in admin.tables["generated_files"]
+        if row["experiment_id"] == experiment_id
+    ]
+    assert versions == [1]
+
+
+@pytest.mark.asyncio
 async def test_superseded_comparison_keeps_unfinished_status(env):
     client, admin, app, settings = env
     detail = create_plan(client)
@@ -1156,8 +1472,21 @@ async def test_recovery_without_runner_id_finalizes_the_run_and_retries(env):
         }
     )
 
+    from reproagent_api.services.runs import execution_request_id
+
+    deterministic_id = execution_request_id(UUID(run_id), 0)
+    cancelled: list[str] = []
+    base = runner_transport()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST" and request.url.path.endswith("/cancel"):
+            cancelled.append(request.url.path.split("/")[2])
+        return base.handler(request)
+
+    app.state.runner_transport = httpx.MockTransport(handler)
     await run_job(app, settings, comparison_id)
 
+    assert str(deterministic_id) in cancelled
     orphan_run = next(row for row in admin.tables["execution_runs"] if row["id"] == run_id)
     orphan_experiment = next(
         row for row in admin.tables["experiments"] if row["id"] == experiment_id

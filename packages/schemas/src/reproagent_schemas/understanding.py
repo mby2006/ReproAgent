@@ -9,13 +9,16 @@ from pydantic import Field
 from .card import ReproductionCard
 from .common import ManualReviewMode, SchemaModel, utcnow
 from .jobs import JobStatus
+from .paper import MAX_PDF_BASE64_LENGTH
 from .parsed import ParsedDocument
 from .workflow import LLMUsage
 
 
 class UnderstandRequest(SchemaModel):
     paper_id: UUID
-    pdf_b64: str = Field(min_length=1, description="base64-encoded PDF bytes")
+    pdf_b64: str = Field(
+        min_length=1, max_length=MAX_PDF_BASE64_LENGTH, description="base64-encoded PDF bytes"
+    )
     title_hint: str | None = None
 
 
@@ -26,7 +29,9 @@ class UnderstandResponse(SchemaModel):
 
 
 class ParseRequest(SchemaModel):
-    pdf_b64: str = Field(min_length=1, description="base64-encoded PDF bytes")
+    pdf_b64: str = Field(
+        min_length=1, max_length=MAX_PDF_BASE64_LENGTH, description="base64-encoded PDF bytes"
+    )
 
 
 class ParseResponse(SchemaModel):

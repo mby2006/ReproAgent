@@ -4,10 +4,10 @@ Reproduces the arq race where restart recovery (recover_workflow_task) overlaps 
 original queued run_workflow_task on the SAME thread_id. Without mutual exclusion
 both drive the shared checkpoint, duplicating nodes/spec versions and forking the
 checkpoint chain. The lock is session-scoped Postgres advisory, so these tests need
-a real `supabase start` Postgres (skipped when unavailable).
+a real `supabase start` Postgres and fail when it is unavailable.
 
 Run explicitly:
-    uv run pytest tests/integration/test_workflow_lock.py -q
+    uv run pytest tests/integration/test_workflow_lock.py -m integration -q
 """
 
 import asyncio
@@ -56,8 +56,8 @@ def _require_db(settings):
     try:
         with psycopg.connect(settings.supabase_db_url, connect_timeout=5) as conn:
             conn.execute("select 1")
-    except Exception as exc:  # noqa: BLE001 - skip when local Postgres is down
-        pytest.skip(f"supabase postgres unavailable: {exc}")
+    except Exception as exc:  # noqa: BLE001 - required integration dependency
+        pytest.fail(f"supabase postgres unavailable: {exc}")
 
 
 @pytest.fixture(scope="module")

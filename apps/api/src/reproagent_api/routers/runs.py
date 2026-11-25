@@ -8,9 +8,10 @@ The API process never executes generated code.
 
 from datetime import datetime
 from typing import Annotated, Literal
-from uuid import UUID, uuid4
+from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
+from httpx import HTTPStatusError
 from pydantic import Field, ValidationError
 from reproagent_schemas import (
     ErrorCategory,
@@ -25,7 +26,8 @@ from ..clients.agent import AgentClient
 from ..clients.runner import RunnerClient
 from ..clients.supabase import make_service_client
 from ..services import generate_and_store_report
-from ..services.runs import load_execution_plan
+from ..services.dispatch import enqueue_pending_outbox
+from ..services.runs import execution_request_id, finalize_execution_run, load_execution_plan
 
 router = APIRouter(prefix="/v1", tags=["runs"])
 
@@ -132,18 +134,6 @@ def _get_run(admin, run_id: UUID, user_id: UUID) -> dict:
     return {col.strip(): row.get(col.strip()) for col in RUN_COLUMNS.split(",")}
 
 
-async def _enqueue(request: Request, run_id: UUID) -> None:
-    arq = getattr(request.app.state, "arq", None)
-    if arq is None:
-        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "Job queue unavailable")
-    try:
-        await arq.enqueue_job("run_experiment_task", str(run_id))
-    except Exception as exc:
-        raise HTTPException(
-            status.HTTP_503_SERVICE_UNAVAILABLE, f"Failed to enqueue job: {exc}"
-        ) from exc
-
-
 @router.post(
     "/experiments/{experiment_id}/runs",
     response_model=RunAccepted,
@@ -168,20 +158,18 @@ async def start_run(
     if actor != user_id:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Experiment not found")
 
-    run_id = uuid4()
-    admin.table("execution_runs").insert(
-        {
-            "id": str(run_id),
-            "experiment_id": str(experiment_id),
-            "plan_id": plan["id"],
-            "code_version": 1,
-            "plan_version": plan["version"],
-            "status": RunStatus.QUEUED.value,
-            "repair_attempt": 0,
-        }
-    ).execute()
-    admin.table("experiments").update({"status": "running"}).eq("id", str(experiment_id)).execute()
-    await _enqueue(request, run_id)
+    run_id = UUID(str(admin.rpc("create_execution_run", {
+        "p_experiment_id": str(experiment_id),
+        "p_plan_id": plan["id"],
+        "p_plan_version": plan["version"],
+    })))
+    # Redis is only a delivery optimization. The run and its outbox intent are
+    # already durable, so an outage must not turn an accepted run into a 503.
+    await enqueue_pending_outbox(
+        admin,
+        getattr(request.app.state, "arq", None),
+        entity_id=run_id,
+    )
     return RunAccepted(run_id=run_id, status=RunStatus.QUEUED)
 
 
@@ -371,31 +359,54 @@ async def cancel_run(
     run = _get_run(admin, run_id, user_id)
     if run["status"] in TERMINAL_STATUSES:
         return RunDetail.model_validate(run)
-    if run.get("runner_run_id"):
+
+    # Dispatch can persist a Runner id while cancellation is awaiting the Runner.
+    # Re-read after every await and cancel whichever identity is currently known;
+    # an executing row with no id still has a deterministic acceptance identity.
+    cancelled: set[UUID] = set()
+    while True:
+        current = _get_run(admin, run_id, user_id)
+        if current["status"] in TERMINAL_STATUSES:
+            return RunDetail.model_validate(current)
+        known_id = current.get("runner_run_id")
+        identity = UUID(known_id) if known_id else None
+        if identity is None and current["status"] in (
+            RunStatus.DISPATCHING.value,
+            RunStatus.RUNNING.value,
+        ):
+            identity = execution_request_id(run_id, current.get("repair_attempt", 0))
+        if identity is None or identity in cancelled:
+            # This read is immediately before the guarded write, with no await
+            # between them, so a real terminal result is returned rather than
+            # overwritten and no newly discovered identity is left uncancelled.
+            finalize_execution_run(
+                admin,
+                str(run_id),
+                RunStatus.CANCELLED,
+                None,
+                attempt=current.get("repair_attempt", 0),
+                require_latest=True,
+            )
+            return RunDetail.model_validate(_get_run(admin, run_id, user_id))
+
         runner = RunnerClient(
             request.app.state.settings,
             transport=getattr(request.app.state, "runner_transport", None),
         )
         try:
-            await runner.cancel_run(UUID(run["runner_run_id"]))
+            await runner.cancel_run(identity)
+        except HTTPStatusError as exc:
+            # A deterministic identity may not have reached Runner yet. A known
+            # Runner id missing from the Registry remains an operational error.
+            if exc.response.status_code != 404 or known_id:
+                raise HTTPException(
+                    status.HTTP_502_BAD_GATEWAY,
+                    f"Failed to cancel run on runner: {exc}",
+                ) from exc
         except Exception as exc:
             raise HTTPException(
                 status.HTTP_502_BAD_GATEWAY, f"Failed to cancel run on runner: {exc}"
             ) from exc
         finally:
             await runner.aclose()
-    # Conditional flip: only queued/running rows become cancelled, so a run that
-    # finished concurrently keeps its real terminal status instead of being
-    # overwritten.
-    updated = (
-        admin.table("execution_runs")
-        .update({"status": RunStatus.CANCELLED.value})
-        .eq("id", str(run_id))
-        .in_("status", [RunStatus.QUEUED.value, RunStatus.RUNNING.value])
-        .execute()
-        .data
-    )
-    if not updated:
-        return RunDetail.model_validate(_get_run(admin, run_id, user_id))
-    run["status"] = RunStatus.CANCELLED.value
-    return RunDetail.model_validate(run)
+        cancelled.add(identity)

@@ -1,8 +1,8 @@
 "use client";
 
-import Link from "next/link";
+import SiteLink from "@/components/SiteLink";
 import { useRouter } from "next/navigation";
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
   downloadComparisonExport,
   getComparison,
@@ -11,6 +11,7 @@ import {
 } from "@/lib/api";
 import type { ComparisonDetail, ComparisonRunView } from "@/lib/comparison";
 import { COMPARISON_META, GROUP_LABEL } from "@/lib/comparison";
+import { startVisiblePolling } from "@/lib/polling";
 import { RUN_META, TONE_BADGE } from "@/lib/ui";
 
 const BUSY = new Set(["queued", "running"]);
@@ -52,21 +53,28 @@ export default function ComparisonClient({ comparisonId }: { comparisonId: strin
   const [busy, setBusy] = useState(false);
   const [rerunNotice, setRerunNotice] = useState<{ id: string; warnings: string[] } | null>(null);
   const router = useRouter();
+  const loadVersion = useRef(0);
 
   const load = useCallback(async () => {
+    const version = ++loadVersion.current;
     try {
       const next = await getComparison(comparisonId);
+      if (!next || version !== loadVersion.current) return null;
       setDetail(next);
+      setError(null);
       if (next.report_status) {
         try {
-          setMarkdown((await getComparisonReport(comparisonId)).markdown);
+          const report = await getComparisonReport(comparisonId);
+          if (report && version === loadVersion.current) setMarkdown(report.markdown);
         } catch {
-          setMarkdown(null);
+          if (version === loadVersion.current) setMarkdown(null);
         }
       }
       return next;
     } catch (exc) {
-      setError(exc instanceof Error ? exc.message : "无法读取对照任务");
+      if (version === loadVersion.current) {
+        setError(exc instanceof Error ? exc.message : "无法读取对照任务");
+      }
       return null;
     }
   }, [comparisonId]);
@@ -75,11 +83,12 @@ export default function ComparisonClient({ comparisonId }: { comparisonId: strin
     void load();
   }, [load]);
 
+  const comparisonActive = detail != null && BUSY.has(detail.status);
+
   useEffect(() => {
-    if (!detail || !BUSY.has(detail.status)) return;
-    const timer = setInterval(() => void load(), 2500);
-    return () => clearInterval(timer);
-  }, [detail, load]);
+    if (!comparisonActive) return;
+    return startVisiblePolling(() => { void load(); }, 2500);
+  }, [comparisonActive, load]);
 
   const exportPackage = async () => {
     setBusy(true);
@@ -133,9 +142,9 @@ export default function ComparisonClient({ comparisonId }: { comparisonId: strin
 
   return (
     <div className="mx-auto w-full max-w-5xl px-5 py-8">
-      <Link href={`/papers`} className="link-quiet text-[12px]">
+      <SiteLink href={`/papers`} className="link-quiet text-[12px]">
         ← 论文库
-      </Link>
+      </SiteLink>
       <div className="mt-3 flex flex-wrap items-start justify-between gap-3">
         <div>
           <h1 className="display text-2xl text-fg">对照结果</h1>

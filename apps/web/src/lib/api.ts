@@ -1,4 +1,5 @@
 import { supabase } from "./supabase";
+import { readOnce } from "./polling";
 import type { CardVersion, ExplainResponse, NodeTrace, PlanVersion, RecommendResponse, OrdinaryReviewMode, RiskTier, WorkflowDetail } from "./types";
 import type { CandidateResponse, ComparisonDetail, ComparisonPlanDetail } from "./comparison";
 
@@ -32,6 +33,14 @@ export async function apiFetch<T>(path: string, init?: RequestInit): Promise<T> 
   return (await response.json()) as T;
 }
 
+export async function apiGet<T>(path: string, init?: RequestInit): Promise<T | null> {
+  const {
+    data: { session },
+  } = await supabase.auth.getSession();
+  if (!session) throw new Error("未登录");
+  return readOnce(`reproagent-read:${API_URL}${path}:${session.user.id}`, () => apiFetch<T>(path, init));
+}
+
 export function uploadPaper(file: File | null, title: string, url?: string) {
   const form = new FormData();
   if (file) form.append("file", file);
@@ -50,7 +59,7 @@ export function deletePaper(paperId: string) {
 }
 
 export function getWorkflow(workflowId: string) {
-  return apiFetch<WorkflowDetail>(`/v1/workflows/${workflowId}`);
+  return apiGet<WorkflowDetail>(`/v1/workflows/${workflowId}`);
 }
 
 export function getPaperWorkflow(paperId: string) {
@@ -235,11 +244,11 @@ export function startComparison(planId: string, version: number, idempotencyKey:
 }
 
 export function getComparison(comparisonId: string) {
-  return apiFetch<ComparisonDetail>(`/v1/comparisons/${comparisonId}`);
+  return apiGet<ComparisonDetail>(`/v1/comparisons/${comparisonId}`);
 }
 
 export function getComparisonReport(comparisonId: string) {
-  return apiFetch<{ comparison_id: string; status: string; markdown: string; created_at: string }>(
+  return apiGet<{ comparison_id: string; status: string; markdown: string; created_at: string }>(
     `/v1/comparisons/${comparisonId}/report`,
   );
 }

@@ -53,7 +53,16 @@ export const WF_META: Record<WorkflowStatus, { label: string; tone: Tone }> = {
   evaluating: { label: "评估", tone: "info" },
   completed: { label: "完成", tone: "ok" },
   failed: { label: "失败", tone: "bad" },
+  cancelled: { label: "已取消", tone: "mute" },
 };
+
+const WORKFLOW_TERMINAL: ReadonlySet<WorkflowStatus> = new Set([
+  "completed", "failed", "cancelled",
+]);
+
+export function isWorkflowTerminal(status: WorkflowStatus): boolean {
+  return WORKFLOW_TERMINAL.has(status);
+}
 
 export const WF_BUSY: WorkflowStatus[] = [
   "uploaded",

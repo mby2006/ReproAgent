@@ -64,7 +64,8 @@ _EVALUATION = '''def evaluate(model, loader, criterion, output, target):
                 index = subset.indices[total + offset]
                 pixels = subset.dataset.data[index].flatten().tolist()
                 samples.append({"index": index, "pixels": bytes(pixels).hex(),
-                                "label": int(labels[offset]), "prediction": int(predictions[offset])})
+                                "label": int(labels[offset]),
+                                "prediction": int(predictions[offset])})
             total += labels.size(0)
     values = {"accuracy": correct / total, "error_rate": (total - correct) / total,
               "test_loss": loss_sum / total}
@@ -244,7 +245,8 @@ def build_loaders(cfg: dict):
         json.dumps(reproducibility, indent=2), encoding="utf-8"
     )
     torch.save(model.state_dict(), output / "model.pt")
-    print(json.dumps({"status": "ok", "accuracy": results["accuracy"], "epochs": training["epochs"]}))
+    print(json.dumps({"status": "ok", "accuracy": results["accuracy"],
+                      "epochs": training["epochs"]}))
 
 
 if __name__ == "__main__":
@@ -284,7 +286,8 @@ CONFIG_PATH = "config.yaml"
     output = Path(cfg["output"]["dir"])
     model = build_model(data["num_classes"])
     model.load_state_dict(torch.load(output / "model.pt", weights_only=True))
-    results = evaluate(model, loader, torch.nn.CrossEntropyLoss(), output, cfg["evaluation"]["target_metric"])
+    results = evaluate(model, loader, torch.nn.CrossEntropyLoss(), output,
+                       cfg["evaluation"]["target_metric"])
     report = {
         "schema_version": "1.1",
         **results,

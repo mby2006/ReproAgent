@@ -16,5 +16,6 @@ async def health(request: Request) -> HealthResponse:
             "torch_available": torch_available,
             "timeout_seconds": settings.timeout_seconds,
             "work_dir": str(settings.work_dir),
+            **request.app.state.registry.status_counts(),
         },
     )

@@ -1,8 +1,11 @@
+from unittest.mock import AsyncMock
+
 import httpx
 import pytest
 from fastapi.testclient import TestClient
 from reproagent_api.config import ApiSettings
 from reproagent_api.main import create_app
+from reproagent_schemas import DependencyHealth, HealthStatus
 
 
 @pytest.fixture
@@ -17,8 +20,23 @@ def settings() -> ApiSettings:
 
 
 @pytest.fixture
-def client(settings) -> TestClient:
+def client(settings, monkeypatch) -> TestClient:
+    monkeypatch.setattr(
+        "reproagent_api.health_checks.check_database",
+        lambda settings: DependencyHealth(name="postgres", status=HealthStatus.OK),
+    )
     return TestClient(create_app(settings))
+
+
+def mock_queue_health(monkeypatch):
+    monkeypatch.setattr(
+        "reproagent_api.health_checks.check_redis",
+        AsyncMock(return_value=DependencyHealth(name="redis", status=HealthStatus.OK)),
+    )
+    monkeypatch.setattr(
+        "reproagent_api.health_checks.check_worker",
+        AsyncMock(return_value=DependencyHealth(name="worker", status=HealthStatus.OK)),
+    )
 
 
 def test_health(client):
@@ -30,6 +48,7 @@ def test_health(client):
 
 
 def test_dependencies_all_ok(client, settings, monkeypatch):
+    mock_queue_health(monkeypatch)
     def handler(request: httpx.Request) -> httpx.Response:
         if request.url.host == "agent.test":
             if request.url.path == "/health/dependencies":
@@ -44,6 +63,8 @@ def test_dependencies_all_ok(client, settings, monkeypatch):
             return httpx.Response(200, json={"service": "agent", "status": "ok"})
         if request.url.path == "/auth/v1/health":
             return httpx.Response(200, json={"status": "ok"})
+        if request.url.path == "/storage/v1/bucket":
+            return httpx.Response(200, json=[{"id": "papers"}])
         return httpx.Response(404)
 
     transport = httpx.MockTransport(handler)
@@ -56,11 +77,14 @@ def test_dependencies_all_ok(client, settings, monkeypatch):
     assert response.status_code == 200
     body = response.json()
     assert body["status"] == "ok"
-    assert {dep["name"] for dep in body["dependencies"]} == {"agent", "supabase", "runner"}
+    assert {dep["name"] for dep in body["dependencies"]} == {
+        "agent", "supabase", "postgres", "storage", "redis", "runner", "worker"
+    }
 
 
 @pytest.mark.parametrize("dependency_status", [200, 503])
 def test_dependencies_ignore_host_proxy_settings(client, monkeypatch, dependency_status):
+    mock_queue_health(monkeypatch)
     monkeypatch.setenv("NO_PROXY", "localhost,[::1]")
     monkeypatch.setenv("no_proxy", "localhost,[::1]")
 
@@ -82,10 +106,14 @@ def test_dependencies_ignore_host_proxy_settings(client, monkeypatch, dependency
     assert response.status_code == 200
     body = response.json()
     assert body["status"] == ("ok" if dependency_status == 200 else "degraded")
-    assert {dep["name"] for dep in body["dependencies"]} == {"agent", "supabase", "runner"}
+    assert {dep["name"] for dep in body["dependencies"]} == {
+        "agent", "supabase", "postgres", "storage", "redis", "runner", "worker"
+    }
+    remote = {"agent", "supabase", "runner", "storage"}
     assert all(
         dep["status"] == ("ok" if dependency_status == 200 else "unavailable")
         for dep in body["dependencies"]
+        if dep["name"] in remote
     )
 
 

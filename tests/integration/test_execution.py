@@ -105,7 +105,7 @@ def client(settings):
         c.ping()
         c.images.get(settings.exec_image)
     except Exception as exc:  # noqa: BLE001
-        pytest.skip(f"Docker daemon or exec image unavailable: {exc}")
+        pytest.fail(f"Docker daemon or exec image unavailable: {exc}")
     return c
 
 

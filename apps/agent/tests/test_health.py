@@ -20,6 +20,14 @@ def test_health_reports_graph_loaded(client):
     assert body["details"]["graph_nodes"] == 7
 
 
+def test_health_is_unavailable_without_loaded_graph():
+    app = create_app(AgentSettings(runner_base_url="http://runner.test", _env_file=None))
+    app.state.graph = None
+    response = TestClient(app).get("/health")
+    assert response.status_code == 503
+    assert response.json()["status"] == "unavailable"
+
+
 def test_dependencies_runner_ok(client, monkeypatch):
     transport = httpx.MockTransport(lambda request: httpx.Response(200, json={"status": "ok"}))
     original_client = httpx.AsyncClient
@@ -55,7 +63,7 @@ def test_dependencies_ignore_host_proxy_settings(client, monkeypatch, dependency
 
 def test_dependencies_runner_down(client, monkeypatch):
     def handler(request):
-        raise httpx.ConnectError("refused", request=request)
+        raise httpx.ConnectError("token=secret-value", request=request)
 
     original_client = httpx.AsyncClient
     monkeypatch.setattr(
@@ -64,4 +72,6 @@ def test_dependencies_runner_down(client, monkeypatch):
     )
     body = client.get("/health/dependencies").json()
     assert body["status"] == "degraded"
+    assert body["dependencies"][0]["name"] == "runner"
     assert body["dependencies"][0]["status"] == "unavailable"
+    assert body["dependencies"][0]["detail"] == "ConnectError"

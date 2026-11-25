@@ -2,38 +2,47 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { getWorkflow } from "./api";
+import { startVisiblePolling } from "./polling";
+import { isWorkflowTerminal } from "./ui";
 import type { WorkflowDetail } from "./types";
-
-const TERMINAL = new Set(["completed", "failed"]);
 
 export function useWorkflow(initialId: string | null) {
   const [workflowId, setWorkflowId] = useState<string | null>(initialId);
   const [workflow, setWorkflow] = useState<WorkflowDetail | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const inFlight = useRef(false);
+  const inFlight = useRef<string | null>(null);
+  const requestVersion = useRef(0);
 
   const refresh = useCallback(async () => {
-    if (!workflowId || inFlight.current) return;
-    inFlight.current = true;
+    if (!workflowId || inFlight.current === workflowId) return;
+    const version = ++requestVersion.current;
+    inFlight.current = workflowId;
     try {
-      setWorkflow(await getWorkflow(workflowId));
-      setError(null);
+      const next = await getWorkflow(workflowId);
+      if (next && version === requestVersion.current) {
+        setWorkflow(next);
+        setError(null);
+      }
     } catch (err) {
-      setError(err instanceof Error ? err.message : "查询工作流失败");
+      if (version === requestVersion.current) {
+        setError(err instanceof Error ? err.message : "查询工作流失败");
+      }
     } finally {
-      inFlight.current = false;
+      if (inFlight.current === workflowId) inFlight.current = null;
     }
   }, [workflowId]);
 
   useEffect(() => {
-    refresh();
+    setWorkflow(null);
+    void refresh();
   }, [refresh]);
 
+  const workflowActive = workflowId != null && workflow != null && !isWorkflowTerminal(workflow.status);
+
   useEffect(() => {
-    if (!workflowId || !workflow || TERMINAL.has(workflow.status)) return;
-    const timer = setInterval(refresh, 2000);
-    return () => clearInterval(timer);
-  }, [workflowId, workflow, refresh]);
+    if (!workflowActive) return;
+    return startVisiblePolling(() => refresh(), 2000);
+  }, [workflowActive, refresh]);
 
   return { workflowId, setWorkflowId, workflow, error, refresh };
 }

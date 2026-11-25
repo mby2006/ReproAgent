@@ -19,6 +19,11 @@ SB_HOST="${2:-}"
 [ -n "$API_HOST" ] && [ -n "$SB_HOST" ] || { echo "用法: $0 <api 域名> <sb 域名>" >&2; exit 2; }
 case "$API_HOST$SB_HOST" in */*|*:*) echo "只传主机名，不要带 https:// 或路径" >&2; exit 2;; esac
 [ -f .env.prod ] || { echo "缺少 .env.prod" >&2; exit 1; }
+CURRENT=/var/lib/reproagent/releases/current
+[ -n "${IMAGE_TAG:-}" ] || [ -f "$CURRENT" ] || {
+  echo "缺少 $CURRENT：先运行 ops.py release，或显式设置 IMAGE_TAG" >&2; exit 1;
+}
+export IMAGE_TAG="${IMAGE_TAG:-$(cat "$CURRENT")}"
 
 read_env() { sed -n "s/^$1=//p" .env.prod | head -1; }
 set_kv() {
@@ -59,5 +64,5 @@ cat <<EOF
 ==> 现在重建受影响的容器：
     cd $(pwd)
     ./bootstrap.sh supabase        # 会重建 auth / api-gw / storage
-    docker compose --env-file .env.prod -f docker-compose.prod.yml up -d api worker
+    IMAGE_TAG="$IMAGE_TAG" docker compose --env-file .env.prod -f docker-compose.prod.yml up -d --no-build api worker
 EOF

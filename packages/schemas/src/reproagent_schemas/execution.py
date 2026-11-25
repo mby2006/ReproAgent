@@ -8,10 +8,11 @@ read them without guessing.
 """
 
 import hashlib
+import json
 import re
 from enum import StrEnum
 from typing import Any
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from pydantic import ConfigDict, Field, model_validator
 
@@ -35,6 +36,7 @@ _SAFE_PATH = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_./-]*$")
 
 class RunStatus(StrEnum):
     QUEUED = "queued"
+    DISPATCHING = "dispatching"
     RUNNING = "running"
     SUCCEEDED = "succeeded"
     FAILED = "failed"
@@ -83,7 +85,20 @@ class CodeFile(SchemaModel):
         return self
 
 
+def canonical_request_content(request: "RunRequest") -> str:
+    """Canonical execution content, excluding the internal idempotency identity."""
+    content = request.model_dump(mode="json", exclude={"request_id"})
+    content["dependencies"] = sorted(content["dependencies"])
+    content["code_files"] = sorted(content["code_files"], key=lambda item: item["path"])
+    return json.dumps(content, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+
+def request_fingerprint(request: "RunRequest") -> str:
+    return hashlib.sha256(canonical_request_content(request).encode("utf-8")).hexdigest()
+
+
 class RunRequest(SchemaModel):
+    request_id: UUID = Field(default_factory=uuid4)
     experiment_id: UUID
     experiment_plan_id: UUID
     code_files: list[CodeFile] = Field(min_length=1)

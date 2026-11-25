@@ -14,6 +14,11 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 [ -f .env.prod ] || { echo "缺少 deploy/server/.env.prod" >&2; exit 1; }
+CURRENT=/var/lib/reproagent/releases/current
+[ -n "${IMAGE_TAG:-}" ] || [ -f "$CURRENT" ] || {
+  echo "缺少 $CURRENT：先运行 ops.py release，或显式设置 IMAGE_TAG" >&2; exit 1;
+}
+export IMAGE_TAG="${IMAGE_TAG:-$(cat "$CURRENT")}"
 # 不 source 这个文件：它以上游 .env.example 为底本，里面有不带引号的含空格值
 # （STUDIO_DEFAULT_ORGANIZATION=Default Organization），bash 会把它当成两条命令。
 # compose 的解析器按「等号后整行」取值，所以只有 shell 这边需要绕开。

@@ -10,7 +10,7 @@
 #   ./bootstrap.sh data      建 /var/lib/reproagent 下的数据目录，并把上游 compose 里
 #                            ./volumes/db/data 与 ./volumes/storage 改成指向它们的软链接
 #   ./bootstrap.sh supabase  起精简数据层（db/auth/rest/storage/imgproxy/kong）
-#   ./bootstrap.sh migrate   按文件名顺序打 8 个迁移（ON_ERROR_STOP，任一失败即停）
+#   ./bootstrap.sh migrate   按版本号事务执行迁移，先做并校验数据库快照
 #   ./bootstrap.sh app       起应用层（api/worker/agent/runner/redis/edge/tunnel）
 #   ./bootstrap.sh gate      上线关卡：端口没漏、白名单生效、伪造失败、登录成功
 #   ./bootstrap.sh status    各容器状态 + 宿主机监听端口
@@ -26,7 +26,6 @@ REPO="$(cd "$HERE/../.." && pwd)"
 UPSTREAM="${UPSTREAM_DOCKER_DIR:-/opt/supabase-src/docker}"
 ENV_FILE="$HERE/.env.prod"
 DATA_ROOT=/var/lib/reproagent/supabase
-MIGRATIONS=( "$REPO"/infra/supabase/migrations/*.sql )
 
 SB=(docker compose -p supabase --env-file "$ENV_FILE"
     -f "$UPSTREAM/docker-compose.yml"
@@ -75,34 +74,22 @@ step_supabase() {
 
 step_migrate() {
   need_env
-  local f
-  for f in "${MIGRATIONS[@]}"; do
-    echo "==> $(basename "$f")"
-    # 容器内经 unix socket 连本地 postgres：免口令，且流量完全不经过任何网络。
-    # ON_ERROR_STOP=1 配上 set -e：任一迁移报错就停在这里，而不是让后面的静默错位。
-    "${SB[@]}" exec -T db psql -U postgres -v ON_ERROR_STOP=1 -q -f - < "$f"
-  done
-  # 迁移生效的证据用我们自己建的表，而不是 supabase_migrations 那种上游记账表：
-  # 我们是直接 psql 打进去的，没有版本号表可读。
-  local n
-  n=$("${SB[@]}" exec -T db psql -U postgres -tA -c \
-        "select count(*) from information_schema.tables where table_schema='public'")
-  echo "==> public 表数：$n"
-  "${SB[@]}" exec -T db psql -U postgres -tA -c \
-    "select relname || ' ' || case relrowsecurity when true then 'RLS on' else 'RLS OFF' end
-       from pg_class where relname in ('papers','runs','reproductions','evidence','comparisons')
-      order by relname"
+  uv run python "$HERE/ops.py" migrate "$@"
 }
 
 step_app() {
   need_env
-  "${APP[@]}" up -d --build
+  : "${IMAGE_TAG:?先设置 IMAGE_TAG=<完整 commit SHA>；推荐用 ops.py release}"
+  "${APP[@]}" up -d --no-build
   "${APP[@]}" ps
 }
 
 step_status() {
   echo "--- supabase ---"; "${SB[@]}" ps || true
   echo "--- reproagent-prod ---"; "${APP[@]}" ps || true
+  echo "--- 应用健康（降级时退出码非 0）---"
+  (cd "$REPO" && uv run python "$HERE/ops.py" health) || true
+  echo "--- 宿主机磁盘 ---"; df -h "$DATA_ROOT"
   echo "--- 宿主机监听端口（非回环，只应看到 sshd；54321/54322/8000/8443 都不该出现）---"
   ss -ltnp | awk 'NR==1 || ($4 != "" && $4 !~ /^(127\.0\.0\.1|\[::1\]|::1):/)'
 }
@@ -230,10 +217,10 @@ PY
 case "${1:-}" in
   data)      step_data ;;
   supabase)  step_supabase ;;
-  migrate)   step_migrate ;;
+  migrate)   shift; step_migrate "$@" ;;
   app)       step_app ;;
   gate)      step_gate ;;
   status)    step_status ;;
   down)      "${APP[@]}" down; "${SB[@]}" down ;;
-  *) echo "用法: $0 {data|supabase|migrate|app|gate|status|down}" >&2; exit 2 ;;
+  *) echo "用法: $0 {data|supabase|migrate [--adopt-existing]|app|gate|status|down}" >&2; exit 2 ;;
 esac

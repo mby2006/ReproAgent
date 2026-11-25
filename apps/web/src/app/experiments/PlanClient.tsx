@@ -1,6 +1,6 @@
 "use client";
 
-import Link from "next/link";
+import SiteLink from "@/components/SiteLink";
 import { useRouter, useSearchParams } from "next/navigation";
 import { Suspense, useCallback, useEffect, useRef, useState } from "react";
 import AuthGate from "@/components/AuthGate";
@@ -609,7 +609,7 @@ function PlanInner({ experimentId }: { experimentId: string }) {
     <main className="mx-auto w-full max-w-7xl space-y-4 px-5 py-6">
       <header className="workspace-heading space-y-4">
         <div className="flex flex-wrap items-center gap-3">
-          <Link
+          <SiteLink
             href={
               experiment
                 ? `/papers?id=${experiment.paper_id}${workflowDriven ? `&workflow=${workflowId}` : ""}`
@@ -619,7 +619,7 @@ function PlanInner({ experimentId }: { experimentId: string }) {
             aria-label="返回论文"
           >
             <IconArrowLeft className="h-4 w-4" />
-          </Link>
+          </SiteLink>
           <div className="workspace-title">
             <p className="label mb-1">实验计划</p>
             <h1 className="display text-2xl font-bold">

@@ -5,7 +5,10 @@
   "description": "ReproAgent - scientific paper reproduction agent (LeNet-5 + MNIST first)",
   "scripts": {
     "dev:web": "pnpm --filter web dev",
-    "build:web": "pnpm --filter web build",
+    "build:web": "pnpm --filter web build:live",
+    "build:web:static": "pnpm --filter web build:static",
+    "verify:web:live": "pnpm --filter web verify:live",
+    "verify:web:static": "pnpm --filter web verify:static",
     "lint:web": "pnpm --filter web lint"
   },
   "packageManager": "pnpm@12.18.0",

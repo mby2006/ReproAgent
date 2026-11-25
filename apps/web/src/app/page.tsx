@@ -1,4 +1,4 @@
-import Link from "next/link";
+import SiteLink from "@/components/SiteLink";
 import PublicHeader from "@/components/PublicHeader";
 import SamplePlate from "@/components/SamplePlate";
 import { IconArrowRight, IconFlask, IconPapers, IconPulse } from "@/components/icons";
@@ -29,8 +29,8 @@ export default function Home() {
           <h1>读懂论文，<br />从一次实验开始。</h1>
           <p className="hero-intro">同一张手写数字，你和模型会给出什么答案？从一次 LeNet-5 实验中，了解模型如何学习，再对照论文核查结果。</p>
           <div className="hero-actions">
-            <Link className="btn btn-primary" href={example}>体验手写数字实验 <IconArrowRight /></Link>
-            {!isStaticSite && <Link className="text-action" href="/papers">复现自己的论文</Link>}
+            <SiteLink className="btn btn-primary" href={example}>体验手写数字实验 <IconArrowRight /></SiteLink>
+            {!isStaticSite && <SiteLink className="text-action" href="/papers">复现自己的论文</SiteLink>}
           </div>
         </div>
         <SamplePlate samples={samples} count={predictions.samples.length} />
@@ -38,12 +38,12 @@ export default function Home() {
       <section aria-labelledby="reading-title" className="reading-index">
         <div><h2 id="reading-title">实验阅读指南</h2><p>选择你想了解的部分。</p></div>
         <div className="chapter-list">
-          {chapters.map(({ title, text, href, icon: Icon }) => <Link className="chapter" href={example + href} key={href}>
+          {chapters.map(({ title, text, href, icon: Icon }) => <SiteLink className="chapter" href={example + href} key={href}>
             <Icon className="chapter-icon" /><div><h3>{title}</h3><p>{text}</p></div><IconArrowRight className="chapter-arrow" />
-          </Link>)}
+          </SiteLink>)}
         </div>
       </section>
     </main>
-    <footer className="public-footer public-container"><span>ReproAgent</span>{!isStaticSite && <Link href="/health">服务状态</Link>}</footer>
+    <footer className="public-footer public-container"><span>ReproAgent</span>{!isStaticSite && <SiteLink href="/health">服务状态</SiteLink>}</footer>
   </>;
 }

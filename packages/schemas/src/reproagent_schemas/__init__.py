@@ -74,7 +74,9 @@ from .execution import (
     RunRequest,
     RunResult,
     RunStatus,
+    canonical_request_content,
     is_whitelisted,
+    request_fingerprint,
 )
 from .health import (
     DependenciesHealthResponse,
@@ -83,7 +85,14 @@ from .health import (
     HealthStatus,
 )
 from .jobs import JobAccepted, JobStatus, ReproductionJob
-from .paper import Paper, PaperSource, PaperStatus
+from .paper import (
+    MAX_PDF_BASE64_LENGTH,
+    MAX_PDF_BYTES,
+    MAX_PDF_PAGES,
+    Paper,
+    PaperSource,
+    PaperStatus,
+)
 from .parsed import ParsedDocument, TableData, TextBlock
 from .plan import (
     Assumption,
@@ -245,6 +254,9 @@ __all__ = [
     "JobStatus",
     "MetricComparison",
     "MetricsReport",
+    "MAX_PDF_BASE64_LENGTH",
+    "MAX_PDF_BYTES",
+    "MAX_PDF_PAGES",
     "OPTIMIZER_NAMES",
     "MethodCheck",
     "MethodItem",
@@ -347,6 +359,8 @@ __all__ = [
     "VerifyPairRequest",
     "VerifyPairResponse",
     "compute_code_hash",
+    "canonical_request_content",
+    "request_fingerprint",
     "is_whitelisted",
     "utcnow",
 ]

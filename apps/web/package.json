@@ -4,9 +4,14 @@
   "private": true,
   "scripts": {
     "dev": "next dev",
-    "build": "next build",
+    "build": "node scripts/build-site.mjs live",
+    "build:live": "node scripts/build-site.mjs live",
+    "build:static": "node scripts/build-site.mjs static",
+    "verify:live": "node scripts/verify-artifact.mjs live",
+    "verify:static": "node scripts/verify-artifact.mjs static",
     "start": "next start",
-    "lint": "eslint"
+    "lint": "eslint",
+    "test": "node --test src/components/*.test.mjs src/lib/*.test.mjs src/app/*/*.test.mjs"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.119.0",

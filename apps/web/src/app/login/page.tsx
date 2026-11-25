@@ -1,6 +1,6 @@
 "use client";
 
-import Link from "next/link";
+import SiteLink from "@/components/SiteLink";
 import { useRouter } from "next/navigation";
 import { useEffect, useState } from "react";
 import { IconArrowLeft, LogoMark } from "@/components/icons";
@@ -25,12 +25,12 @@ const SUBMIT_LABEL: Record<Mode, string> = {
 
 function BrandPanel() {
   return <aside className="auth-side">
-    <Link href="/" className="wordmark"><LogoMark />ReproAgent</Link>
+    <SiteLink href="/" className="wordmark"><LogoMark />ReproAgent</SiteLink>
     <div>
       <p className="paper-citation"><span aria-hidden="true" />LeNet-5 × MNIST</p>
       <h2>每个参数，<br />都有来处可查。</h2>
       <p>从论文原文开始，记录训练中的假设和调整，再对照实际运行的结果。</p>
-      <Link href="/examples/lenet-mnist#conditions" className="text-action">先看看公开实验的参数对照表</Link>
+      <SiteLink href="/examples/lenet-mnist#conditions" className="text-action">先看看公开实验的参数对照表</SiteLink>
     </div>
   </aside>;
 }
@@ -124,7 +124,7 @@ export default function LoginPage() {
       <div className="relative flex items-center justify-center p-6">
 
         <form onSubmit={submit} className="card relative w-full max-w-md space-y-5 p-6 sm:p-9">
-          <Link href="/" className="wordmark lg:hidden"><LogoMark />ReproAgent</Link>
+          <SiteLink href="/" className="wordmark lg:hidden"><LogoMark />ReproAgent</SiteLink>
           <div>
             <h1 className="display text-2xl font-bold">{TITLES[mode]}</h1>
           </div>
@@ -237,7 +237,7 @@ export default function LoginPage() {
               <IconArrowLeft className="h-3.5 w-3.5" /> 返回登录
             </button>
           )}
-          <Link href="/examples/lenet-mnist" className="text-action lg:hidden">免登录体验公开实验</Link>
+          <SiteLink href="/examples/lenet-mnist" className="text-action lg:hidden">免登录体验公开实验</SiteLink>
         </form>
       </div>
     </main>

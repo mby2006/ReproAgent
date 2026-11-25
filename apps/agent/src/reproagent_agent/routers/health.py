@@ -1,7 +1,7 @@
 import time
 
 import httpx
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, Request, Response
 from reproagent_schemas import (
     DependenciesHealthResponse,
     DependencyHealth,
@@ -15,9 +15,9 @@ router = APIRouter(tags=["health"])
 
 
 @router.get("/health", response_model=HealthResponse)
-async def health(request: Request) -> HealthResponse:
+async def health(request: Request) -> Response:
     graph = getattr(request.app.state, "graph", None)
-    return HealthResponse(
+    payload = HealthResponse(
         service="agent",
         status=HealthStatus.OK if graph is not None else HealthStatus.UNAVAILABLE,
         details={
@@ -25,6 +25,11 @@ async def health(request: Request) -> HealthResponse:
             "graph_nodes": len(NODE_ORDER),
             "llm_configured": bool(request.app.state.settings.qwen_api_key),
         },
+    )
+    return Response(
+        content=payload.model_dump_json(),
+        status_code=200 if graph is not None else 503,
+        media_type="application/json",
     )
 
 
@@ -46,6 +51,10 @@ async def dependencies_health(request: Request) -> DependenciesHealthResponse:
                 detail=f"HTTP {response.status_code}",
             )
     except httpx.HTTPError as exc:
-        runner = DependencyHealth(name="runner", status=HealthStatus.UNAVAILABLE, detail=str(exc))
+        runner = DependencyHealth(
+            name="runner",
+            status=HealthStatus.UNAVAILABLE,
+            detail=type(exc).__name__,
+        )
     overall = HealthStatus.OK if runner.status is HealthStatus.OK else HealthStatus.DEGRADED
     return DependenciesHealthResponse(service="agent", status=overall, dependencies=[runner])

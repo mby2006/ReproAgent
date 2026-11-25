@@ -126,14 +126,14 @@ def admin(settings):
 
 @pytest.fixture(scope="module")
 def runner(settings):
-    """Real Runner app + Docker client; skip when Docker/image unavailable."""
+    """Real Runner app + Docker client; fail when Docker/image is unavailable."""
     runner_settings = RunnerSettings(work_dir=WORK_DIR, enforce_disk_quota=False, _env_file=None)
     try:
         client = make_client(runner_settings)
         client.ping()
         client.images.get(runner_settings.exec_image)
     except Exception as exc:  # noqa: BLE001
-        pytest.skip(f"Docker daemon or exec image unavailable: {exc}")
+        pytest.fail(f"Docker daemon or exec image unavailable: {exc}")
     app = create_runner_app(runner_settings, client=client)
     # ASGITransport does not run lifespan events, so wire the registry by hand.
     app.state.registry = RunRegistry(runner_settings, client=client)
@@ -274,7 +274,9 @@ class TestFullClosedLoop:
         assert target_metric in ("accuracy", "error_rate")
         metrics = run["metrics_json"]
         assert metrics["metric_value"] == metrics[target_metric]
-        assert metrics["accuracy"] == pytest.approx(metrics["correct_count"] / metrics["evaluated_count"])
+        assert metrics["accuracy"] == pytest.approx(
+            metrics["correct_count"] / metrics["evaluated_count"]
+        )
         assert metrics["error_rate"] == pytest.approx(1 - metrics["accuracy"])
         examples = alice_client.get(f"/v1/runs/{run_id}/prediction-examples")
         assert examples.status_code == 200, examples.text

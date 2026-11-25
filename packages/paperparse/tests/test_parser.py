@@ -1,4 +1,5 @@
-from reproagent_paperparse import OCRProvider, parse_pdf
+import pytest
+from reproagent_paperparse import OCRProvider, parse_pdf, parser
 
 
 class TestParsePdf:
@@ -41,6 +42,29 @@ class TestParsePdf:
     def test_bbox_recorded(self, paper_pdf):
         doc = parse_pdf(paper_pdf)
         assert all(b.bbox is not None and len(b.bbox) == 4 for b in doc.blocks)
+
+    def test_byte_limit_rejected_before_parser(self, monkeypatch):
+        monkeypatch.setattr(parser, "MAX_PDF_BYTES", 8)
+        with pytest.raises(ValueError, match="50 MB|byte limit"):
+            parse_pdf(b"%PDF-1.4 fake body")
+
+    def test_page_limit_rejected_before_text_extraction(self, paper_pdf, monkeypatch):
+        monkeypatch.setattr(parser, "MAX_PDF_PAGES", 2)
+        with pytest.raises(ValueError, match="200 pages|page limit"):
+            parse_pdf(paper_pdf)
+
+    def test_document_closes_when_extraction_fails(self, paper_pdf, monkeypatch):
+        documents = []
+
+        def fail_extraction(doc, *, ocr):
+            documents.append(doc)
+            raise RuntimeError("extraction failed")
+
+        monkeypatch.setattr(parser, "_parse_document", fail_extraction)
+        with pytest.raises(RuntimeError, match="extraction failed"):
+            parse_pdf(paper_pdf)
+        assert len(documents) == 1
+        assert documents[0].is_closed
 
 
 class TestOcr:

@@ -1,4 +1,4 @@
-import Link from "next/link";
+import SiteLink from "@/components/SiteLink";
 import { PredictionReader } from "@/components/PredictionReader";
 import PublicHeader from "@/components/PublicHeader";
 import ParameterTable from "@/components/ParameterTable";
@@ -68,7 +68,7 @@ export default function LeNetExample() {
       <div className="flex flex-wrap gap-4">
         <a className="btn btn-primary" download href={assets+"/report.md"}>下载实验报告</a>
         <a className="btn btn-ghost" href={assets+"/manifest.json"}>核查产物指纹</a>
-        <Link className="btn btn-ghost" href="/papers">登录后运行自己的实验</Link>
+        <SiteLink className="btn btn-ghost" href="/papers">登录后运行自己的实验</SiteLink>
       </div>
     </footer>
   </main></>;

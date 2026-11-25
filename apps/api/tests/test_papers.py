@@ -2,6 +2,7 @@ import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from time import time
 from types import SimpleNamespace
+from urllib.parse import urlparse
 from uuid import uuid4
 
 import pytest
@@ -88,6 +89,50 @@ def test_upload_rejects_empty_file(client):
 def test_upload_rejects_oversized(client, monkeypatch):
     monkeypatch.setattr(papers, "MAX_PDF_BYTES", 10)
     response = upload(client, b"%PDF-1.4" + b"x" * 100)
+    assert response.status_code == 413
+
+
+async def test_upload_reader_stops_at_limit_and_closes(monkeypatch):
+    from fastapi import HTTPException
+
+    class ChunkedUpload:
+        def __init__(self):
+            self.read_sizes = []
+            self.closed = False
+
+        async def read(self, size=-1):
+            self.read_sizes.append(size)
+            return b"%PDF" if len(self.read_sizes) == 1 else b"x" * 64
+
+        async def close(self):
+            self.closed = True
+
+    monkeypatch.setattr(papers, "MAX_PDF_BYTES", 10)
+    upload_file = ChunkedUpload()
+    try:
+        with pytest.raises(HTTPException) as exc:
+            await papers._read_pdf_upload(upload_file)
+    finally:
+        assert upload_file.closed
+    assert exc.value.status_code == 413
+    assert upload_file.read_sizes and all(0 < size <= 64 * 1024 for size in upload_file.read_sizes)
+
+
+def test_request_body_limit_rejects_declared_oversize(client):
+    response = client.post(
+        "/v1/workflows/resume",
+        content=b"x" * (2 * 1024 * 1024 + 1),
+        headers={**AUTH, "Content-Type": "application/json"},
+    )
+    assert response.status_code == 413
+
+
+def test_request_body_limit_rejects_chunked_oversize(client):
+    response = client.post(
+        "/v1/workflows/resume",
+        content=iter([b"x" * 1024 * 1024, b"x" * 1024 * 1024, b"x"]),
+        headers={**AUTH, "Content-Type": "application/json"},
+    )
     assert response.status_code == 413
 
 
@@ -325,15 +370,59 @@ def test_assert_public_host_blocks_private(monkeypatch):
     from fastapi import HTTPException
 
     monkeypatch.setattr(
-        papers.socket, "getaddrinfo", lambda *a: [(2, 1, 6, "", ("127.0.0.1", 0))]
+        papers.socket, "getaddrinfo", lambda *a, **k: [(2, 1, 6, "", ("127.0.0.1", 0))]
     )
     with pytest.raises(HTTPException) as exc:
         papers._assert_public_host("evil.example")
     assert exc.value.status_code == 422
     monkeypatch.setattr(
-        papers.socket, "getaddrinfo", lambda *a: [(2, 1, 6, "", ("93.184.216.34", 0))]
+        papers.socket, "getaddrinfo", lambda *a, **k: [(2, 1, 6, "", ("93.184.216.34", 0))]
     )
     papers._assert_public_host("example.org")
+
+
+def test_assert_public_host_rejects_mixed_public_and_private(monkeypatch):
+    from fastapi import HTTPException
+
+    monkeypatch.setattr(
+        papers.socket,
+        "getaddrinfo",
+        lambda *a, **k: [
+            (2, 1, 6, "", ("93.184.216.34", 0)),
+            (2, 1, 6, "", ("10.0.0.8", 0)),
+        ],
+    )
+    with pytest.raises(HTTPException) as exc:
+        papers._assert_public_host("evil.example")
+    assert exc.value.status_code == 422
+
+
+async def test_pinned_backend_connects_to_validated_address(monkeypatch):
+    calls = []
+
+    async def connect(host, port, **kwargs):
+        calls.append((host, port))
+        return object()
+
+    monkeypatch.setattr(papers, "connect_tcp", connect)
+    monkeypatch.setattr(papers, "AnyIOStream", lambda stream: stream)
+    monkeypatch.setattr(
+        papers.socket,
+        "getaddrinfo",
+        lambda *a, **k: [(2, 1, 6, "", ("93.184.216.34", 443))],
+    )
+    stream = await papers._PinnedNetworkBackend().connect_tcp("papers.example", 443)
+    assert stream is not None
+    assert calls == [("93.184.216.34", 443)]
+
+
+def test_paper_url_rejects_userinfo_and_nonstandard_port():
+    from fastapi import HTTPException
+
+    for url in ("https://user:secret@example.org/paper.pdf", "https://example.org:8443/paper.pdf"):
+        with pytest.raises(HTTPException) as exc:
+            papers._normalize_paper_url(url)
+        assert exc.value.status_code == 422
 
 
 class _PdfHandler(BaseHTTPRequestHandler):
@@ -341,6 +430,10 @@ class _PdfHandler(BaseHTTPRequestHandler):
         if self.path == "/redirect":
             self.send_response(302)
             self.send_header("Location", "/paper.pdf")
+            self.end_headers()
+        elif self.path == "/declared-big.pdf":
+            self.send_response(200)
+            self.send_header("Content-Length", "1000")
             self.end_headers()
         elif self.path == "/paper.pdf":
             body = b"%PDF-1.4 fake"
@@ -367,7 +460,15 @@ class _PdfHandler(BaseHTTPRequestHandler):
 
 @pytest.fixture
 def pdf_server(monkeypatch):
-    monkeypatch.setattr(papers, "_assert_public_host", lambda host: None)
+    monkeypatch.setattr(papers, "_resolve_public_addresses", lambda host, port: ["127.0.0.1"])
+    normalize = papers._normalize_paper_url
+
+    def normalize_test_url(url):
+        if urlparse(url).hostname == "127.0.0.1":
+            return url
+        return normalize(url)
+
+    monkeypatch.setattr(papers, "_normalize_paper_url", normalize_test_url)
     server = ThreadingHTTPServer(("127.0.0.1", 0), _PdfHandler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -394,4 +495,13 @@ async def test_download_pdf_enforces_size_cap(pdf_server, monkeypatch):
     monkeypatch.setattr(papers, "MAX_PDF_BYTES", 10)
     with pytest.raises(HTTPException) as exc:
         await papers._download_pdf(f"{pdf_server}/big.pdf")
+    assert exc.value.status_code == 413
+
+
+async def test_download_pdf_rejects_oversized_content_length(pdf_server, monkeypatch):
+    from fastapi import HTTPException
+
+    monkeypatch.setattr(papers, "MAX_PDF_BYTES", 10)
+    with pytest.raises(HTTPException) as exc:
+        await papers._download_pdf(f"{pdf_server}/declared-big.pdf")
     assert exc.value.status_code == 413

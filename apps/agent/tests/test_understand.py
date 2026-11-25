@@ -2,6 +2,7 @@ import base64
 import json
 from uuid import uuid4
 
+import pytest
 from fastapi.testclient import TestClient
 from reproagent_agent.config import AgentSettings
 from reproagent_agent.llm.base import ChatMessage, LLMAdapter
@@ -144,6 +145,16 @@ class TestUnderstandEndpoint:
         with make_client(llm) as client:
             response = post_pdf(client, b"hello, not a pdf")
         assert response.status_code == 422
+
+    def test_oversized_decoded_pdf_rejected_before_graph(self, monkeypatch):
+        from fastapi import HTTPException
+        from reproagent_agent.routers import understand
+
+        monkeypatch.setattr(understand, "MAX_PDF_BYTES", 4)
+        monkeypatch.setattr(understand, "MAX_PDF_BASE64_LENGTH", 8)
+        with pytest.raises(HTTPException) as exc:
+            understand._decode_pdf(base64.b64encode(b"%PDF-1.4 oversized").decode())
+        assert exc.value.status_code == 413
 
     def test_code_fenced_json_accepted(self, paper_pdf):
         llm = MockLLM(["```json\n" + json.dumps(VALID_CARD) + "\n```"])

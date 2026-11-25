@@ -17,13 +17,15 @@ Entry points:
 import logging
 import os
 from contextlib import contextmanager
-from datetime import UTC, datetime
-from uuid import UUID, uuid4
+from datetime import UTC, datetime, timedelta
+from uuid import NAMESPACE_URL, UUID, uuid5
 
 import psycopg
+from arq import cron
 from arq.connections import RedisSettings
 from reproagent_schemas import (
     BudgetConfig,
+    RunStatus,
     WorkflowStatus,
 )
 
@@ -31,8 +33,10 @@ from .clients.agent import AgentClient
 from .clients.runner import RunnerClient
 from .clients.supabase import make_service_client
 from .config import ApiSettings
+from .observability import configure_logging
 from .services.comparisons import execute_comparison
-from .services.runs import load_execution_plan
+from .services.dispatch import enqueue_pending_outbox
+from .services.runs import finalize_execution_run, load_execution_plan
 from .workflow import (
     WorkflowContext,
     build_workflow_graph,
@@ -46,7 +50,10 @@ from .workflow import (
 
 logger = logging.getLogger(__name__)
 
-TERMINAL = {s.value for s in (WorkflowStatus.COMPLETED, WorkflowStatus.FAILED)}
+DISPATCH_STALE_SECONDS = 1260  # job_timeout (1200) + 60 seconds of grace
+TERMINAL = {
+    s.value for s in (WorkflowStatus.COMPLETED, WorkflowStatus.FAILED, WorkflowStatus.CANCELLED)
+}
 AWAITING = {
     s.value for s in (WorkflowStatus.AWAITING_SPEC_REVIEW, WorkflowStatus.AWAITING_PLAN_APPROVAL)
 }
@@ -107,7 +114,8 @@ async def run_workflow_task(ctx: dict, workflow_id: str) -> None:
     admin = make_service_client(settings)
     workflow = _load_workflow(admin, workflow_id)
     if workflow is None:
-        return
+        logger.error("workflow %s not found", workflow_id)
+        raise RuntimeError(f"Workflow {workflow_id} not found")
     with _drive_lock(settings, workflow_id) as acquired:
         if not acquired:
             logger.info("workflow %s: another driver holds the thread; skipping", workflow_id)
@@ -126,7 +134,8 @@ async def resume_workflow_task(ctx: dict, workflow_id: str, stage: str) -> None:
     admin = make_service_client(settings)
     workflow = _load_workflow(admin, workflow_id)
     if workflow is None:
-        return
+        logger.error("workflow %s not found", workflow_id)
+        raise RuntimeError(f"Workflow {workflow_id} not found")
     # Guard against a stale/duplicate resume driving a thread that already moved
     # past its gate: only the matching awaiting state may be resumed.
     expected = (
@@ -152,15 +161,78 @@ async def resume_workflow_task(ctx: dict, workflow_id: str, stage: str) -> None:
             await wctx.runner.aclose()
 
 
+async def _recover_run_workflow(ctx: dict, admin, run: dict) -> bool:
+    """Freshly recover an existing workflow, returning whether one was found."""
+    workflows = admin.table("workflows").select("*").eq("run_id", run["id"]).execute().data
+    if not workflows:
+        return False
+    await _recover_existing_workflow(ctx, admin, run, workflows[0])
+    return True
+
+
+async def _enqueue_workflow_recovery(redis, workflow_id: str) -> None:
+    """Best-effort recovery delivery without a retained-result job identity."""
+    if redis is None:
+        return
+    try:
+        await redis.enqueue_job("recover_workflow_task", workflow_id)
+    except Exception as exc:
+        logger.warning("workflow %s recovery enqueue failed: %s", workflow_id, exc)
+
+
+async def _recover_existing_workflow(ctx: dict, admin, run: dict, workflow: dict) -> None:
+    """Recover the run's existing workflow instead of creating a duplicate."""
+    if workflow["status"] not in TERMINAL:
+        await _enqueue_workflow_recovery(ctx.get("redis"), workflow["id"])
+        return
+
+    if workflow["status"] == WorkflowStatus.CANCELLED.value:
+        run_status = RunStatus.CANCELLED.value
+        error = workflow.get("error")
+        finalized = finalize_execution_run(
+            admin,
+            run["id"],
+            RunStatus.CANCELLED,
+            error,
+            attempt=run.get("repair_attempt", 0),
+        )
+    else:
+        run_status = (
+            RunStatus.SUCCEEDED.value
+            if workflow["status"] == WorkflowStatus.COMPLETED.value
+            else RunStatus.FAILED.value
+        )
+        error = None
+        if run_status == RunStatus.FAILED.value:
+            error = workflow.get("error") or f"Workflow {workflow['id']} failed"
+        finalized = admin.rpc("reconcile_execution_run", {
+            "p_run_id": run["id"],
+            "p_status": run_status,
+            "p_error": error,
+        })
+    if finalized:
+        logger.warning(
+            "finalized run %s as %s from terminal workflow %s",
+            run["id"], run_status, workflow["id"],
+        )
+
+
 async def run_experiment_task(ctx: dict, run_id: str) -> None:
-    """Legacy runs-router entry: drive the unified graph from generate_code onward."""
+    """Atomically claim a queued run, then drive its single deterministic workflow."""
     settings: ApiSettings = ctx["settings"]
     admin = make_service_client(settings)
-    runs = admin.table("execution_runs").select("*").eq("id", run_id).execute().data
-    if not runs:
+    claimed = admin.table("execution_runs").update({
+        "status": RunStatus.DISPATCHING.value,
+    }).eq("id", run_id).eq("status", RunStatus.QUEUED.value).execute().data
+    if not claimed:
+        existing = admin.table("execution_runs").select("id").eq("id", run_id).execute().data
+        if not existing:
+            logger.error("execution run %s not found", run_id)
+            raise RuntimeError(f"Execution run {run_id} not found")
+        # Another delivery owns the run, or it already reached a later state.
         return
-    run = runs[0]
-    if run["status"] != "queued":
+    run = claimed[0]
+    if await _recover_run_workflow(ctx, admin, run):
         return
     try:
         experiment, plan_row, plan, spec, card, _ = load_execution_plan(
@@ -172,13 +244,13 @@ async def run_experiment_task(ctx: dict, run_id: str) -> None:
         admin.table("execution_runs").update({
             "status": "failed", "finished_at": datetime.now(UTC).isoformat(),
             "error": "Execution authorization invalid; approve the latest plan before retrying",
-        }).eq("id", run_id).eq("status", "queued").execute()
+        }).eq("id", run_id).eq("status", RunStatus.DISPATCHING.value).execute()
         return
 
-    workflow_id = uuid4()
-    workflow = (
+    workflow_id = uuid5(NAMESPACE_URL, f"reproagent:run:{run_id}")
+    workflow_rows = (
         admin.table("workflows")
-        .insert(
+        .upsert(
             {
                 "id": str(workflow_id),
                 "thread_id": str(workflow_id),
@@ -190,11 +262,20 @@ async def run_experiment_task(ctx: dict, run_id: str) -> None:
                 "spec_version_id": spec["id"],
                 "plan_id": plan_row["id"],
                 "budget_json": {},
-            }
+            },
+            # The deterministic primary key is inferable by PostgreSQL; the
+            # partial workflows_run_id_unique index remains a second guard.
+            on_conflict="id",
+            ignore_duplicates=True,
         )
         .execute()
-        .data[0]
+        .data
     )
+    if not workflow_rows:
+        if await _recover_run_workflow(ctx, admin, run):
+            return
+        raise RuntimeError(f"Workflow for execution run {run_id} disappeared after insert")
+    workflow = workflow_rows[0]
 
     with _drive_lock(settings, workflow["id"]) as acquired:
         if not acquired:
@@ -259,7 +340,10 @@ async def recover_workflow_task(ctx: dict, workflow_id: str) -> None:
     settings: ApiSettings = ctx["settings"]
     admin = make_service_client(settings)
     workflow = _load_workflow(admin, workflow_id)
-    if workflow is None or workflow["status"] in TERMINAL or workflow["status"] in AWAITING:
+    if workflow is None:
+        logger.error("workflow %s not found", workflow_id)
+        raise RuntimeError(f"Workflow {workflow_id} not found")
+    if workflow["status"] in TERMINAL or workflow["status"] in AWAITING:
         return
     with _drive_lock(settings, workflow_id) as acquired:
         if not acquired:
@@ -293,6 +377,114 @@ async def recover_workflow_task(ctx: dict, workflow_id: str) -> None:
             await wctx.runner.aclose()
 
 
+def _ensure_pending_outbox(admin, run_id: str, now: str) -> None:
+    """Idempotently restore a run's dispatch intent after a lost delivery."""
+    job_id = f"run-experiment:{run_id}"
+    admin.table("job_outbox").upsert({
+        "job_type": "run_experiment_task",
+        "entity_id": run_id,
+        "job_id": job_id,
+        "status": "pending",
+        "created_at": now,
+        "updated_at": now,
+    }, on_conflict="job_id", ignore_duplicates=True).execute()
+    admin.table("job_outbox").update({
+        "status": "pending",
+        "last_error": None,
+        "updated_at": now,
+    }).eq("job_id", job_id).neq("status", "pending").execute()
+
+
+async def publish_worker_heartbeat(ctx: dict) -> None:
+    redis = ctx.get("redis")
+    if redis is not None:
+        await redis.set("reproagent:worker:heartbeat", datetime.now(UTC).isoformat(), ex=60)
+
+
+async def reconcile_dispatch_task(ctx: dict) -> None:
+    """Recover lost dispatch intents and workflows stalled past the job timeout."""
+    settings: ApiSettings = ctx["settings"]
+    admin = make_service_client(settings)
+    redis = ctx.get("redis")
+    now = datetime.now(UTC)
+    cutoff = (now - timedelta(seconds=DISPATCH_STALE_SECONDS)).isoformat()
+    now_iso = now.isoformat()
+
+    # An orphaned intent must never be sent to the worker, where it would fail
+    # forever without a run row to claim.
+    outbox_rows = admin.table("job_outbox").select("*").in_(
+        "job_type", ["run_experiment_task"]
+    ).in_("status", ["pending", "enqueued"]).execute().data
+    entity_ids = [row["entity_id"] for row in outbox_rows]
+    existing_run_ids: set[str] = set()
+    if entity_ids:
+        existing_run_ids = {
+            row["id"] for row in admin.table("execution_runs").select("id").in_(
+                "id", entity_ids
+            ).execute().data
+        }
+    for row in outbox_rows:
+        if row["entity_id"] in existing_run_ids:
+            continue
+        error = f"Execution run {row['entity_id']} no longer exists"
+        logger.error("failing orphaned outbox job %s: %s", row["job_id"], error)
+        admin.table("job_outbox").update({
+            "status": "failed",
+            "last_error": error,
+            "updated_at": now_iso,
+        }).eq("id", row["id"]).in_("status", ["pending", "enqueued"]).execute()
+
+    stale_runs = admin.table("execution_runs").select("*").in_(
+        "status", [RunStatus.QUEUED.value, RunStatus.DISPATCHING.value, RunStatus.RUNNING.value]
+    ).lte("updated_at", cutoff).execute().data
+
+    for run in stale_runs:
+        run_id = run["id"]
+        status = run["status"]
+        if await _recover_run_workflow(ctx, admin, run):
+            continue
+
+        if status == RunStatus.QUEUED.value:
+            _ensure_pending_outbox(admin, run_id, now_iso)
+            continue
+
+        if status == RunStatus.DISPATCHING.value:
+            requeued = admin.table("execution_runs").update({
+                "status": RunStatus.QUEUED.value,
+                "updated_at": now_iso,
+            }).eq("id", run_id).eq(
+                "status", RunStatus.DISPATCHING.value
+            ).lte("updated_at", cutoff).execute().data
+            if requeued:
+                logger.warning("requeued stale dispatching run %s", run_id)
+                _ensure_pending_outbox(admin, run_id, now_iso)
+        else:
+            error = (
+                "Stale running execution has no workflow after "
+                f"{DISPATCH_STALE_SECONDS} seconds"
+            )
+            failed = admin.table("execution_runs").update({
+                "status": RunStatus.FAILED.value,
+                "error": error,
+                "finished_at": now_iso,
+                "updated_at": now_iso,
+            }).eq("id", run_id).eq(
+                "status", RunStatus.RUNNING.value
+            ).lte("updated_at", cutoff).execute().data
+            if failed:
+                logger.error("failed stale running run %s: %s", run_id, error)
+
+    await enqueue_pending_outbox(admin, redis)
+    logger.info(
+        "dispatch reconciliation complete",
+        extra={
+            "event": "dispatch_reconciled",
+            "outbox_candidates": len(outbox_rows),
+            "stale_runs": len(stale_runs),
+        },
+    )
+
+
 async def run_comparison_task(ctx: dict, comparison_id: str) -> None:
     """Drive a paired comparison: paired runs, verification, report.
 
@@ -323,7 +515,12 @@ class WorkerSettings:
         resume_workflow_task,
         run_experiment_task,
         recover_workflow_task,
+        reconcile_dispatch_task,
         run_comparison_task,
+    ]
+    cron_jobs = [
+        cron(reconcile_dispatch_task, second={0, 30}, run_at_startup=True),
+        cron(publish_worker_heartbeat, second={0, 15, 30, 45}),
     ]
     max_tries = 1
     job_timeout = 1200
@@ -333,24 +530,30 @@ class WorkerSettings:
 
     @staticmethod
     async def on_startup(ctx: dict) -> None:
+        configure_logging("worker")
         settings = ApiSettings()
         ctx["settings"] = settings
+        await publish_worker_heartbeat(ctx)
         saver, pool = await make_postgres_checkpointer(settings.supabase_db_url)
         ctx["checkpointer"] = saver
         ctx["checkpoint_pool"] = pool
         # Restart recovery: re-drive workflows that were mid-flight (not terminal,
         # not paused at a human gate). Awaiting workflows wait for user resume.
         admin = make_service_client(settings)
-        rows = admin.table("workflows").select("id,status").execute().data
         redis = ctx.get("redis")
+        await enqueue_pending_outbox(admin, redis)
+        rows = admin.table("workflows").select("id,status").execute().data
         for row in rows:
             if row["status"] not in TERMINAL and row["status"] not in AWAITING and redis:
-                await redis.enqueue_job("recover_workflow_task", row["id"])
+                await _enqueue_workflow_recovery(redis, row["id"])
         # Comparisons resume the same way: completed groups are skipped, so a
         # crash mid-pair only re-runs what is missing.
         for row in admin.table("comparisons").select("id,status").execute().data:
             if row["status"] in ("queued", "running") and redis:
-                await redis.enqueue_job("run_comparison_task", row["id"])
+                try:
+                    await redis.enqueue_job("run_comparison_task", row["id"])
+                except Exception as exc:
+                    logger.warning("comparison %s recovery enqueue failed: %s", row["id"], exc)
 
     @staticmethod
     async def on_shutdown(ctx: dict) -> None:

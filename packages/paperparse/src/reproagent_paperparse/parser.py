@@ -9,7 +9,7 @@ import re
 from collections import Counter
 
 import pymupdf
-from reproagent_schemas import ParsedDocument, TableData, TextBlock
+from reproagent_schemas import MAX_PDF_BYTES, MAX_PDF_PAGES, ParsedDocument, TableData, TextBlock
 
 from .ocr import OCRProvider
 
@@ -89,7 +89,17 @@ def _extract_title_authors(
 
 
 def parse_pdf(pdf_bytes: bytes, *, ocr: OCRProvider | None = None) -> ParsedDocument:
-    doc = pymupdf.open(stream=pdf_bytes, filetype="pdf")
+    if len(pdf_bytes) > MAX_PDF_BYTES:
+        raise ValueError(f"PDF exceeds the {MAX_PDF_BYTES} byte limit")
+    if not pdf_bytes.startswith(b"%PDF"):
+        raise ValueError("File is not a PDF")
+    with pymupdf.open(stream=pdf_bytes, filetype="pdf") as doc:
+        if doc.page_count > MAX_PDF_PAGES:
+            raise ValueError(f"PDF exceeds the {MAX_PDF_PAGES} page limit")
+        return _parse_document(doc, ocr=ocr)
+
+
+def _parse_document(doc, *, ocr: OCRProvider | None) -> ParsedDocument:
     blocks: list[TextBlock] = []
     tables: list[TableData] = []
     ocr_required: list[int] = []
@@ -166,7 +176,6 @@ def parse_pdf(pdf_bytes: bytes, *, ocr: OCRProvider | None = None) -> ParsedDocu
             ocr_required.append(page_no)
 
     num_pages = doc.page_count
-    doc.close()
     return ParsedDocument(
         title=title,
         authors=authors,

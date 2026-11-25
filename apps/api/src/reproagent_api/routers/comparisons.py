@@ -305,11 +305,9 @@ async def _enqueue(request: Request, comparison_id: UUID) -> None:
     if arq is None:
         raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "任务队列不可用")
     try:
-        # A deterministic job id makes duplicate submissions collapse into one
-        # queued job; the row-level idempotency key only prevents duplicate rows.
-        await arq.enqueue_job(
-            "run_comparison_task", str(comparison_id), _job_id=f"cmp-{comparison_id}"
-        )
+        # Let arq assign a fresh identity so a retained failed/no-op result cannot
+        # suppress retry delivery; the advisory lock and state guards deduplicate.
+        await arq.enqueue_job("run_comparison_task", str(comparison_id))
     except Exception as exc:
         raise HTTPException(
             status.HTTP_503_SERVICE_UNAVAILABLE, f"任务入队失败：{exc}"

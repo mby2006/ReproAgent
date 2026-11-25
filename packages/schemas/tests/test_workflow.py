@@ -17,8 +17,8 @@ from reproagent_schemas import (
 )
 
 
-def test_workflow_status_has_exactly_twelve_states():
-    assert len(WorkflowStatus) == 12
+def test_workflow_status_has_exactly_thirteen_states():
+    assert len(WorkflowStatus) == 13
     assert {s.value for s in WorkflowStatus} == {
         "uploaded",
         "parsing",
@@ -32,11 +32,14 @@ def test_workflow_status_has_exactly_twelve_states():
         "evaluating",
         "completed",
         "failed",
+        "cancelled",
     }
 
 
 def test_terminal_and_awaiting_sets():
-    assert TERMINAL_WORKFLOW_STATUSES == {WorkflowStatus.COMPLETED, WorkflowStatus.FAILED}
+    assert TERMINAL_WORKFLOW_STATUSES == {
+        WorkflowStatus.COMPLETED, WorkflowStatus.FAILED, WorkflowStatus.CANCELLED,
+    }
     assert AWAITING_WORKFLOW_STATUSES == {
         WorkflowStatus.AWAITING_SPEC_REVIEW,
         WorkflowStatus.AWAITING_PLAN_APPROVAL,

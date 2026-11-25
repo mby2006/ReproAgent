@@ -5,6 +5,8 @@ from fastapi import APIRouter, HTTPException, Request, status
 from fastapi.responses import FileResponse
 from reproagent_schemas import ExecImageStatus, RunAccepted, RunLogs, RunRequest, RunResult
 
+from ..registry import RequestConflictError
+
 router = APIRouter(tags=["runs"])
 
 
@@ -22,6 +24,8 @@ async def image_status(request: Request) -> ExecImageStatus:
 async def create_run(body: RunRequest, request: Request) -> RunAccepted:
     try:
         return _registry(request).start(body)
+    except RequestConflictError as exc:
+        raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
     except OverflowError as exc:
         raise HTTPException(status.HTTP_429_TOO_MANY_REQUESTS, str(exc)) from exc
 

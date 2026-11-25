@@ -36,14 +36,19 @@ from ..services.runs import (
     async_persist_result,
     build_run_request,
     create_oom_plan,
+    finalize_execution_run,
     insert_code_version,
     load_confirmed_card,
     load_execution_plan,
+    load_run_row,
+    mark_attempt_running,
+    persist_runner_run_id,
     pin_run_files,
+    terminal_result_from_row,
 )
 from ..services.versions import insert_versioned
 from .context import WorkflowContext
-from .harness import BudgetExceeded, ensure_llm_budget, record_usages, redact, time_budget_exhausted
+from .harness import BudgetExceeded, ensure_llm_budget, record_usages, time_budget_exhausted
 
 POLL_INTERVAL_SECONDS = 1.0
 TERMINAL_RUN = {RunStatus.SUCCEEDED, RunStatus.FAILED, RunStatus.TIMEOUT, RunStatus.CANCELLED}
@@ -53,11 +58,10 @@ def _now() -> str:
     return datetime.now(UTC).isoformat()
 
 
-def _finalize_run(admin, run_id: str, status: str, error: str | None = None) -> None:
-    update = {"status": status, "finished_at": _now()}
-    if error is not None:
-        update["error"] = redact(error)
-    admin.table("execution_runs").update(update).eq("id", run_id).execute()
+def _finalize_run(
+    admin, run_id: str, status: str, error: str | None = None, *, attempt: int | None = None
+) -> None:
+    finalize_execution_run(admin, run_id, RunStatus(status), error, attempt=attempt)
 
 
 async def _poll_run(runner, runner_run_id: UUID):
@@ -66,7 +70,46 @@ async def _poll_run(runner, runner_run_id: UUID):
         if result.status in TERMINAL_RUN:
             return result
         await asyncio.sleep(POLL_INTERVAL_SECONDS)
-    return await runner.get_run(runner_run_id)
+    try:
+        await runner.cancel_run(runner_run_id)
+    except Exception:
+        pass
+    return RunResult(
+        run_id=runner_run_id,
+        status=RunStatus.TIMEOUT,
+        error="Runner polling budget exhausted; execution was cancelled",
+        error_category=ErrorCategory.TIMEOUT,
+    )
+
+
+def _reuse_code_version(admin, state: dict, row: dict, bundle, attempt: int):
+    if (
+        row.get("code_hash") != bundle.code_hash
+        or row.get("repair_attempt", 0) != attempt
+        or not row.get("code_version")
+    ):
+        return None
+    pins = admin.table("execution_run_files").select("generated_file_id").eq(
+        "run_id", state["run_id"]
+    ).execute().data
+    if pins:
+        rows = admin.table("generated_files").select("*").in_(
+            "id", [pin["generated_file_id"] for pin in pins]
+        ).execute().data
+    else:
+        rows = admin.table("generated_files").select("*").eq(
+            "experiment_id", state["experiment_id"]
+        ).eq("version", row["code_version"]).execute().data
+    if {item["path"] for item in rows} != {item.path for item in bundle.files}:
+        return None
+    return row["code_version"], [item["id"] for item in rows]
+
+
+async def _cancel_runner(runner, runner_run_id: UUID) -> None:
+    try:
+        await runner.cancel_run(runner_run_id)
+    except Exception:
+        pass
 
 
 async def ingest_paper(state: dict, ctx: WorkflowContext) -> dict:
@@ -318,7 +361,7 @@ async def generate_code(state: dict, ctx: WorkflowContext) -> dict:
                 "id": run_id,
                 "experiment_id": state["experiment_id"],
                 "plan_id": state["plan_id"],
-                "code_version": 1,
+                "code_version": 0,
                 "plan_version": state["plan_version"],
                 "status": RunStatus.QUEUED.value,
                 "repair_attempt": 0,
@@ -353,7 +396,11 @@ async def validate_code(state: dict, ctx: WorkflowContext) -> dict:
     )
     ctx.admin.table("execution_runs").update(
         {"error_category": classification.category.value}
-    ).eq("id", state["run_id"]).execute()
+    ).eq("id", state["run_id"]).eq(
+        "repair_attempt", state.get("repair_attempt", 0)
+    ).neq("status", RunStatus.CANCELLED.value).neq(
+        "status", RunStatus.SUCCEEDED.value
+    ).execute()
     return {
         **updates,
         "validation_ok": False,
@@ -365,78 +412,116 @@ async def validate_code(state: dict, ctx: WorkflowContext) -> dict:
 async def execute_code(state: dict, ctx: WorkflowContext) -> dict:
     updates = ctx.set_status(state, WorkflowStatus.EXECUTING, "execute_code")
     run_id = state["run_id"]
+    row = load_run_row(ctx.admin, run_id)
+    if row is None:
+        raise ValueError("Execution run is unavailable")
+    if row["status"] in (RunStatus.CANCELLED.value, RunStatus.SUCCEEDED.value):
+        return {**updates, "execution_result": terminal_result_from_row(row)}
+
+    attempt = state.get("repair_attempt", 0)
+    if row["status"] in (RunStatus.FAILED.value, RunStatus.TIMEOUT.value) and (
+        row.get("repair_attempt", 0) >= attempt
+    ):
+        return {**updates, "execution_result": terminal_result_from_row(row)}
     if time_budget_exhausted(state, ctx.budget_config):
         error = "experiment time budget exhausted"
-        _finalize_run(ctx.admin, run_id, RunStatus.FAILED.value, error)
+        _finalize_run(ctx.admin, run_id, RunStatus.FAILED.value, error, attempt=attempt)
         return {**updates, "budget_exhausted": True, "error": error}
-
-    # A cancel can land while the run is still queued; re-check the persisted
-    # status before driving the Runner so RUNNING never overwrites CANCELLED.
-    current = ctx.admin.table("execution_runs").select("status").eq("id", run_id).execute().data
-    if current and current[0]["status"] == RunStatus.CANCELLED.value:
-        error = "cancelled before execution started"
-        _finalize_run(ctx.admin, run_id, RunStatus.CANCELLED.value, error)
-        result = RunResult(run_id=UUID(run_id), status=RunStatus.CANCELLED, error=error)
-        return {**updates, "execution_result": result}
 
     # A newer draft must stop dispatch, never replace the plan under generated code.
     _, _, plan, _, _, _ = _selected_execution(state, ctx)
-    attempt = state.get("repair_attempt", 0)
     bundle = state["code_bundle"]
-    change_reason = (
-        "initial deterministic codegen" if attempt == 0 else f"auto-repair attempt {attempt}"
+    reused = _reuse_code_version(ctx.admin, state, row, bundle, attempt)
+    if reused is None:
+        change_reason = (
+            "initial deterministic codegen" if attempt == 0 else f"auto-repair attempt {attempt}"
+        )
+        related_error = None
+        if attempt > 0:
+            if state.get("execution_result") is not None:
+                related_error = state["execution_result"].error
+            elif state.get("classification") is not None:
+                related_error = state["classification"].reason
+        code_version, file_ids = insert_code_version(
+            ctx.admin, state["experiment_id"], state["code_version"], bundle,
+            change_reason, related_error,
+        )
+        pin_run_files(ctx.admin, run_id, file_ids)
+    else:
+        code_version, file_ids = reused
+        pins = ctx.admin.table("execution_run_files").select("generated_file_id").eq(
+            "run_id", run_id
+        ).execute().data
+        if not pins:
+            pin_run_files(ctx.admin, run_id, file_ids)
+
+    claimed = mark_attempt_running(
+        ctx.admin, row, attempt=attempt, code_version=code_version, code_hash=bundle.code_hash,
+        plan_id=state["plan_id"], plan_version=state["plan_version"],
     )
-    related_error = None
-    if attempt > 0:
-        if state.get("execution_result") is not None:
-            related_error = state["execution_result"].error
-        elif state.get("classification") is not None:
-            related_error = state["classification"].reason
-    code_version, file_ids = insert_code_version(
-        ctx.admin,
-        state["experiment_id"],
-        state["code_version"],
-        bundle,
-        change_reason,
-        related_error,
-    )
-    pin_run_files(ctx.admin, run_id, file_ids)
-    ctx.admin.table("execution_runs").update(
-        {
-            "code_version": code_version,
-            "code_hash": bundle.code_hash,
-            "repair_attempt": attempt,
-            "plan_id": state["plan_id"],
-            "plan_version": state["plan_version"],
-            "status": RunStatus.RUNNING.value,
-            "started_at": _now(),
-        }
-    ).eq("id", run_id).execute()
+    row = load_run_row(ctx.admin, run_id)
+    if claimed is None or row is None:
+        if row is not None and row["status"] in (
+            RunStatus.CANCELLED.value, RunStatus.SUCCEEDED.value,
+            RunStatus.FAILED.value, RunStatus.TIMEOUT.value,
+        ):
+            return {**updates, "execution_result": terminal_result_from_row(row)}
+        raise RuntimeError("Execution attempt ownership was lost")
 
     request = build_run_request(
-        UUID(state["experiment_id"]),
-        UUID(state["plan_id"]),
-        bundle,
-        plan,
-        code_version,
-        state["plan_version"],
+        UUID(state["experiment_id"]), UUID(state["plan_id"]), bundle, plan,
+        code_version, state["plan_version"], UUID(run_id), attempt,
     )
-    accepted = await ctx.runner.start_run(request)
-    runner_run_id = accepted.run_id
-    ctx.admin.table("execution_runs").update({"runner_run_id": str(runner_run_id)}).eq(
-        "id", run_id
-    ).execute()
+    runner_run_id = UUID(row["runner_run_id"]) if row.get("runner_run_id") else None
+    result = None
+    try:
+        if runner_run_id is None:
+            # Re-check immediately before dispatch; the conditional Runner-id
+            # write below closes the remaining acceptance/persistence window.
+            current = load_run_row(ctx.admin, run_id)
+            if current["status"] == RunStatus.CANCELLED.value:
+                return {**updates, "execution_result": terminal_result_from_row(current)}
+            accepted = await ctx.runner.start_run(request)
+            runner_run_id = accepted.run_id
+            if not persist_runner_run_id(ctx.admin, run_id, runner_run_id, attempt):
+                current = load_run_row(ctx.admin, run_id)
+                if current["status"] != RunStatus.SUCCEEDED.value:
+                    await _cancel_runner(ctx.runner, runner_run_id)
+                return {**updates, "execution_result": terminal_result_from_row(current)}
 
-    result = await _poll_run(ctx.runner, runner_run_id)
-    await async_persist_result(ctx.admin, run_id, runner_run_id, result, ctx.runner, attempt)
-    _finalize_run(ctx.admin, run_id, result.status.value, result.error)
+        result = await _poll_run(ctx.runner, runner_run_id)
+        await async_persist_result(ctx.admin, run_id, runner_run_id, result, ctx.runner, attempt)
+        _finalize_run(ctx.admin, run_id, result.status.value, result.error, attempt=attempt)
+    except asyncio.CancelledError:
+        await _cancel_runner(ctx.runner, runner_run_id or request.request_id)
+        raise
+    except Exception as exc:
+        if runner_run_id is not None:
+            await _cancel_runner(ctx.runner, runner_run_id)
+        else:
+            # A transport error can happen after Runner acceptance. Cancel the
+            # deterministic identity even though no accepted id was received.
+            await _cancel_runner(ctx.runner, request.request_id)
+        current = load_run_row(ctx.admin, run_id)
+        if current["status"] in (RunStatus.CANCELLED.value, RunStatus.SUCCEEDED.value):
+            result = terminal_result_from_row(current)
+        elif result is not None and result.status in TERMINAL_RUN:
+            # The Runner's real terminal outcome remains authoritative even if
+            # storing its audit data failed.
+            _finalize_run(ctx.admin, run_id, result.status.value, result.error, attempt=attempt)
+        else:
+            result = RunResult(
+                run_id=UUID(run_id), status=RunStatus.FAILED,
+                error=f"Runner execution failed: {exc}", error_category=ErrorCategory.UNKNOWN_ERROR,
+            )
+            _finalize_run(ctx.admin, run_id, result.status.value, result.error, attempt=attempt)
 
     budget = state["budget"].model_copy(deep=True)
     budget.record_experiment_time(result.execution_time or 0.0)
     return {
         **updates,
         "execution_result": result,
-        "runner_run_id": str(runner_run_id),
+        "runner_run_id": str(runner_run_id) if runner_run_id else None,
         "code_version": code_version,
         "budget": budget,
     }
@@ -453,8 +538,12 @@ async def classify_error(state: dict, ctx: WorkflowContext) -> dict:
             status=result.status,
         )
     )
-    ctx.admin.table("execution_runs").update({"error_category": classification.category.value}).eq(
-        "id", state["run_id"]
+    ctx.admin.table("execution_runs").update(
+        {"error_category": classification.category.value}
+    ).eq("id", state["run_id"]).eq(
+        "repair_attempt", state.get("repair_attempt", 0)
+    ).neq("status", RunStatus.CANCELLED.value).neq(
+        "status", RunStatus.SUCCEEDED.value
     ).execute()
     return {**updates, "classification": classification}
 
@@ -551,21 +640,24 @@ async def generate_report(state: dict, ctx: WorkflowContext) -> dict:
 
 async def persist_results(state: dict, ctx: WorkflowContext) -> dict:
     pipeline_failed = bool(state.get("error")) or state.get("validation_ok") is False
-    status = WorkflowStatus.FAILED if pipeline_failed else WorkflowStatus.COMPLETED
+    result = state.get("execution_result")
+    if result is not None and result.status is RunStatus.CANCELLED and not pipeline_failed:
+        status = WorkflowStatus.CANCELLED
+    else:
+        status = WorkflowStatus.FAILED if pipeline_failed else WorkflowStatus.COMPLETED
     if state.get("validation_ok") is False and state.get("run_id"):
-        _finalize_run(ctx.admin, state["run_id"], RunStatus.FAILED.value, state.get("error"))
-    if state.get("experiment_id"):
-        result = state.get("execution_result")
-        if pipeline_failed or result is None:
-            experiment_status = "failed"
-        elif result.status is RunStatus.SUCCEEDED:
-            experiment_status = "succeeded"
-        elif result.status is RunStatus.CANCELLED:
-            experiment_status = "cancelled"
-        else:
-            experiment_status = "failed"
-        ctx.admin.table("experiments").update({"status": experiment_status}).eq(
-            "id", state["experiment_id"]
-        ).execute()
+        run_row = load_run_row(ctx.admin, state["run_id"])
+        _finalize_run(
+            ctx.admin, state["run_id"], RunStatus.FAILED.value, state.get("error"),
+            attempt=run_row.get("repair_attempt", 0) if run_row else 0,
+        )
+    elif result is not None and result.status is RunStatus.CANCELLED and state.get("run_id"):
+        run_row = load_run_row(ctx.admin, state["run_id"])
+        _finalize_run(
+            ctx.admin, state["run_id"], RunStatus.CANCELLED.value, result.error,
+            attempt=run_row.get("repair_attempt", 0) if run_row else 0,
+        )
+    # Execution reconciliation already mirrors the status to the experiment with
+    # a latest-run guard. Do not overwrite a newer run here.
     ctx.finalize_workflow(state, status, state.get("error"))
     return {"status": status.value, "current_node": "persist_results"}

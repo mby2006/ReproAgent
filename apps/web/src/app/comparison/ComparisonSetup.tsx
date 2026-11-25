@@ -1,6 +1,6 @@
 "use client";
 
-import Link from "next/link";
+import SiteLink from "@/components/SiteLink";
 import { useRouter } from "next/navigation";
 import { useCallback, useEffect, useState } from "react";
 import {
@@ -269,9 +269,9 @@ export default function ComparisonSetup({ paperId }: { paperId: string }) {
 
   return (
     <div className="mx-auto w-full max-w-5xl px-5 py-8">
-      <Link href={`/papers?id=${paperId}`} className="link-quiet text-[12px]">
+      <SiteLink href={`/papers?id=${paperId}`} className="link-quiet text-[12px]">
         ← 返回论文
-      </Link>
+      </SiteLink>
       <h1 className="display mt-3 text-2xl text-fg">优化器对照</h1>
       <p className="mt-2 max-w-3xl text-[13px] text-fg-2">
         两组只在优化器（及其学习率）上不同；数据划分、初始权重、样本顺序、训练预算和评估条件必须一致。

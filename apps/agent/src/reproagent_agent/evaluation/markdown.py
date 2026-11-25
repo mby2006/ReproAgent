@@ -205,23 +205,42 @@ def reader_summary(request: EvaluateRequest, report: EvaluationReport) -> str:
     total = request.metrics.get("evaluated_count")
     lines = []
     if type(correct) is int and type(total) is int and 0 <= correct <= total and total > 0:
-        lines.append(f"模型做了 {total:,} 道识别题，答对 {correct:,} 道，答错 {total - correct:,} 道。")
+        lines.append(
+            f"模型做了 {total:,} 道识别题，答对 {correct:,} 道，答错 {total - correct:,} 道。"
+        )
     target = next((c for c in report.metric_comparisons if c.metric == report.target_metric), None)
     if target and target.metric in {"accuracy", "error_rate"} and target.unit == "fraction":
         action = "答对" if target.metric == "accuracy" else "答错"
         if target.experiment_value is not None:
-            lines.append(f"按每 100 道题折算，本次平均{action} {100 * target.experiment_value:.1f} 道。")
+            lines.append(
+                f"按每 100 道题折算，本次平均{action} {100 * target.experiment_value:.1f} 道。"
+            )
         if target.paper_value is not None:
-            lines.append(f"按同一指标折算，论文平均每 100 道{action} {100 * target.paper_value:.1f} 道。")
+            lines.append(
+                f"按同一指标折算，论文平均每 100 道{action} {100 * target.paper_value:.1f} 道。"
+            )
     elif target and target.metric == "test_loss" and target.experiment_value is not None:
-        lines.append(f"本次给预测错误程度打出的平均分是 {_metric(target.experiment_value, target.unit)}。"
-                     "评分规则相同时，分数越低越好。")
+        lines.append(
+            f"本次给预测错误程度打出的平均分是 {_metric(target.experiment_value, target.unit)}。"
+            "评分规则相同时，分数越低越好。"
+        )
     interpretations = {
-        FinalStatus.DEVIATION_FOUND: "核对时发现，代码与论文的做法或实际运行与计划之间有出入。请在条件表中查看具体差别。",
-        FinalStatus.INSUFFICIENT_EVIDENCE: "还有关键设置或成绩缺少证据，现有记录不足以判断两次实验是否吻合。",
-        FinalStatus.METHOD_VALIDATED: "已核对的关键做法与论文相符，主要成绩也落在计划允许的差距内。这个判断只适用于本次缩小规模的实验。",
-        FinalStatus.SCALED_RUN_COMPLETED: "小规模实验跑完了，主要成绩与论文的差距超过计划允许的范围。单次比较无法定位原因。",
-        FinalStatus.PARTIAL_MATCH: "有些成绩接近论文，有些超出了计划允许的差距。需要分别查看各项成绩。",
+        FinalStatus.DEVIATION_FOUND: (
+            "核对时发现，代码与论文的做法或实际运行与计划之间有出入。请在条件表中查看具体差别。"
+        ),
+        FinalStatus.INSUFFICIENT_EVIDENCE: (
+            "还有关键设置或成绩缺少证据，现有记录不足以判断两次实验是否吻合。"
+        ),
+        FinalStatus.METHOD_VALIDATED: (
+            "已核对的关键做法与论文相符，主要成绩也落在计划允许的差距内。"
+            "这个判断只适用于本次缩小规模的实验。"
+        ),
+        FinalStatus.SCALED_RUN_COMPLETED: (
+            "小规模实验跑完了，主要成绩与论文的差距超过计划允许的范围。单次比较无法定位原因。"
+        ),
+        FinalStatus.PARTIAL_MATCH: (
+            "有些成绩接近论文，有些超出了计划允许的差距。需要分别查看各项成绩。"
+        ),
     }
     lines.append(interpretations[report.final_status])
     return "".join(lines)
@@ -276,7 +295,10 @@ def render_markdown(
     headline += ["", "> **这份报告不能回答**"]
     headline += [f"> - {line}" for line in cannot]
     counts = request.metrics
-    if counts.get("correct_count") is None and counts.get("target_metric") in {"error_rate", "error rate"}:
+    if (
+        counts.get("correct_count") is None
+        and counts.get("target_metric") in {"error_rate", "error rate"}
+    ):
         headline.append("旧版运行未记录正确样本数，原始目标值不可独立核验。")
     sections.append("\n".join(headline))
 
@@ -296,7 +318,10 @@ def render_markdown(
     if comparison and comparison.paper_value is not None and comparison.paper_evidence:
         evidence = comparison.paper_evidence
         page = f"（论文第 {evidence.source_page} 页）" if evidence.source_page else ""
-        reference = f"按该指标换算的论文参考值为 **{_metric(comparison.paper_value, comparison.unit)}**{page}。"
+        reference = (
+            f"按该指标换算的论文参考值为 **{_metric(comparison.paper_value, comparison.unit)}**"
+            f"{page}。"
+        )
         if evidence.detail:
             reference += f"原文记录：{evidence.detail}。"
     purpose = [
@@ -314,7 +339,8 @@ def render_markdown(
         f"- 允许的浮动范围（容差）：{ev.tolerance}。{ev.comparison_note}",
     ]
     actual_target = request.metrics.get("target_metric")
-    if isinstance(actual_target, str) and (execution_metric(actual_target) or actual_target) != wanted:
+    recorded_target = execution_metric(actual_target) if isinstance(actual_target, str) else None
+    if isinstance(actual_target, str) and (recorded_target or actual_target) != wanted:
         purpose.append(
             f"\n> 注意：计划记录的目标指标是 `{ev.target_metric}`，"
             f"运行记录的目标指标是 `{actual_target}`。报告仍按获批目标核查。"

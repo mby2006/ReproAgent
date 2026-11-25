@@ -258,6 +258,150 @@ uv run python scripts/smoke_execution.py   # 真实容器执行验收（需 exec
 > Runner 不发布端口。验证 Runner：`curl http://localhost:8001/health/dependencies`
 > （api → agent → runner 链路探测），或 `docker compose exec agent python -c "import httpx; print(httpx.get('http://runner:8002/health').text)"`。
 
+## 生产发布、备份与回滚
+
+以下命令都在服务器仓库 `/opt/reproagent` 中执行，且已经完成 `deploy/server/gen_secrets.sh`。
+生产数据位于 `/var/lib/reproagent/`；不要对正在运行的数据库直接复制数据目录。
+
+### 数据库迁移
+
+```bash
+cd /opt/reproagent
+./deploy/server/bootstrap.sh migrate
+```
+
+迁移器只执行 `infra/supabase/migrations/` 中尚未记账的 SQL：每个文件在一个事务内执行，
+事务内持有 Postgres advisory lock，并写入 `public.schema_migrations` 的版本与 SHA-256。
+重复执行同一版本是 no-op；已应用文件内容发生变化会直接失败，不能靠改历史迁移“打补丁”。
+有待执行迁移时，迁移器先停止 api/worker/agent/runner，再创建
+`/var/lib/reproagent/backups/pre-migration/<时间>-<commit>/`，校验数据库 dump 和 Storage tar
+后才开始迁移；快照失败则迁移不执行。成功后恢复原容器；迁移失败时应用保持停止，需人工检查
+`public.schema_migrations` 和失败原因后再决定启动或恢复快照。
+
+旧版 bootstrap 没有版本表。升级到本流程时，先备份并人工确认当前 schema，再显式接纳历史版本：
+
+```bash
+uv run python deploy/server/ops.py backup
+uv run python deploy/server/ops.py verify /var/lib/reproagent/backups/<本次备份目录>
+./deploy/server/bootstrap.sh migrate --adopt-existing
+```
+
+接纳操作只把当前迁移文件登记为“已应用”，**不验证历史 SQL 是否真的执行过**；只有确认现有
+`public.papers` 等表与迁移末尾状态一致时才可使用。全新空数据库不要加这个参数。
+
+### 定期备份与异地副本
+
+```bash
+cd /opt/reproagent
+uv run python deploy/server/ops.py backup
+uv run python deploy/server/ops.py verify /var/lib/reproagent/backups/<本次备份目录>
+rsync -a /var/lib/reproagent/backups/ /mnt/offsite/reproagent/backups/
+```
+
+`backup` 会先停止 api/worker/agent/runner，避免应用继续写 Storage；无论成功失败都会按原容器
+配置重新启动它们。备份包含 Postgres custom-format dump、Storage tar、迁移清单与文件 SHA-256。
+`verify` 会重算校验和并用 `pg_restore --list`、tar 结构检查验证文件可读，但它不等同于完整恢复演练。
+备份含用户数据与密码哈希，必须限制目录权限并只进入加密的异地存储；`.env.prod` 另用服务器现有
+机密管理流程保存，不要明文塞进备份目录。
+
+建议在 root 的 crontab 中加入每天备份和异地同步；`/mnt/offsite` 必须是已经挂载的异地加密存储，
+未挂载时同步命令会失败并写日志，不会假装备份成功：
+
+```cron
+17 3 * * * cd /opt/reproagent && uv run python deploy/server/ops.py backup >> /var/log/reproagent-backup.log 2>&1
+20 3 * * * test -d /mnt/offsite/reproagent && rsync -a /var/lib/reproagent/backups/ /mnt/offsite/reproagent/backups/ >> /var/log/reproagent-backup.log 2>&1
+```
+
+脚本不自动删除旧备份或旧镜像；确认异地副本和恢复演练通过前不要配置清理策略。
+
+### 健康检查、指标与告警
+
+`/health` 是低成本存活检查；`/ready` 只读后台探测的缓存，不阻塞在慢依赖上。API 每 15 秒并行检查
+agent、Supabase Auth、Postgres、Storage、Redis、worker 心跳和 Runner；缓存超过 45 秒或任一依赖异常，
+`/ready` 返回 503。worker 每 15 秒写入 60 秒过期的 Redis 心跳。人工诊断会实时执行完整依赖检查：
+
+```bash
+cd /opt/reproagent
+./deploy/server/bootstrap.sh status
+uv run python deploy/server/ops.py health
+curl -fsS http://127.0.0.1:8000/health/dependencies
+```
+
+`ops.py health` 在未就绪或依赖降级时退出码为 1，可直接接入服务器巡检或外部监控。外部 uptime 监控轮询
+公网 `/ready` 即可；连续失败告警比单次失败更可靠。仓库不内置邮件/Webhook 发送器，告警渠道由现有监控
+平台配置。不要把 `/metrics` 当公开端点：`.env.prod` 没设置 `OPS_TOKEN` 时它返回 404，设置后必须带内部令牌：
+
+```bash
+cd /opt/reproagent
+OPS_TOKEN=$(sed -n 's/^OPS_TOKEN=//p' deploy/server/.env.prod | head -1)
+curl -fsS -H "X-Ops-Token: $OPS_TOKEN" http://127.0.0.1:8000/metrics
+unset OPS_TOKEN
+```
+
+指标目前只有进程内 HTTP 请求数和耗时总和，按 method/route template/status 低基数聚合，最多 100 条序列；
+进程重启会清零，没有直方图、队列积压跨实例聚合或历史分位数，不能替代日志与数据库运行记录。访问日志只记录
+请求 ID、路由模板、状态和耗时，不记录查询串（包括 PDF 签名链接）或请求体。API/worker 的结构化 JSON 日志由
+`LOG_FORMAT=json` 开启；所有生产容器使用 10MB × 3 的 json-file 轮转。数据库记录 warning、超过 1 秒的语句和锁等待：
+
+```bash
+docker logs --since 30m reproagent-prod-api-1
+docker logs --since 30m reproagent-prod-worker-1
+docker logs --since 30m supabase-db-1
+```
+
+日志可能包含业务错误文本，分享前仍需脱敏；不要开启 HTTP 请求体日志。容器 unhealthy 先看
+`/health/dependencies` 区分的依赖，再决定重启；readiness 失败不应触发无限自动重启。以上配置需要重建容器才生效，
+本次离线验证没有实际执行容器健康检查、Prometheus 抓取或告警投递。
+
+### 应用发布与应用回滚
+
+提交并推送本次发布代码后，在服务器拉取到该 commit，保持工作区干净，然后执行：
+
+```bash
+cd /opt/reproagent
+git pull --ff-only
+./deploy/server/bootstrap.sh migrate
+uv run python deploy/server/ops.py release "$(git rev-parse HEAD)"
+./deploy/server/bootstrap.sh gate
+```
+
+`release` 拒绝脏工作区和非当前 HEAD，构建并使用完整 commit SHA 标记 api/worker/agent/runner
+和执行镜像；已存在的 SHA 镜像直接复用，不覆盖为 `latest`。发布记录在
+`/var/lib/reproagent/releases/`，旧 tag 保留。执行镜像首次构建仍需要 PyTorch 镜像源与 MNIST 下载。
+
+应用异常、但数据库 schema 仍兼容上一版本时：
+
+```bash
+cd /opt/reproagent
+uv run python deploy/server/ops.py rollback <上一个完整commit-SHA>
+./deploy/server/bootstrap.sh gate
+```
+
+回滚前会检查发布记录和全部五个镜像是否存在。它**只回滚容器镜像，不回滚数据库**；如果新版本
+已经写入不兼容数据，必须先写向前兼容的修复迁移，不能只退回旧镜像。不要执行会清理旧 tag 的
+Docker prune，否则会破坏回滚能力。
+
+### 数据库恢复与恢复演练
+
+`restore` 会覆盖当前数据库，属于破坏性操作。优先使用向后兼容的修复迁移；确需回滚时，先确认
+Redis 队列可以清空（其中任务可能引用回滚后不存在的数据），再恢复迁移前快照：
+
+```bash
+cd /opt/reproagent
+uv run python deploy/server/ops.py verify /var/lib/reproagent/backups/pre-migration/<快照目录>
+uv run python deploy/server/ops.py restore /var/lib/reproagent/backups/pre-migration/<快照目录> \
+  --confirm DESTROY_CURRENT_DATABASE
+```
+
+只有数据库与 Storage 是同一份快照且确实需要一起回退时才加 `--storage`。原 Storage 目录会先
+重命名为 `storage.before-restore-<时间>`，不会自动删除。恢复后检查
+`public.schema_migrations`、登录、上传和一条完整运行链路，再重新开放服务；恢复旧数据库后不要
+直接启动需要新 schema 的新镜像。
+
+完整恢复演练必须在备用服务器/隔离环境使用异地副本执行，并实际登录、读取 Storage、启动 worker、
+完成一次训练。不要为了演练在生产实例上运行 `restore`。本仓库的离线测试只验证命令编排、失败
+中止、校验和与重启保障，不能代替真实恢复演练。
+
 ## 本地进程模式（不用 Docker 跑应用）
 
 Supabase 仍用 `supabase start`（Docker），Redis 可用 `docker compose up -d redis`，应用直接跑在本机：
@@ -276,12 +420,40 @@ pnpm dev:web
 前端另需 `apps/web/.env.local`（已被 gitignore）：
 `NEXT_PUBLIC_API_URL`、`NEXT_PUBLIC_SUPABASE_URL`、`NEXT_PUBLIC_SUPABASE_ANON_KEY`。
 
+## 前端构建与发布
+
+前端只有 `NEXT_PUBLIC_SITE_MODE` 一个构建模式开关，缺省为 `live`；显式构建命令会覆盖它，
+Windows、Linux 与 macOS 使用同一套命令，不需要额外设置环境变量。
+
+```bash
+pnpm build:web              # live：Next.js 服务端构建，产物 apps/web/.next/
+pnpm build:web:static       # static：纯静态导出，产物 apps/web/out/
+pnpm verify:web:live        # 独立检查 live 产物标记与 BUILD_ID
+pnpm verify:web:static      # 独立检查静态页面、资源目录与产物标记
+```
+
+两种构建都会写入 `site-mode.json` 并自动验证产物；单独发布前必须运行对应 `verify` 命令。
+`live` 启用 `cacheComponents` 与 `partialPrefetching`；`static` 使用 `output: "export"` 且不启用
+这两个服务端渲染选项。静态构建会在编译时关闭登录和工作台后端功能，仅保留公开案例；
+它不是连接后端的一种降级运行模式。
+
+当前 Qoder Sites 静态托管没有 HTML 回退，深层链接必须带 `.html`，例如 `/login.html`、
+`/papers.html?id=<paper_id>`、`/experiments.html?id=<experiment_id>`、
+`/comparisons.html?id=<comparison_id>`。静态构建的站内导航会自动补上 `.html` 并使用整页跳转，
+避免客户端路由请求不存在的无扩展名地址。发布目录是 `apps/web/out/`，不要发布 `.next/` 或
+另一个模式留下的旧产物。`bash scripts/check.sh` 与离线 CI 会依次构建并验证两种模式。
+
 ## 测试
 
 ```bash
-uv run pytest                        # 356 个单元/契约测试（schemas/paperparse/api/agent/runner）
+uv run pytest                        # 离线单元/契约测试（schemas/paperparse/api/agent/runner）
 uv run pytest tests/integration -v   # RLS + 理解 + 规划 + 真实容器执行 + 统一工作流 E2E（需 supabase start / Docker）
-pnpm --filter web build              # 前端类型检查 + 生产构建
+pnpm lint:web                        # 前端 lint
+pnpm --filter web test               # 前端离线回归测试
+pnpm --filter web exec tsc --noEmit  # 前端类型检查
+pnpm build:web                       # live 前端生产构建与产物校验
+pnpm build:web:static                # static 前端生产构建与产物校验
+bash scripts/check.sh                # 完整离线门禁（Python + 前端 + 两种构建）
 uv run python scripts/smoke_test.py        # 健康 + 规划冒烟（需 compose 栈已启动）
 uv run python scripts/smoke_execution.py   # 真实容器执行验收（需 exec 镜像 + compose 栈）
 ```

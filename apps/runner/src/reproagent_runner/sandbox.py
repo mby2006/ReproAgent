@@ -84,9 +84,9 @@ def _host_config(
     return config
 
 
-def _create_container(client, image: str, request: RunRequest, host_config: dict):
+def _create_container(client, image: str, request: RunRequest, host_config: dict, labels: dict):
     command = ["python", request.entrypoint]
-    kwargs = dict(host_config)
+    kwargs = dict(host_config, labels=labels)
     volumes = {}
     for bind in kwargs.pop("binds", []):
         source, dest, mode = bind.rsplit(":", 2)
@@ -161,10 +161,14 @@ def _dir_size(path: Path) -> int:
 
 
 class Sandbox:
-    def __init__(self, client, settings: RunnerSettings, host_work_dir: str | None = None):
+    def __init__(
+        self, client, settings: RunnerSettings, host_work_dir: str | None = None,
+        owner_id: str | None = None,
+    ):
         self._client = client
         self._settings = settings
         self._host_work_dir = host_work_dir or str(settings.work_dir)
+        self._owner_id = owner_id
 
     def execute(
         self,
@@ -190,9 +194,16 @@ class Sandbox:
                 audit=audit,
             )
 
+        labels = {
+            "reproagent.managed": "true",
+            "reproagent.run_id": str(request.request_id),
+            "reproagent.request_id": str(request.request_id),
+        }
+        if self._owner_id is not None:
+            labels["reproagent.owner"] = self._owner_id
         try:
             container = _create_container(
-                self._client, self._settings.exec_image, request, host_config
+                self._client, self._settings.exec_image, request, host_config, labels
             )
         except (ImageNotFound, APIError) as exc:
             return RunResult(
@@ -204,15 +215,14 @@ class Sandbox:
                 audit=audit,
             )
 
-        if on_container is not None:
-            on_container(container.id)
-
         status = RunStatus.FAILED
         exit_code: int | None = None
         started = time.monotonic()
         disk_exceeded = False
         disk_limit = budget.disk_mb * 1024 * 1024
         try:
+            if on_container is not None:
+                on_container(container.id)
             container.start()
             deadline = started + budget.max_seconds
             # Poll instead of one blocking wait: storage_opt cannot quota the

@@ -8,11 +8,12 @@ row persistence and trace writing so individual nodes stay focused on compute.
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
-from reproagent_schemas import BudgetConfig, LLMUsage, WorkflowStatus
+from reproagent_schemas import BudgetConfig, LLMUsage, RunStatus, WorkflowStatus
 
 from ..clients.agent import AgentClient
 from ..clients.runner import RunnerClient
 from ..config import ApiSettings
+from ..services.runs import finalize_execution_run, load_run_row
 from .harness import WORKFLOW_PERSIST_KEYS, redact
 
 
@@ -81,8 +82,26 @@ class WorkflowContext:
             row["error"] = redact(error)
         if "budget" in state:
             row["budget_json"] = state["budget"].model_dump(mode="json")
-        self.admin.table("workflows").update(row).eq("id", state["workflow_id"]).execute()
-        if status is WorkflowStatus.FAILED and state.get("run_id"):
-            self.admin.table("execution_runs").update({
-                "status": "failed", "error": redact(error), "finished_at": _now(),
-            }).eq("id", state["run_id"]).in_("status", ["queued", "running"]).execute()
+        self.admin.table("workflows").update(row).eq("id", state["workflow_id"]).in_(
+            "status",
+            [
+                status.value
+                for status in WorkflowStatus
+                if status
+                not in (WorkflowStatus.COMPLETED, WorkflowStatus.FAILED, WorkflowStatus.CANCELLED)
+            ],
+        ).execute()
+        attempt = None
+        if state.get("run_id"):
+            # Static-validation repair can advance workflow state before any
+            # execution attempt owns the row; finalize the row's actual attempt.
+            run_row = load_run_row(self.admin, state["run_id"])
+            attempt = run_row.get("repair_attempt", 0) if run_row else 0
+        if status in (WorkflowStatus.FAILED, WorkflowStatus.CANCELLED) and attempt is not None:
+            finalize_execution_run(
+                self.admin,
+                state["run_id"],
+                RunStatus.CANCELLED if status is WorkflowStatus.CANCELLED else RunStatus.FAILED,
+                error,
+                attempt=attempt,
+            )

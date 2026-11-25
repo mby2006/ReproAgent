@@ -44,7 +44,9 @@ def parameter_comparisons(request: EvaluateRequest, methods, experiments):
                 key=key, label=label, paper=check.paper_value if check.paper_evidence else None,
                 paper_evidence=check.paper_evidence, plan=str(planned),
                 actual=check.implementation_value, actual_evidence=check.implementation_evidence,
-                decision=decision(plan.training_config.loss_function) if key == "loss_function" else None,
+                decision=(
+                    decision(plan.training_config.loss_function) if key == "loss_function" else None
+                ),
                 note=check.note,
             ))
     target = request.metrics.get("target_metric")
@@ -67,7 +69,10 @@ def text_value(value):
 
 
 def evidence(field):
-    if field is None or field.status not in (EvidenceStatus.PAPER_EXPLICIT, EvidenceStatus.PAPER_DESCRIBED):
+    if field is None or field.status not in (
+        EvidenceStatus.PAPER_EXPLICIT,
+        EvidenceStatus.PAPER_DESCRIBED,
+    ):
         return None
     return EvidenceRef(kind="paper", quote=field.evidence_quote, source_page=field.source_page,
                        source_section=field.source_section, detail=text_value(field.value))

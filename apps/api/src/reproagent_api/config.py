@@ -19,6 +19,7 @@ class ApiSettings(BaseSettings):
     agent_base_url: str = "http://127.0.0.1:8001"
     runner_base_url: str = "http://127.0.0.1:8002"
     redis_url: str = "redis://127.0.0.1:6379"
+    ops_token: str = ""
     cors_origins: str = "http://localhost:3000"
 
     @field_validator("cors_origins")

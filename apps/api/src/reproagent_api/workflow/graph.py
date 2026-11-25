@@ -6,14 +6,17 @@ compiled with a checkpointer keyed by thread_id == workflow_id, so human gates
 (interrupt) and crashes resume from the last completed node.
 """
 
+import asyncio
 import logging
 import time
+from uuid import UUID
 
 from langgraph.errors import GraphInterrupt
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import Command
 from reproagent_schemas import ErrorCategory, RunStatus, WorkflowStatus
 
+from ..services.runs import execution_request_id, load_run_row
 from .context import WorkflowContext
 from .harness import BudgetExceeded, redact, trace_input, trace_output
 from .nodes import (
@@ -189,6 +192,40 @@ def build_workflow_graph(ctx: WorkflowContext, checkpointer):
 async def _invoke(graph, payload, config: dict, ctx: WorkflowContext, fallback: dict) -> None:
     try:
         await graph.ainvoke(payload, config)
+    except asyncio.CancelledError:
+        # Cleanup is best effort: database/checkpoint failures must never replace
+        # the task's cancellation exception. The deterministic request id covers
+        # acceptance before the accepted Runner id could be persisted.
+        try:
+            current = (await graph.aget_state(config)).values or fallback
+        except Exception:
+            current = fallback
+        runner_run_id = current.get("runner_run_id") or fallback.get("runner_run_id")
+        try:
+            if not runner_run_id and current.get("run_id"):
+                run_row = load_run_row(ctx.admin, current["run_id"])
+                runner_run_id = run_row.get("runner_run_id") if run_row else None
+                if not runner_run_id and current.get("code_version"):
+                    runner_run_id = execution_request_id(
+                        UUID(current["run_id"]), current.get("repair_attempt", 0)
+                    )
+        except Exception:
+            logger.warning("workflow %s cancellation lookup failed", current.get("workflow_id"))
+        if runner_run_id:
+            try:
+                await ctx.runner.cancel_run(UUID(str(runner_run_id)))
+            except Exception:
+                logger.warning(
+                    "workflow %s Runner cancellation failed",
+                    current.get("workflow_id"),
+                )
+        try:
+            ctx.finalize_workflow(current, WorkflowStatus.CANCELLED, "workflow cancelled")
+        except Exception:
+            logger.warning(
+                "workflow %s cancellation persistence failed", current.get("workflow_id")
+            )
+        raise
     except BudgetExceeded as exc:
         current = (await graph.aget_state(config)).values or fallback
         ctx.finalize_workflow(current, WorkflowStatus.FAILED, str(exc))

@@ -1,6 +1,6 @@
 "use client";
 
-import Link from "next/link";
+import SiteLink from "@/components/SiteLink";
 import { useRouter, useSearchParams } from "next/navigation";
 import { Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import AuthGate from "@/components/AuthGate";
@@ -262,7 +262,7 @@ function PapersInner() {
             const meta = STATUS_META[paper.status];
             return (
               <li key={paper.id} className="card card-hover rise flex flex-col" style={{ animationDelay: `${Math.min(i, 8) * 0.05}s` }}>
-                <Link href={`/papers?id=${paper.id}`} className="group flex flex-1 flex-col p-4">
+                <SiteLink href={`/papers?id=${paper.id}`} className="group flex flex-1 flex-col p-4">
                   <div className="mb-3 flex items-center justify-between gap-2">
                     <span className="chip">
                       {paper.source === "upload" ? (
@@ -286,7 +286,7 @@ function PapersInner() {
                     </span>
                     <IconArrowRight className="h-4 w-4 text-fg-3 transition group-hover:translate-x-1 group-hover:text-brand" />
                   </div>
-                </Link>
+                </SiteLink>
                 <div className="flex justify-end border-t border-line px-3 py-2">
                   <DeletePaperButton
                     paper={paper}

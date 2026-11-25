@@ -1,6 +1,6 @@
 "use client";
 
-import Link from "next/link";
+import SiteLink from "@/components/SiteLink";
 import { useRouter, useSearchParams } from "next/navigation";
 import { Suspense, useCallback, useEffect, useRef, useState } from "react";
 import AuthGate from "@/components/AuthGate";
@@ -412,9 +412,9 @@ function PaperInner({ paperId }: { paperId: string }) {
   return (
     <main className="mx-auto w-full max-w-7xl space-y-4 px-5 py-6">
       <header className="workspace-heading flex flex-wrap items-center gap-3">
-        <Link href="/papers" className="btn btn-ghost btn-sm" aria-label="返回论文库">
+        <SiteLink href="/papers" className="btn btn-ghost btn-sm" aria-label="返回论文库">
           <IconArrowLeft className="h-4 w-4" />
-        </Link>
+        </SiteLink>
         <div className="workspace-title">
           <p className="label mb-1">论文复现卡</p>
           <h1 className="display text-2xl font-bold">{paper?.title ?? "论文"}</h1>
@@ -462,17 +462,17 @@ function PaperInner({ paperId }: { paperId: string }) {
           </button>
         )}
         {workflow?.experiment_id && (
-          <Link
+          <SiteLink
             href={`/experiments?id=${workflow.experiment_id}&workflow=${workflow.id}`}
             className="btn btn-primary btn-sm"
           >
             查看实验计划 <IconArrowRight className="h-3.5 w-3.5" />
-          </Link>
+          </SiteLink>
         )}
         {(confirmedVersionId === cardVersion?.id || workflow?.spec_version_id) && (
-          <Link href={`/comparison?id=${paperId}`} className="btn btn-ghost btn-sm">
+          <SiteLink href={`/comparison?id=${paperId}`} className="btn btn-ghost btn-sm">
             建立优化器对照 <IconArrowRight className="h-3.5 w-3.5" />
-          </Link>
+          </SiteLink>
         )}
       </header>
 

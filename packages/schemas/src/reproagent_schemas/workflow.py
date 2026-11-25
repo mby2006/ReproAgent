@@ -29,9 +29,12 @@ class WorkflowStatus(StrEnum):
     EVALUATING = "evaluating"
     COMPLETED = "completed"
     FAILED = "failed"
+    CANCELLED = "cancelled"
 
 
-TERMINAL_WORKFLOW_STATUSES = frozenset({WorkflowStatus.COMPLETED, WorkflowStatus.FAILED})
+TERMINAL_WORKFLOW_STATUSES = frozenset(
+    {WorkflowStatus.COMPLETED, WorkflowStatus.FAILED, WorkflowStatus.CANCELLED}
+)
 AWAITING_WORKFLOW_STATUSES = frozenset(
     {WorkflowStatus.AWAITING_SPEC_REVIEW, WorkflowStatus.AWAITING_PLAN_APPROVAL}
 )

@@ -39,10 +39,15 @@ testpaths = [
     "apps/api/tests",
     "apps/agent/tests",
     "apps/runner/tests",
+    "tests/unit",
+    "tests/integration",
 ]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
-addopts = "-q --import-mode=importlib"
+addopts = "-q --import-mode=importlib -m 'not integration'"
+markers = [
+    "integration: requires real external services; excluded from the default offline lane",
+]
 
 [tool.ruff]
 line-length = 100

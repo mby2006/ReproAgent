@@ -15,6 +15,7 @@ import asyncio
 from datetime import UTC, datetime
 from uuid import UUID, uuid4
 
+import httpx
 from reproagent_schemas import (
     CodegenRequest,
     ComparisonOrigin,
@@ -23,6 +24,7 @@ from reproagent_schemas import (
     ComparisonReportRequest,
     ComparisonRerunRequest,
     ComparisonStatus,
+    ErrorCategory,
     ExecImageStatus,
     ExperimentPlan,
     GroupKey,
@@ -44,7 +46,12 @@ from reproagent_schemas import (
 from .runs import (
     async_persist_result,
     build_run_request,
+    execution_request_id,
+    finalize_execution_run,
     insert_code_version,
+    load_run_row,
+    mark_attempt_running,
+    persist_runner_run_id,
     pin_run_files,
 )
 from .versions import insert_versioned
@@ -609,7 +616,49 @@ async def _poll(runner, runner_run_id: UUID) -> RunResult:
         if result.status in TERMINAL_RUNS:
             return result
         await asyncio.sleep(POLL_INTERVAL_SECONDS)
-    return await runner.get_run(runner_run_id)
+    try:
+        await runner.cancel_run(runner_run_id)
+    except Exception:
+        pass
+    return RunResult(
+        run_id=runner_run_id,
+        status=RunStatus.TIMEOUT,
+        error="Runner polling budget exhausted; execution was cancelled",
+        error_category=ErrorCategory.TIMEOUT,
+    )
+
+
+def _result_from_row(run_id: UUID, row: dict) -> RunResult:
+    return RunResult(
+        run_id=run_id,
+        status=RunStatus(row["status"]),
+        error=row.get("error"),
+    )
+
+
+def _finalize_cancelled(admin, run_id: str, fallback: dict) -> None:
+    current = load_run_row(admin, run_id) or fallback
+    if current["status"] not in (
+        RunStatus.CANCELLED.value, RunStatus.SUCCEEDED.value,
+    ):
+        _finalize_execution(
+            admin,
+            current,
+            RunResult(run_id=UUID(run_id), status=RunStatus.CANCELLED),
+        )
+
+
+async def _cancel_runner(runner, identity: UUID | None) -> None:
+    if identity is None:
+        return
+    try:
+        await runner.cancel_run(identity)
+    except Exception:
+        pass
+
+
+def _is_not_found(exc: Exception) -> bool:
+    return isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code == 404
 
 
 async def _execute_attempt(
@@ -668,7 +717,7 @@ async def _execute_attempt(
             "id": str(run_id),
             "experiment_id": str(experiment_id),
             "plan_id": plan_row["id"],
-            "code_version": 1,
+            "code_version": 0,
             "plan_version": 1,
             "status": RunStatus.QUEUED.value,
             "repair_attempt": 0,
@@ -694,6 +743,9 @@ async def _execute_attempt(
         )
         return run_id, result, str(experiment_id)
 
+    request: RunRequest | None = None
+    runner_run_id: UUID | None = None
+    result: RunResult | None = None
     try:
         bundle = (await agent.codegen(CodegenRequest(card=card, plan=plan_for_group))).bundle
         validation = await agent.validate_code(StaticValidateRequest(bundle=bundle))
@@ -709,54 +761,100 @@ async def _execute_attempt(
             f"comparison seed {seed} group {group.key.value}",
         )
         pin_run_files(admin, str(run_id), file_ids)
-        admin.table("execution_runs").update(
-            {
-                "code_version": code_version,
-                "code_hash": bundle.code_hash,
-                "status": RunStatus.RUNNING.value,
-                "started_at": _now(),
-            }
-        ).eq("id", str(run_id)).execute()
-
-        request: RunRequest = build_run_request(
+        request = build_run_request(
             experiment_id,
             UUID(plan_row["id"]),
             bundle,
             plan_for_group,
             code_version,
             1,
+            run_id,
+            0,
         )
-        accepted = await runner.start_run(request)
-        admin.table("execution_runs").update({"runner_run_id": str(accepted.run_id)}).eq(
-            "id", str(run_id)
-        ).execute()
-        result = await _poll(runner, accepted.run_id)
-        await async_persist_result(admin, str(run_id), accepted.run_id, result, runner, 0)
+        claimed = mark_attempt_running(
+            admin,
+            load_run_row(admin, str(run_id)),
+            attempt=0,
+            code_version=code_version,
+            code_hash=bundle.code_hash,
+            plan_id=plan_row["id"],
+            plan_version=1,
+            request_json=request.model_dump(mode="json"),
+        )
+        if claimed is None:
+            current = load_run_row(admin, str(run_id))
+            if current and current["status"] in (
+                RunStatus.CANCELLED.value, RunStatus.SUCCEEDED.value,
+                RunStatus.FAILED.value, RunStatus.TIMEOUT.value,
+            ):
+                return run_id, _result_from_row(run_id, current), str(experiment_id)
+            return fail("Execution attempt ownership was lost")
+
+        runner_run_id = UUID(claimed["runner_run_id"]) if claimed.get("runner_run_id") else None
+        if runner_run_id is None:
+            current = load_run_row(admin, str(run_id))
+            if current["status"] in (
+                RunStatus.CANCELLED.value, RunStatus.SUCCEEDED.value,
+            ):
+                return run_id, _result_from_row(run_id, current), str(experiment_id)
+            accepted = await runner.start_run(request)
+            runner_run_id = accepted.run_id
+            if not persist_runner_run_id(admin, str(run_id), runner_run_id, 0):
+                current = load_run_row(admin, str(run_id))
+                if current["status"] != RunStatus.SUCCEEDED.value:
+                    await _cancel_runner(runner, runner_run_id)
+                return run_id, _result_from_row(run_id, current), str(experiment_id)
+        result = await _poll(runner, runner_run_id)
+        await async_persist_result(admin, str(run_id), runner_run_id, result, runner, 0)
         _finalize_execution(
             admin, {"id": str(run_id), "experiment_id": str(experiment_id)}, result
         )
         return run_id, result, str(experiment_id)
+    except asyncio.CancelledError:
+        await _cancel_runner(runner, runner_run_id or (request.request_id if request else None))
+        _finalize_cancelled(
+            admin,
+            str(run_id),
+            {"id": str(run_id), "experiment_id": str(experiment_id)},
+        )
+        raise
     except Exception as exc:  # noqa: BLE001 - never leave a run stuck in running
+        await _cancel_runner(runner, runner_run_id or (request.request_id if request else None))
+        current = load_run_row(admin, str(run_id))
+        if current and current["status"] in (
+            RunStatus.CANCELLED.value, RunStatus.SUCCEEDED.value,
+        ):
+            return run_id, _result_from_row(run_id, current), str(experiment_id)
+        if result is not None and result.status in TERMINAL_RUNS:
+            # The Runner's real terminal outcome remains authoritative even if
+            # storing its audit data failed.
+            _finalize_execution(
+                admin,
+                current or {"id": str(run_id), "experiment_id": str(experiment_id)},
+                result,
+            )
+            return run_id, result, str(experiment_id)
         return fail(f"执行失败：{exc}")
 
 
 def _finalize_execution(admin, run_row: dict, result: RunResult, error: str | None = None) -> None:
-    admin.table("execution_runs").update(
-        {
-            "status": result.status.value,
-            "finished_at": _now(),
-            "error": error if error is not None else result.error,
-        }
-    ).eq("id", run_row["id"]).execute()
-    admin.table("experiments").update(
-        {"status": "succeeded" if result.status is RunStatus.SUCCEEDED else "failed"}
-    ).eq("id", run_row["experiment_id"]).execute()
+    # The RPC locks the row, guards its attempt and latest-run position, and
+    # serializes the experiment mirror. Direct status writes can resurrect a
+    # cancelled/succeeded run or overwrite a newer repair/rerun.
+    finalize_execution_run(
+        admin,
+        run_row["id"],
+        result.status,
+        error if error is not None else result.error,
+        attempt=run_row.get("repair_attempt", 0),
+        require_latest=True,
+    )
 
 
 def _fetch_run(admin, run_id: str) -> dict | None:
     rows = (
         admin.table("execution_runs")
-        .select("id,experiment_id,status,runner_run_id")
+        .select("id,experiment_id,status,runner_run_id,repair_attempt,created_at")
         .eq("id", run_id)
         .execute()
         .data
@@ -765,45 +863,83 @@ def _fetch_run(admin, run_id: str) -> dict | None:
 
 
 async def _resume_run(admin, runner, run_row: dict) -> RunResult | None:
-    """Re-attach to a run left in flight by a crashed driver.
+    """Re-attach to the stable Runner identity left by a crashed driver.
 
-    Polling the existing Runner run (same container) avoids training the same
-    group twice; if the Runner no longer knows it, the attempt is finalized as
-    failed so the caller can retry deliberately.
+    The API persists the deterministic request before dispatch. If the response
+    was lost, probing that identity recovers the accepted container instead of
+    generating code or starting a second run. Confirmed absence fails this
+    attempt deliberately; uncertain transport failures cancel the identity
+    before the caller is allowed to retry.
     """
-    runner_run_id = run_row.get("runner_run_id")
-    if not runner_run_id:
-        # The driver died between "status=running" and knowing the Runner's run
-        # id. Nothing can be polled, and leaving it open would keep the run and
-        # its experiment in `running` forever (which also blocks paper deletion).
-        failed = RunResult(
-            run_id=UUID(run_row["id"]),
-            status=RunStatus.FAILED,
-            error="无法恢复运行：缺少 Runner 运行标识（驱动在启动阶段中断）",
-        )
-        _finalize_execution(admin, run_row, failed)
-        return failed
+    run_uuid = UUID(run_row["id"])
+    current = load_run_row(admin, str(run_uuid))
+    if current and current["status"] in (
+        RunStatus.SUCCEEDED.value, RunStatus.CANCELLED.value,
+    ):
+        return _result_from_row(run_uuid, current)
+    current = current or run_row
+    attempt = current.get("repair_attempt", 0)
+    runner_run_id = UUID(current["runner_run_id"]) if current.get("runner_run_id") else None
+    discovered: RunResult | None = None
+    if runner_run_id is None:
+        deterministic_id = execution_request_id(run_uuid, attempt)
+        try:
+            discovered = await runner.get_run(deterministic_id)
+        except Exception as exc:  # noqa: BLE001
+            if not _is_not_found(exc):
+                await _cancel_runner(runner, deterministic_id)
+            failed = RunResult(
+                run_id=run_uuid,
+                status=RunStatus.FAILED,
+                error=f"无法恢复运行：缺少 Runner 运行标识（驱动在启动阶段中断）：{exc}",
+            )
+            _finalize_execution(admin, current, failed)
+            return failed
+        if not persist_runner_run_id(admin, str(run_uuid), deterministic_id, attempt):
+            current = load_run_row(admin, str(run_uuid)) or current
+            if current["status"] != RunStatus.SUCCEEDED.value:
+                await _cancel_runner(runner, deterministic_id)
+            return _result_from_row(run_uuid, current)
+        runner_run_id = deterministic_id
+
     try:
-        result = await _poll(runner, UUID(runner_run_id))
+        result = (
+            discovered
+            if discovered is not None and discovered.status in TERMINAL_RUNS
+            else await _poll(runner, runner_run_id)
+        )
+    except asyncio.CancelledError:
+        await _cancel_runner(runner, runner_run_id)
+        _finalize_cancelled(admin, str(run_uuid), current)
+        raise
     except Exception as exc:  # noqa: BLE001
+        await _cancel_runner(runner, runner_run_id)
+        current = load_run_row(admin, str(run_uuid)) or current
+        if current["status"] in (
+            RunStatus.SUCCEEDED.value, RunStatus.CANCELLED.value,
+        ):
+            return _result_from_row(run_uuid, current)
         failed = RunResult(
-            run_id=UUID(run_row["id"]),
+            run_id=run_uuid,
             status=RunStatus.FAILED,
             error=f"无法恢复运行（Runner 记录已失效）：{exc}",
         )
-        _finalize_execution(admin, run_row, failed)
+        _finalize_execution(admin, current, failed)
         return failed
+
     try:
-        await async_persist_result(admin, run_row["id"], UUID(runner_run_id), result, runner, 0)
-    except Exception as exc:  # noqa: BLE001
-        failed = RunResult(
-            run_id=UUID(run_row["id"]),
-            status=RunStatus.FAILED,
-            error=f"恢复运行后结果持久化失败：{exc}",
-        )
-        _finalize_execution(admin, run_row, failed)
-        return failed
-    _finalize_execution(admin, run_row, result)
+        await async_persist_result(admin, str(run_uuid), runner_run_id, result, runner, attempt)
+    except asyncio.CancelledError:
+        await _cancel_runner(runner, runner_run_id)
+        _finalize_cancelled(admin, str(run_uuid), current)
+        raise
+    except Exception:  # noqa: BLE001 - the polled terminal result is authoritative
+        current = load_run_row(admin, str(run_uuid)) or current
+        if current["status"] in (
+            RunStatus.SUCCEEDED.value, RunStatus.CANCELLED.value,
+        ):
+            return _result_from_row(run_uuid, current)
+    _finalize_execution(admin, current, result)
     return result
 
 
@@ -829,11 +965,13 @@ async def _run_group(
         run_row = _fetch_run(admin, row["run_id"])
         if run_row is None:
             continue
-        if run_row["status"] == RunStatus.SUCCEEDED.value:
+        if run_row["status"] in (RunStatus.SUCCEEDED.value, RunStatus.CANCELLED.value):
             return prior
-        if run_row["status"] in (RunStatus.QUEUED.value, RunStatus.RUNNING.value):
+        if run_row["status"] in (
+            RunStatus.QUEUED.value, RunStatus.DISPATCHING.value, RunStatus.RUNNING.value,
+        ):
             result = await _resume_run(admin, runner, run_row)
-            if result is not None and result.status is RunStatus.SUCCEEDED:
+            if result is not None and result.status in (RunStatus.SUCCEEDED, RunStatus.CANCELLED):
                 return prior
 
     attempt = max((row["attempt"] for row in prior), default=0) + 1
@@ -863,7 +1001,7 @@ async def _run_group(
                 "experiment_id": experiment_id,
             }
         )
-        if result.status is RunStatus.SUCCEEDED:
+        if result.status in (RunStatus.SUCCEEDED, RunStatus.CANCELLED):
             break
         attempt += 1
     return prior + created
@@ -889,7 +1027,9 @@ async def execute_comparison(admin, agent, runner, comparison_id: str) -> None:
                 "status": ComparisonStatus.FAILED.value,
                 "error": "计划超出授权范围：" + "；".join(violations),
             }
-        ).eq("id", comparison_id).execute()
+        ).eq("id", comparison_id).in_(
+            "status", [ComparisonStatus.QUEUED.value, ComparisonStatus.RUNNING.value]
+        ).execute()
         return
     plan_row = get_plan_row(admin, comparison["plan_id"])
     spec_id = plan_row["spec_id"]
@@ -909,15 +1049,26 @@ async def execute_comparison(admin, agent, runner, comparison_id: str) -> None:
                 "status": ComparisonStatus.FAILED.value,
                 "error": f"执行镜像不可用：{image.error or image.image}",
             }
-        ).eq("id", comparison_id).execute()
+        ).eq("id", comparison_id).in_(
+            "status", [ComparisonStatus.QUEUED.value, ComparisonStatus.RUNNING.value]
+        ).execute()
         return
 
     admin.table("comparisons").update({"status": ComparisonStatus.RUNNING.value}).eq(
         "id", comparison_id
+    ).in_(
+        "status", [ComparisonStatus.QUEUED.value, ComparisonStatus.RUNNING.value]
     ).execute()
+
+    current = get_comparison(admin, comparison_id)
+    if current["status"] not in (
+        ComparisonStatus.QUEUED.value, ComparisonStatus.RUNNING.value,
+    ):
+        return
 
     existing = comparison_runs(admin, comparison_id)
     try:
+        active = True
         for seed in plan.seeds:
             for group in plan.groups:
                 updated = await _run_group(
@@ -941,11 +1092,23 @@ async def execute_comparison(admin, agent, runner, comparison_id: str) -> None:
                     )
                 ]
                 existing = kept + updated
+                current = get_comparison(admin, comparison_id)
+                active = current["status"] in (
+                    ComparisonStatus.QUEUED.value, ComparisonStatus.RUNNING.value,
+                )
+                if not active:
+                    break
+            if not active:
+                break
     except Exception as exc:  # infrastructure failure: never fake a result
         admin.table("comparisons").update(
             {"status": ComparisonStatus.FAILED.value, "error": str(exc)[:1000]}
-        ).eq("id", comparison_id).execute()
-        return
+        ).eq("id", comparison_id).in_(
+            "status", [ComparisonStatus.QUEUED.value, ComparisonStatus.RUNNING.value]
+        ).execute()
+        current = get_comparison(admin, comparison_id)
+        if current["status"] != ComparisonStatus.INCOMPLETE.value:
+            return
 
     observations = []
     for row in existing:
@@ -1031,7 +1194,16 @@ async def execute_comparison(admin, agent, runner, comparison_id: str) -> None:
     if not superseded:
         payload["status"] = final_status.value
         payload["error"] = None
-    admin.table("comparisons").update(payload).eq("id", comparison_id).execute()
+    query = admin.table("comparisons").update(payload).eq("id", comparison_id)
+    if superseded:
+        query = query.eq("status", ComparisonStatus.INCOMPLETE.value)
+    else:
+        query = query.in_(
+            "status", [ComparisonStatus.QUEUED.value, ComparisonStatus.RUNNING.value]
+        )
+    query.execute()
+
+
 def _comparison_image_digest(admin, comparison_id: str) -> str | None:
     """The digest actually observed by the original runs, not a stored claim."""
     for row in comparison_runs(admin, comparison_id):

@@ -6,6 +6,8 @@ an LLM. Ownership flows runs -> experiments -> projects.user_id.
 """
 
 import json
+from contextlib import contextmanager
+from datetime import UTC, datetime
 from types import SimpleNamespace
 from uuid import UUID, uuid4
 
@@ -26,6 +28,7 @@ from reproagent_api.auth import get_anon_client
 from reproagent_api.config import ApiSettings
 from reproagent_api.main import create_app
 from reproagent_api.routers import runs
+from reproagent_api.services.runs import async_persist_result, execution_request_id
 from reproagent_api.workflow import make_memory_checkpointer
 from reproagent_schemas import (
     ClassifyRequest,
@@ -156,6 +159,9 @@ class FakeQuery:
         self._limit = None
         self._insert = None
         self._update = None
+        self._upsert = None
+        self._on_conflict = None
+        self._ignore_duplicates = False
         self._delete = False
         self._select = None
         self._single = False
@@ -171,6 +177,14 @@ class FakeQuery:
 
     def in_(self, key, values):
         self._filters.append(("in", key, list(values)))
+        return self
+
+    def neq(self, key, value):
+        self._filters.append(("neq", key, value))
+        return self
+
+    def lte(self, key, value):
+        self._filters.append(("lte", key, value))
         return self
 
     def order(self, key, desc=False):
@@ -189,6 +203,12 @@ class FakeQuery:
         self._update = patch
         return self
 
+    def upsert(self, row, *, on_conflict=None, ignore_duplicates=False):
+        self._upsert = row
+        self._on_conflict = on_conflict
+        self._ignore_duplicates = ignore_duplicates
+        return self
+
     def delete(self):
         self._delete = True
         return self
@@ -204,29 +224,68 @@ class FakeQuery:
                 return False
             if kind == "in" and actual not in value:
                 return False
+            if kind == "neq" and actual == value:
+                return False
+            if kind == "lte" and (
+                actual is None or datetime.fromisoformat(actual) > datetime.fromisoformat(value)
+            ):
+                return False
             if kind == "not_is" and value == "null" and actual is None:
                 return False
         return True
 
+    def _new_row(self, item):
+        defaults = PLAN_DEFAULTS if self._name == "experiment_plans" else {}
+        if self._name == "execution_runs":
+            defaults = {
+                "code_version": 0,
+                "plan_version": 1,
+                "status": "queued",
+                "repair_attempt": 0,
+                "metrics_json": {},
+                "audit_json": {},
+                "runtime_json": {},
+            }
+        elif self._name == "job_outbox":
+            defaults = {
+                "status": "pending",
+                "attempts": 0,
+                "last_error": None,
+            }
+        elif self._name == "experiments":
+            defaults = {"spec_id": None, "status": "pending"}
+        row = {
+            "id": str(uuid4()),
+            "created_at": "2026-01-01T00:00:00+00:00",
+            "updated_at": "2026-01-01T00:00:00+00:00",
+            **defaults,
+        }
+        row.update(item)
+        _check_experiment_status(self._name, row.get("status"))
+        if self._name == "experiments" and "project_id" in row:
+            row.setdefault("projects", {"user_id": self._admin.owners.get(row["project_id"])})
+        return row
+
     def execute(self):
+        if self._upsert is not None:
+            keys = (self._on_conflict or "id").split(",")
+            existing = next((
+                row for row in self._rows
+                if all(row.get(key) == self._upsert.get(key) for key in keys)
+            ), None)
+            if existing is not None and self._ignore_duplicates:
+                return FakeResult([])
+            if existing is None:
+                existing = self._new_row(self._upsert)
+                self._rows.append(existing)
+            else:
+                existing.update(self._upsert)
+            return FakeResult([existing])
         if self._insert is not None:
-            defaults = PLAN_DEFAULTS if self._name == "experiment_plans" else {}
-            if self._name == "experiments":
-                defaults = {"spec_id": None, "status": "pending"}
             items = self._insert if isinstance(self._insert, list) else [self._insert]
             inserted = []
             for item in items:
-                row = {
-                    "id": str(uuid4()),
-                    "created_at": "2026-01-01T00:00:00+00:00",
-                    **defaults,
-                }
-                row.update(item)
-                _check_experiment_status(self._name, row.get("status"))
-                if self._name == "experiments" and "project_id" in row:
-                    row.setdefault(
-                        "projects", {"user_id": self._admin.owners.get(row["project_id"])}
-                    )
+                row = self._new_row(item)
                 self._rows.append(row)
                 inserted.append(row)
             return FakeResult(inserted)
@@ -282,14 +341,100 @@ class FakeAdmin:
         self.tables = tables
         self.owners = owners
         self.storage = FakeStorage()
+        self.rpc_calls = []
 
     def table(self, name):
         return FakeQuery(self, name)
+
+    def rpc(self, name, params):
+        self.rpc_calls.append((name, params))
+        if name == "reconcile_execution_run":
+            run = next(
+                (row for row in self.tables["execution_runs"]
+                 if row["id"] == params["p_run_id"]),
+                None,
+            )
+            guarded = "p_repair_attempt" in params
+            if not guarded:
+                if run is None or run["status"] not in ("queued", "dispatching", "running"):
+                    return False
+            elif (
+                run is None
+                or run.get("repair_attempt", 0) != params["p_repair_attempt"]
+                or not (
+                    run["status"] in ("queued", "dispatching", "running")
+                    or (run["status"] == "cancelled" and params["p_status"] == "cancelled")
+                )
+            ):
+                return False
+            now = datetime.now(UTC).isoformat()
+            run_order = (run.get("created_at") or "", run["id"])
+            has_newer_run = any(
+                row["experiment_id"] == run["experiment_id"]
+                and (row.get("created_at") or "", row["id"]) > run_order
+                for row in self.tables["execution_runs"]
+            )
+            if params.get("p_require_latest") and has_newer_run:
+                return False
+            if run["status"] != "cancelled":
+                run.update({
+                    "status": params["p_status"],
+                    "error": params["p_error"],
+                    "finished_at": now,
+                    "updated_at": now,
+                })
+            if not has_newer_run:
+                experiment = next(
+                    row for row in self.tables["experiments"]
+                    if row["id"] == run["experiment_id"]
+                )
+                experiment["status"] = (
+                    "failed" if params["p_status"] == "timeout" else params["p_status"]
+                )
+            return True
+        if name != "create_execution_run":
+            raise AssertionError(f"unexpected rpc: {name}")
+        experiment = next(
+            row for row in self.tables["experiments"] if row["id"] == params["p_experiment_id"]
+        )
+        plan = next(
+            row for row in self.tables["experiment_plans"] if row["id"] == params["p_plan_id"]
+        )
+        if plan["experiment_id"] != experiment["id"]:
+            raise ValueError("plan does not belong to experiment")
+        if plan["version"] != params["p_plan_version"]:
+            raise ValueError("plan version mismatch")
+        run_id = str(uuid4())
+        self.tables["execution_runs"].append({
+            "id": run_id,
+            "experiment_id": experiment["id"],
+            "plan_id": plan["id"],
+            "code_version": 0,
+            "plan_version": plan["version"],
+            "status": "queued",
+            "repair_attempt": 0,
+            "created_at": "2026-01-01T00:00:00+00:00",
+            "updated_at": "2026-01-01T00:00:00+00:00",
+        })
+        self.tables.setdefault("job_outbox", []).append({
+            "id": str(uuid4()),
+            "job_type": "run_experiment_task",
+            "entity_id": run_id,
+            "job_id": f"run-experiment:{run_id}",
+            "status": "pending",
+            "attempts": 0,
+            "last_error": None,
+            "created_at": "2026-01-01T00:00:00+00:00",
+            "updated_at": "2026-01-01T00:00:00+00:00",
+        })
+        experiment["status"] = "running"
+        return run_id
 
 
 class FakeArq:
     def __init__(self):
         self.jobs = []
+        self.enqueued = []
         self._job_ids = set()
 
     async def enqueue_job(self, name, *args, _job_id=None):
@@ -298,10 +443,15 @@ class FakeArq:
                 return None
             self._job_ids.add(_job_id)
         self.jobs.append((name, args))
+        self.enqueued.append((name, args, _job_id))
         return None
 
     async def aclose(self):
         return None
+
+    async def set(self, key, value, ex=None):
+        self.heartbeat = (key, value, ex)
+        return True
 
 
 def agent_transport() -> httpx.MockTransport:
@@ -423,6 +573,9 @@ def seed_tables(*, approved=True, with_spec=True):
             }
         ],
         "execution_runs": [],
+        "workflows": [],
+        "comparisons": [],
+        "job_outbox": [],
         "generated_files": [],
         "execution_run_files": [],
         "execution_artifacts": [],
@@ -434,6 +587,11 @@ def env(monkeypatch):
     tables = seed_tables()
     admin = FakeAdmin(tables, {str(PROJECT_ID): str(USER_ID)})
     monkeypatch.setattr(runs, "make_service_client", lambda s: admin)
+
+    async def offline_redis_pool(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr("reproagent_api.main.create_pool", offline_redis_pool)
     settings = ApiSettings(
         supabase_anon_key="anon-test", supabase_service_role_key="service-test", _env_file=None
     )
@@ -473,9 +631,11 @@ def test_start_run_without_approved_plan_conflicts(env):
 
 
 def test_start_run_foreign_user_not_found(env):
-    client, _, _ = env
+    client, admin, _ = env
     response = client.post(f"/v1/experiments/{EXPERIMENT_ID}/runs", headers=BOB_AUTH)
     assert response.status_code == 404
+    assert admin.rpc_calls == []
+    assert admin.tables["job_outbox"] == []
 
 
 def _seed_run(admin, status="succeeded", runner_run_id=None):
@@ -606,6 +766,150 @@ def test_cancel_queued_run_without_runner(env):
     assert admin.tables["execution_runs"][0]["status"] == "cancelled"
 
 
+def test_cancel_dispatching_run_without_runner(env):
+    client, admin, app = env
+    run_id = _seed_run(admin, status="dispatching")
+    expected = execution_request_id(UUID(run_id), 0)
+    cancelled: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        cancelled.append(request.url.path.split("/")[2])
+        return httpx.Response(404, json={"detail": "run not found"})
+
+    app.state.runner_transport = httpx.MockTransport(handler)
+    response = client.post(f"/v1/runs/{run_id}/cancel", headers=AUTH)
+    assert response.status_code == 200
+    assert response.json()["status"] == "cancelled"
+    assert admin.tables["execution_runs"][0]["status"] == "cancelled"
+    assert cancelled == [str(expected)]
+
+
+def test_cancel_rechecks_runner_id_persisted_after_initial_null_read(env, monkeypatch):
+    client, admin, app = env
+    runner_run_id = str(uuid4())
+    run_id = _seed_run(admin, status="running")
+    cancelled: list[str] = []
+    original_get_run = runs._get_run
+    reads = 0
+
+    def racing_get_run(admin, run_id, user_id):
+        nonlocal reads
+        row = original_get_run(admin, run_id, user_id)
+        reads += 1
+        if reads == 2:
+            admin.table("execution_runs").update({"runner_run_id": runner_run_id}).eq(
+                "id", str(run_id)
+            ).execute()
+            row["runner_run_id"] = runner_run_id
+        return row
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        cancelled.append(request.url.path.split("/")[2])
+        result = make_result(RunStatus.CANCELLED, None).model_copy(
+            update={"run_id": UUID(request.url.path.split("/")[2])}
+        )
+        return httpx.Response(200, json=result.model_dump(mode="json"))
+
+    monkeypatch.setattr(runs, "_get_run", racing_get_run)
+    app.state.runner_transport = httpx.MockTransport(handler)
+    response = client.post(f"/v1/runs/{run_id}/cancel", headers=AUTH)
+    assert response.status_code == 200
+    assert response.json()["status"] == "cancelled"
+    assert cancelled == [runner_run_id]
+
+
+def test_cancel_cancels_runner_id_discovered_on_final_read(env, monkeypatch):
+    client, admin, app = env
+    runner_run_id = str(uuid4())
+    run_id = _seed_run(admin, status="running")
+    expected = execution_request_id(UUID(run_id), 0)
+    cancelled: list[str] = []
+    original_get_run = runs._get_run
+    reads = 0
+
+    def racing_get_run(admin, run_id, user_id):
+        nonlocal reads
+        row = original_get_run(admin, run_id, user_id)
+        reads += 1
+        if reads == 3:
+            admin.table("execution_runs").update({"runner_run_id": runner_run_id}).eq(
+                "id", str(run_id)
+            ).execute()
+            row["runner_run_id"] = runner_run_id
+        return row
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        cancelled.append(request.url.path.split("/")[2])
+        result = make_result(RunStatus.CANCELLED, None).model_copy(
+            update={"run_id": UUID(request.url.path.split("/")[2])}
+        )
+        return httpx.Response(200, json=result.model_dump(mode="json"))
+
+    monkeypatch.setattr(runs, "_get_run", racing_get_run)
+    app.state.runner_transport = httpx.MockTransport(handler)
+    response = client.post(f"/v1/runs/{run_id}/cancel", headers=AUTH)
+    assert response.status_code == 200
+    assert response.json()["status"] == "cancelled"
+    assert cancelled == [str(expected), runner_run_id]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("status", "row_attempt", "artifact_attempt"),
+    [("succeeded", 0, 0), ("running", 1, 1)],
+)
+async def test_stale_result_persistence_preserves_protected_artifacts(
+    env, status, row_attempt, artifact_attempt
+):
+    _, admin, _ = env
+    run_id = _seed_run(admin, status=status)
+    admin.tables["execution_runs"][0]["repair_attempt"] = row_attempt
+    protected = {
+        "id": str(uuid4()),
+        "run_id": run_id,
+        "artifact_type": "protected.txt",
+        "storage_path": f"{run_id}/attempt-{artifact_attempt}/artifacts/protected.txt",
+        "metadata_json": {"attempt": artifact_attempt},
+        "created_at": "2026-01-01T00:00:00+00:00",
+    }
+    admin.tables["execution_artifacts"].append(protected)
+
+    class ArtifactRunner:
+        async def get_artifact_bytes(self, runner_run_id, name):
+            return b"stale"
+
+    result = make_result(RunStatus.FAILED, 1, artifacts=["stale.txt"]).model_copy(
+        update={"run_id": UUID(run_id)}
+    )
+    await async_persist_result(admin, run_id, uuid4(), result, ArtifactRunner(), 0)
+
+    assert admin.tables["execution_artifacts"] == [protected]
+    assert admin.tables["execution_runs"][0]["metrics_json"] == {"accuracy": 0.98}
+
+
+def test_cancel_preserves_success_that_completes_during_runner_call(env):
+    client, admin, app = env
+    runner_run_id = str(uuid4())
+    run_id = _seed_run(admin, status="running", runner_run_id=runner_run_id)
+    finished_at = "2026-01-01T00:00:00+00:00"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        admin.table("execution_runs").update(
+            {"status": "succeeded", "finished_at": finished_at, "error": "real result"}
+        ).eq("id", run_id).execute()
+        cancelled = make_result(RunStatus.CANCELLED, None)
+        return httpx.Response(200, json=cancelled.model_dump(mode="json"))
+
+    app.state.runner_transport = httpx.MockTransport(handler)
+    response = client.post(f"/v1/runs/{run_id}/cancel", headers=AUTH)
+    assert response.status_code == 200
+    assert response.json()["status"] == "succeeded"
+    run = admin.tables["execution_runs"][0]
+    assert run["status"] == "succeeded"
+    assert run["finished_at"] == finished_at
+    assert run["error"] == "real result"
+
+
 def test_cancel_runner_failure_returns_502(env):
     client, admin, app = env
     run_id = _seed_run(admin, status="running", runner_run_id=str(uuid4()))
@@ -677,11 +981,18 @@ def test_logs_terminal_uses_storage_even_with_runner_id(env):
 # --- Worker repair loop -----------------------------------------------------
 
 
+@contextmanager
+def _always_acquired(settings, workflow_id):
+    """Keep direct worker calls offline by replacing the Postgres advisory lock."""
+    yield True
+
+
 def run_worker(admin, results, monkeypatch, agent_tr=None):
     settings = ApiSettings(
         supabase_anon_key="anon-test", supabase_service_role_key="service-test", _env_file=None
     )
     monkeypatch.setattr(worker, "make_service_client", lambda s: admin)
+    monkeypatch.setattr(worker, "_drive_lock", _always_acquired)
     run_id = str(uuid4())
     admin.tables["execution_runs"].append(
         {
@@ -807,6 +1118,7 @@ def test_worker_static_validation_failure_repairs_then_fails(monkeypatch):
         supabase_anon_key="anon-test", supabase_service_role_key="service-test", _env_file=None
     )
     monkeypatch.setattr(worker, "make_service_client", lambda s: admin)
+    monkeypatch.setattr(worker, "_drive_lock", _always_acquired)
     run_id = str(uuid4())
     admin.tables["execution_runs"].append(
         {
@@ -1042,6 +1354,8 @@ def test_runs_api_rechecks_approval_and_authority(env, problem):
     response = client.post(f"/v1/experiments/{EXPERIMENT_ID}/runs", headers=AUTH)
     assert response.status_code == 409
     assert admin.tables["execution_runs"] == []
+    assert admin.tables["job_outbox"] == []
+    assert admin.rpc_calls == []
     assert app.state.arq.jobs == []
 
 

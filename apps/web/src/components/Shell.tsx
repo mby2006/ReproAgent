@@ -1,9 +1,10 @@
 "use client";
 
-import Link from "next/link";
+import SiteLink from "@/components/SiteLink";
 import { usePathname, useRouter } from "next/navigation";
 import { useCallback, useEffect, useRef, useState } from "react";
-import { apiFetch } from "@/lib/api";
+import { apiGet } from "@/lib/api";
+import { startVisiblePolling } from "@/lib/polling";
 import { supabase } from "@/lib/supabase";
 import type { WorkflowDetail } from "@/lib/types";
 import { TONE_DOT, WF_META } from "@/lib/ui";
@@ -48,8 +49,8 @@ function SidebarBody({ onNavigate }: { onNavigate?: () => void }) {
     }
     setEmail(data.session.user.email ?? null);
     try {
-      const list = await apiFetch<WorkflowDetail[]>("/v1/workflows");
-      setWorkflows(list.slice(0, 4));
+      const list = await apiGet<WorkflowDetail[]>("/v1/workflows");
+      if (list) setWorkflows(list.slice(0, 4));
     } catch {
       setWorkflows(null);
     }
@@ -57,22 +58,21 @@ function SidebarBody({ onNavigate }: { onNavigate?: () => void }) {
 
   useEffect(() => {
     void loadWorkflows();
-    const timer = setInterval(() => void loadWorkflows(), 8000);
-    return () => clearInterval(timer);
+    return startVisiblePolling(() => loadWorkflows(), 8000);
   }, [loadWorkflows, pathname]);
 
   return (
     <div className="flex h-full flex-col gap-6 overflow-y-auto p-4">
-      <Link href="/" onClick={onNavigate} className="wordmark px-1 pt-1">
+      <SiteLink href="/" onClick={onNavigate} className="wordmark px-1 pt-1">
         <LogoMark />ReproAgent
-      </Link>
+      </SiteLink>
 
       <nav className="space-y-1" aria-label="工作台导航">
         {NAV.map((item) => {
           const active = isActive(pathname, item.href);
           const Icon = item.icon;
           return (
-            <Link
+            <SiteLink
               aria-current={active ? "page" : undefined}
               key={item.href}
               href={item.href}
@@ -81,7 +81,7 @@ function SidebarBody({ onNavigate }: { onNavigate?: () => void }) {
             >
               <Icon className="h-4 w-4 shrink-0" />
               <span className="flex-1">{item.label}</span>
-            </Link>
+            </SiteLink>
           );
         })}
       </nav>
@@ -98,7 +98,7 @@ function SidebarBody({ onNavigate }: { onNavigate?: () => void }) {
               const meta = WF_META[wf.status];
               return (
                 <li key={wf.id}>
-                  <Link
+                  <SiteLink
                     href={`/papers?id=${wf.paper_id}&workflow=${wf.id}`}
                     onClick={onNavigate}
                     className="group flex items-center gap-2.5 rounded-lg border border-transparent px-2 py-1.5 transition hover:border-line hover:bg-ink-800"
@@ -116,7 +116,7 @@ function SidebarBody({ onNavigate }: { onNavigate?: () => void }) {
                         {wf.current_node ? ` · ${wf.current_node}` : ""}
                       </span>
                     </span>
-                  </Link>
+                  </SiteLink>
                 </li>
               );
             })}
@@ -142,9 +142,9 @@ function SidebarBody({ onNavigate }: { onNavigate?: () => void }) {
             </button>
           </div>
         ) : (
-          <Link href="/login" onClick={onNavigate} className="btn btn-ghost btn-sm w-full">
+          <SiteLink href="/login" onClick={onNavigate} className="btn btn-ghost btn-sm w-full">
             登录 / 注册
-          </Link>
+          </SiteLink>
         )}
       </div>
     </div>
@@ -185,7 +185,7 @@ export default function Shell({ children }: { children: React.ReactNode }) {
         >
           <IconMenu className="h-4 w-4" />
         </button>
-        <Link href="/" className="wordmark"><LogoMark />ReproAgent</Link>
+        <SiteLink href="/" className="wordmark"><LogoMark />ReproAgent</SiteLink>
       </header>
 
       <dialog ref={drawer} id="workspace-navigation" className="workspace-drawer" aria-label="工作台导航"

@@ -11,9 +11,17 @@ from fastapi.testclient import TestClient
 from httpx import ASGITransport
 from reproagent_runner.config import RunnerSettings
 from reproagent_runner.main import create_app
-from reproagent_runner.registry import RunRegistry
+from reproagent_runner.registry import RunRecord, RunRegistry
 from reproagent_runner.sandbox import Sandbox, _host_config
-from reproagent_schemas import CodeFile, ErrorCategory, ResourceBudget, RunRequest, RunStatus
+from reproagent_schemas import (
+    CodeFile,
+    ErrorCategory,
+    ResourceBudget,
+    RunRequest,
+    RunResult,
+    RunStatus,
+    request_fingerprint,
+)
 from requests.exceptions import ConnectionError as RequestsConnectionError
 
 METRICS = {
@@ -40,6 +48,10 @@ def make_request(**overrides) -> RunRequest:
     )
     base.update(overrides)
     return RunRequest(**base)
+
+
+def make_runner_result(run_id, status):
+    return RunResult(run_id=run_id, status=status)
 
 
 class FakeImage:
@@ -107,16 +119,36 @@ class FakeContainer:
         return self._behavior.get("stderr", b"")
 
 
+def labels_match(labels, filters):
+    for key, values in (filters or {}).items():
+        expected = values if isinstance(values, list) else [values]
+        for value in expected:
+            if key == "label":
+                name, _, wanted = value.partition("=")
+                if labels.get(name) != wanted:
+                    return False
+            elif labels.get(key) not in expected:
+                return False
+    return True
+
+
 class FakeContainers:
     def __init__(self, behavior):
         self._behavior = behavior
         self.last = None
+        self.created = []
+        self.created_count = 0
 
     def create(self, image, command=None, detach=False, **host_config):
+        self.created_count += 1
         self.last = FakeContainer(host_config, self._behavior)
+        self.last.labels = host_config.get("labels", {})
+        self.created.append(self.last)
         return self.last
 
     def get(self, container_id):
+        if container_id not in {container.id for container in self.created}:
+            raise RuntimeError("container not found")
         return self.last
 
 
@@ -130,6 +162,30 @@ class FakeDockerClient:
 @pytest.fixture
 def settings(tmp_path):
     return RunnerSettings(work_dir=tmp_path, _env_file=None)
+
+
+@pytest.mark.parametrize("label_kind", ["missing", "other_owner", "other_run"])
+def test_journal_cleanup_refuses_unrelated_container_labels(settings, label_kind):
+    docker = FakeDockerClient()
+    registry = RunRegistry(settings, client=docker)
+    request = make_request()
+    labels = {}
+    if label_kind != "missing":
+        labels = {
+            "reproagent.managed": "true",
+            "reproagent.owner": (
+                "another-runner" if label_kind == "other_owner" else registry._owner_id
+            ),
+            "reproagent.request_id": (
+                str(uuid4()) if label_kind == "other_run" else str(request.request_id)
+            ),
+        }
+    container = docker.containers.create("image", labels=labels)
+
+    registry._remove_container(container.id, request.request_id)
+
+    assert not container.killed
+    assert not container.removed
 
 
 def test_image_status_reports_digest_and_dataset(settings):
@@ -162,6 +218,9 @@ def test_health(settings):
     assert body["service"] == "runner"
     assert body["status"] == "ok"
     assert "torch_available" in body["details"]
+    assert body["details"]["queued"] == 0
+    assert body["details"]["running"] == 0
+    assert body["details"]["concurrency_limit"] >= 1
 
 
 def test_settings_have_no_secret_fields():
@@ -212,6 +271,21 @@ class TestSandboxLockdown:
         client = FakeDockerClient()
         run_dir = tmp_path / str(uuid4())
         Sandbox(client, settings).execute(make_request(), run_dir, asyncio.Event())
+        assert client.containers.last.removed is True
+
+    def test_journal_callback_failure_removes_created_container(self, settings, tmp_path):
+        client = FakeDockerClient()
+        run_dir = tmp_path / str(uuid4())
+
+        def fail_journal(container_id):
+            raise OSError("journal unavailable")
+
+        with pytest.raises(OSError, match="journal unavailable"):
+            Sandbox(client, settings).execute(
+                make_request(), run_dir, asyncio.Event(), on_container=fail_journal
+            )
+
+        assert client.containers.last.started is False
         assert client.containers.last.removed is True
 
     def test_timeout_kills_container(self, settings, tmp_path):
@@ -362,6 +436,332 @@ class TestRunsAPI:
             finally:
                 gate.set()
 
+    async def test_duplicate_request_is_deduplicated_before_concurrency_limit(self, settings):
+        settings.max_concurrent_runs = 1
+        gate = threading.Event()
+        docker = FakeDockerClient(wait_gate=gate)
+        request = make_request()
+        async with await self._client(settings, docker) as ac:
+            first = await ac.post("/runs", json=request.model_dump(mode="json"))
+            assert first.status_code == 202
+            run_id = first.json()["run_id"]
+            try:
+                for _ in range(200):
+                    if (await ac.get(f"/runs/{run_id}")).json()["status"] == "running":
+                        break
+                    await asyncio.sleep(0.01)
+                duplicate = await ac.post("/runs", json=request.model_dump(mode="json"))
+                assert duplicate.status_code == 202
+                assert duplicate.json()["run_id"] == run_id
+            finally:
+                gate.set()
+            for _ in range(200):
+                if (await ac.get(f"/runs/{run_id}")).json()["status"] == "succeeded":
+                    break
+                await asyncio.sleep(0.01)
+        assert docker.containers.created_count == 1
+
+    async def test_conflicting_duplicate_request_returns_409_without_container(self, settings):
+        docker = FakeDockerClient()
+        request = make_request()
+        async with await self._client(settings, docker) as ac:
+            first = await ac.post("/runs", json=request.model_dump(mode="json"))
+            assert first.status_code == 202
+            conflict = request.model_dump(mode="json")
+            conflict["seed"] += 1
+            response = await ac.post("/runs", json=conflict)
+            assert response.status_code == 409
+            for _ in range(200):
+                status = (await ac.get(f"/runs/{first.json()['run_id']}")).json()["status"]
+                if status == "succeeded":
+                    break
+                await asyncio.sleep(0.01)
+        assert docker.containers.created_count == 1
+
+    async def test_restart_fails_active_record_and_duplicate_does_not_retrain(
+        self, settings, monkeypatch
+    ):
+        from contextlib import suppress
+
+        from reproagent_runner import registry as registry_module
+
+        ready = threading.Event()
+        release = threading.Event()
+
+        class BlockingSandbox:
+            def __init__(self, client, *args, **kwargs):
+                self._client = client
+
+            def execute(self, request, run_dir, cancel_event, on_container=None):
+                container = self._client.containers.create(
+                    "reproagent-exec:latest",
+                    labels={
+                        "reproagent.managed": "true",
+                        "reproagent.owner": first._owner_id,
+                        "reproagent.request_id": str(request.request_id),
+                    },
+                )
+                container.id = "owned-container"
+                if on_container is not None:
+                    on_container(container.id)
+                ready.set()
+                release.wait(timeout=10)
+                return make_runner_result(request.request_id, RunStatus.SUCCEEDED)
+
+        class RecoveryContainers(FakeContainers):
+            def create(self, image, command=None, detach=False, **host_config):
+                container = super().create(image, command, detach, **host_config)
+                container.id = "owned-container"
+                return container
+
+            def list(self, all=False, filters=None):
+                return [
+                    container for container in self.created
+                    if labels_match(container.labels, filters)
+                ]
+
+        monkeypatch.setattr(registry_module, "Sandbox", BlockingSandbox)
+        docker = FakeDockerClient()
+        docker.containers = RecoveryContainers(docker.behavior)
+        request = make_request()
+        first = RunRegistry(settings, client=docker)
+        accepted = first.start(request)
+        for _ in range(200):
+            if ready.is_set():
+                break
+            await asyncio.sleep(0.01)
+        assert ready.is_set()
+        first._runs[accepted.run_id].task.cancel()
+        with suppress(asyncio.CancelledError):
+            await first._runs[accepted.run_id].task
+        release.set()
+
+        recovered = RunRegistry(settings, client=docker)
+        result = recovered.get(accepted.run_id)
+        assert result.status is RunStatus.FAILED
+        assert "restart" in result.error.lower()
+        assert docker.containers.last.killed is True
+        assert docker.containers.last.removed is True
+        duplicate = recovered.start(request)
+        assert duplicate.run_id == accepted.run_id
+        assert duplicate.status is RunStatus.FAILED
+        assert docker.containers.created_count == 1
+
+    async def test_restart_preserves_cancellation_won_during_execution(self, settings, monkeypatch):
+        from contextlib import suppress
+
+        from reproagent_runner import registry as registry_module
+
+        ready = threading.Event()
+        release = threading.Event()
+
+        class BlockingSandbox:
+            def __init__(self, client, *args, **kwargs):
+                self._client = client
+
+            def execute(self, request, run_dir, cancel_event, on_container=None):
+                container = self._client.containers.create(
+                    "reproagent-exec:latest",
+                    labels={
+                        "reproagent.managed": "true",
+                        "reproagent.owner": first._owner_id,
+                        "reproagent.request_id": str(request.request_id),
+                    },
+                )
+                container.id = "cancel-window-container"
+                if on_container is not None:
+                    on_container(container.id)
+                ready.set()
+                release.wait(timeout=10)
+                return make_runner_result(request.request_id, RunStatus.SUCCEEDED)
+
+        class RecoveryContainers(FakeContainers):
+            def create(self, image, command=None, detach=False, **host_config):
+                container = super().create(image, command, detach, **host_config)
+                container.id = "cancel-window-container"
+                return container
+
+            def list(self, all=False, filters=None):
+                return [
+                    container
+                    for container in self.created
+                    if labels_match(container.labels, filters)
+                ]
+
+        monkeypatch.setattr(registry_module, "Sandbox", BlockingSandbox)
+        docker = FakeDockerClient()
+        docker.containers = RecoveryContainers(docker.behavior)
+        request = make_request()
+        first = RunRegistry(settings, client=docker)
+        accepted = first.start(request)
+        for _ in range(200):
+            if ready.is_set():
+                break
+            await asyncio.sleep(0.01)
+        assert ready.is_set()
+
+        cancel_response = first.cancel(accepted.run_id)
+        first._runs[accepted.run_id].task.cancel()
+        with suppress(asyncio.CancelledError):
+            await first._runs[accepted.run_id].task
+        release.set()
+
+        recovered = RunRegistry(settings, client=docker)
+        result = recovered.get(accepted.run_id)
+        assert cancel_response.status is RunStatus.CANCELLED
+        assert result.status is RunStatus.CANCELLED
+        assert docker.containers.last.killed is True
+        assert docker.containers.last.removed is True
+        duplicate = recovered.start(request)
+        assert duplicate.run_id == accepted.run_id
+        assert duplicate.status is RunStatus.CANCELLED
+        assert docker.containers.created_count == 1
+
+    async def test_restart_removes_owned_orphan_but_not_unrelated_container(self, settings):
+        class OrphanContainers(FakeContainers):
+            def __init__(self, owner):
+                super().__init__({})
+                self.owned = FakeContainer({}, {})
+                self.owned.id = "orphan"
+                self.owned.labels = {
+                    "reproagent.managed": "true",
+                    "reproagent.owner": owner,
+                }
+                self.unrelated = FakeContainer({}, {})
+                self.unrelated.id = "unrelated"
+                self.unrelated.labels = {"application": "something-else"}
+
+            def list(self, all=False, filters=None):
+                return [
+                    container for container in (self.owned, self.unrelated)
+                    if labels_match(container.labels, filters)
+                ]
+
+            def get(self, container_id):
+                if container_id == self.owned.id:
+                    return self.owned
+                raise RuntimeError("container not found")
+
+        docker = FakeDockerClient()
+        owner_file = settings.work_dir / "runner-owner"
+        settings.work_dir.mkdir(parents=True, exist_ok=True)
+        owner_file.write_text("stable-owner", encoding="utf-8")
+        containers = OrphanContainers(owner_file.read_text(encoding="utf-8"))
+        docker.containers = containers
+
+        RunRegistry(settings, client=docker)
+
+        assert containers.owned.killed is True
+        assert containers.owned.removed is True
+        assert containers.unrelated.killed is False
+        assert containers.unrelated.removed is False
+
+    async def test_completed_result_survives_restart_and_ttl_reap(self, settings):
+        docker = FakeDockerClient()
+        request = make_request()
+        first = RunRegistry(settings, client=docker)
+        accepted = first.start(request)
+        for _ in range(200):
+            if first.get(accepted.run_id).status is RunStatus.SUCCEEDED:
+                break
+            await asyncio.sleep(0.01)
+        expected = first.get(accepted.run_id)
+
+        recovered = RunRegistry(settings, client=docker)
+        assert recovered.get(accepted.run_id) == expected
+        assert recovered.start(request).run_id == accepted.run_id
+        recovered._runs[accepted.run_id].finished_at = time.time() - settings.run_ttl_seconds - 1
+        recovered.reap_expired()
+        assert accepted.run_id not in recovered._runs
+        assert not (settings.work_dir / str(accepted.run_id)).exists()
+        assert not (settings.work_dir / ".journal" / f"{accepted.run_id}.json").exists()
+
+    async def test_corrupt_journal_does_not_block_valid_recovery(self, settings, caplog):
+        docker = FakeDockerClient()
+        request = make_request()
+        first = RunRegistry(settings, client=docker)
+        accepted = first.start(request)
+        for _ in range(200):
+            if first.get(accepted.run_id).status is RunStatus.SUCCEEDED:
+                break
+            await asyncio.sleep(0.01)
+        journal_dir = settings.work_dir / ".journal"
+        (journal_dir / "corrupt.json").write_text("{not-json", encoding="utf-8")
+
+        recovered = RunRegistry(settings, client=docker)
+
+        assert recovered.get(accepted.run_id).status is RunStatus.SUCCEEDED
+        assert "journal" in caplog.text.lower()
+
+    @pytest.mark.parametrize(
+        "corruption",
+        [
+            "bad_timestamp",
+            "terminal_without_result",
+            "result_status_mismatch",
+            "active_with_result",
+        ],
+    )
+    def test_structurally_corrupt_journal_is_isolated(self, settings, caplog, corruption):
+        docker = FakeDockerClient()
+        registry = RunRegistry(settings, client=docker)
+        valid_request = make_request()
+        valid_result = make_runner_result(valid_request.request_id, RunStatus.SUCCEEDED)
+        valid = RunRecord(
+            request=valid_request,
+            run_id=valid_request.request_id,
+            run_dir=settings.work_dir / str(valid_request.request_id),
+            status=RunStatus.SUCCEEDED,
+            result=valid_result,
+            finished_at=time.time(),
+            fingerprint=request_fingerprint(valid_request),
+        )
+        registry._write_record(valid)
+        corrupt_request = make_request()
+        corrupt = RunRecord(
+            request=corrupt_request,
+            run_id=corrupt_request.request_id,
+            run_dir=settings.work_dir / str(corrupt_request.request_id),
+            status=RunStatus.RUNNING,
+            fingerprint=request_fingerprint(corrupt_request),
+        )
+        registry._write_record(corrupt)
+        path = registry._journal_path(corrupt_request.request_id)
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if corruption == "bad_timestamp":
+            payload.update(
+                status="succeeded",
+                result=make_runner_result(
+                    corrupt_request.request_id, RunStatus.SUCCEEDED
+                ).model_dump(mode="json"),
+                finished_at="bad",
+            )
+        elif corruption == "terminal_without_result":
+            payload.update(status="succeeded", result=None, finished_at=time.time())
+        elif corruption == "result_status_mismatch":
+            payload.update(
+                status="succeeded",
+                result=make_runner_result(
+                    corrupt_request.request_id, RunStatus.FAILED
+                ).model_dump(mode="json"),
+                finished_at=time.time(),
+            )
+        else:
+            payload.update(
+                status="running",
+                result=make_runner_result(
+                    corrupt_request.request_id, RunStatus.SUCCEEDED
+                ).model_dump(mode="json"),
+                finished_at=time.time(),
+            )
+        path.write_text(json.dumps(payload), encoding="utf-8")
+
+        recovered = RunRegistry(settings, client=docker)
+
+        assert recovered.get(valid_request.request_id) == valid_result
+        assert corrupt_request.request_id not in recovered._runs
+        assert "journal" in caplog.text.lower()
+
     async def test_reap_expired_evicts_and_cleans(self, settings):
         registry = RunRegistry(settings, client=FakeDockerClient())
         accepted = registry.start(make_request())
@@ -371,7 +771,7 @@ class TestRunsAPI:
             await asyncio.sleep(0.01)
         record = registry._runs[accepted.run_id]
         assert record.run_dir.exists()
-        record.finished_at = time.monotonic() - settings.run_ttl_seconds - 1
+        record.finished_at = time.time() - settings.run_ttl_seconds - 1
         registry.reap_expired()
         assert accepted.run_id not in registry._runs
         assert not record.run_dir.exists()

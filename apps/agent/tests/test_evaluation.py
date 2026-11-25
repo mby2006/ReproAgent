@@ -877,7 +877,9 @@ def test_approved_loss_drives_verdict_summary_and_units(actual, expected):
     ))
     plan = make_plan(card)
     plan.evaluation_config.target_metric = "test loss"
-    metrics = full_metrics(plan) | {"target_metric": "test_loss", "test_loss": actual, "accuracy": 0.1}
+    metrics = full_metrics(plan) | {
+        "target_metric": "test_loss", "test_loss": actual, "accuracy": 0.1
+    }
     response = evaluate_run(make_request(card=card, plan=plan, metrics=metrics))
     assert response.report.final_status is expected
     assert response.report.target_metric == "test_loss"

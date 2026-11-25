@@ -1,3 +1,4 @@
+import asyncio
 import hashlib
 import hmac
 import ipaddress
@@ -8,8 +9,10 @@ from typing import Annotated
 from urllib.parse import urlparse
 from uuid import UUID, uuid4
 
+import anyio
 import httpx
 import psycopg
+from anyio import connect_tcp
 from fastapi import (
     APIRouter,
     Depends,
@@ -21,9 +24,12 @@ from fastapi import (
     UploadFile,
     status,
 )
+from httpcore import AsyncNetworkBackend, ConnectError, ConnectTimeout
+from httpcore._backends.anyio import AnyIOStream
 from psycopg import sql
 from psycopg.rows import dict_row
 from reproagent_schemas import (
+    MAX_PDF_BYTES,
     CardConfirmBatchRequest,
     CardEditRequest,
     CardExplainRequest,
@@ -52,7 +58,8 @@ from ..services.review import generate_review
 
 router = APIRouter(prefix="/v1", tags=["papers"])
 
-MAX_PDF_BYTES = 50 * 1024 * 1024
+PDF_DOWNLOAD_TIMEOUT_SECONDS = 30
+UPLOAD_READ_CHUNK_BYTES = 64 * 1024
 VERSION_COLUMNS = "id,paper_id,version,origin,parent_version_id,spec_json,status,created_at"
 
 
@@ -195,26 +202,72 @@ def _create_workflow(admin, project_id: str, paper_id: UUID) -> UUID:
 
 
 def _normalize_paper_url(url: str) -> str:
-    parsed = urlparse(url)
+    try:
+        parsed = urlparse(url)
+        port = parsed.port
+    except ValueError as exc:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Invalid URL") from exc
     if parsed.scheme not in ("http", "https") or not parsed.hostname:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "URL must be http(s)")
+    if parsed.username is not None or parsed.password is not None:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "URL credentials are not allowed")
+    expected_port = 80 if parsed.scheme == "http" else 443
+    if port not in (None, expected_port):
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY, "URL port must be 80 or 443"
+        )
     if parsed.hostname in ("arxiv.org", "www.arxiv.org") and parsed.path.startswith("/abs/"):
         return f"https://arxiv.org/pdf/{parsed.path[len('/abs/') :]}"
     return url
 
 
-def _assert_public_host(hostname: str) -> None:
+def _resolve_public_addresses(hostname: str, port: int) -> list[str]:
     try:
-        infos = socket.getaddrinfo(hostname, None)
-    except socket.gaierror as exc:
+        infos = socket.getaddrinfo(hostname, port, type=socket.SOCK_STREAM)
+    except OSError as exc:
         raise HTTPException(
             status.HTTP_422_UNPROCESSABLE_ENTITY, "Cannot resolve URL host"
         ) from exc
+    addresses: list[str] = []
     for info in infos:
-        if not ipaddress.ip_address(info[4][0]).is_global:
+        try:
+            address = ipaddress.ip_address(info[4][0])
+        except ValueError as exc:
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_ENTITY, "URL host returned an invalid address"
+            ) from exc
+        if not address.is_global:
             raise HTTPException(
                 status.HTTP_422_UNPROCESSABLE_ENTITY, "URL host is not a public address"
             )
+        if str(address) not in addresses:
+            addresses.append(str(address))
+    if not addresses:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Cannot resolve URL host")
+    return addresses
+
+
+def _assert_public_host(hostname: str) -> None:
+    _resolve_public_addresses(hostname, 443)
+
+
+class _PinnedNetworkBackend(AsyncNetworkBackend):
+    async def connect_tcp(
+        self, host, port, timeout=None, local_address=None, socket_options=None
+    ):
+        addresses = await asyncio.to_thread(_resolve_public_addresses, host, port)
+        try:
+            with anyio.fail_after(timeout):
+                stream = await connect_tcp(
+                    addresses[0], port, local_host=local_address
+                )
+                for option in socket_options or ():
+                    stream._raw_socket.setsockopt(*option)
+        except TimeoutError as exc:
+            raise ConnectTimeout(exc) from exc
+        except (OSError, anyio.BrokenResourceError) as exc:
+            raise ConnectError(exc) from exc
+        return AnyIOStream(stream)
 
 
 async def _download_pdf(url: str) -> bytes:
@@ -229,43 +282,86 @@ async def _download_pdf(url: str) -> bytes:
 async def _fetch_pdf(url: str) -> bytes:
     current = _normalize_paper_url(url)
     chunks: list[bytes] = []
-    async with httpx.AsyncClient(timeout=30, follow_redirects=False, trust_env=False) as client:
-        for _ in range(6):
-            parsed = urlparse(current)
-            if parsed.scheme not in ("http", "https") or not parsed.hostname:
-                raise HTTPException(
-                    status.HTTP_422_UNPROCESSABLE_ENTITY, "Redirect target must be http(s)"
-                )
-            # re-check every hop: a redirect must not land on a private address
-            _assert_public_host(parsed.hostname)
-            async with client.stream("GET", current) as response:
-                if response.status_code in (301, 302, 303, 307, 308):
-                    location = response.headers.get("location")
-                    if not location:
-                        raise HTTPException(
-                            status.HTTP_422_UNPROCESSABLE_ENTITY, "Redirect without location"
-                        )
-                    current = str(httpx.URL(current).join(location))
-                    continue
-                if response.status_code != 200:
+    transport = httpx.AsyncHTTPTransport(trust_env=False)
+    # HTTPX does not expose network-backend injection; replacing this pool backend
+    # makes the validated DNS result the actual peer instead of resolving twice.
+    transport._pool._network_backend = _PinnedNetworkBackend()
+    try:
+        async with asyncio.timeout(PDF_DOWNLOAD_TIMEOUT_SECONDS):
+            async with httpx.AsyncClient(
+                transport=transport,
+                timeout=httpx.Timeout(30, connect=10),
+                follow_redirects=False,
+                trust_env=False,
+            ) as client:
+                for _ in range(6):
+                    current = _normalize_paper_url(current)
+                    async with client.stream("GET", current) as response:
+                        if response.status_code in (301, 302, 303, 307, 308):
+                            location = response.headers.get("location")
+                            if not location:
+                                raise HTTPException(
+                                    status.HTTP_422_UNPROCESSABLE_ENTITY,
+                                    "Redirect without location",
+                                )
+                            current = str(httpx.URL(current).join(location))
+                            continue
+                        if response.status_code != 200:
+                            raise HTTPException(
+                                status.HTTP_422_UNPROCESSABLE_ENTITY,
+                                f"URL returned HTTP {response.status_code}",
+                            )
+                        declared_size = response.headers.get("content-length")
+                        if declared_size is not None:
+                            try:
+                                if int(declared_size) > MAX_PDF_BYTES:
+                                    raise HTTPException(
+                                        status.HTTP_413_CONTENT_TOO_LARGE, "PDF exceeds 50 MB"
+                                    )
+                            except ValueError as exc:
+                                raise HTTPException(
+                                    status.HTTP_422_UNPROCESSABLE_ENTITY,
+                                    "Invalid Content-Length",
+                                ) from exc
+                        size = 0
+                        async for chunk in response.aiter_bytes():
+                            size += len(chunk)
+                            if size > MAX_PDF_BYTES:
+                                raise HTTPException(
+                                    status.HTTP_413_CONTENT_TOO_LARGE, "PDF exceeds 50 MB"
+                                )
+                            chunks.append(chunk)
+                    break
+                else:
                     raise HTTPException(
-                        status.HTTP_422_UNPROCESSABLE_ENTITY,
-                        f"URL returned HTTP {response.status_code}",
+                        status.HTTP_422_UNPROCESSABLE_ENTITY, "Too many redirects"
                     )
-                size = 0
-                async for chunk in response.aiter_bytes():
-                    size += len(chunk)
-                    if size > MAX_PDF_BYTES:
-                        raise HTTPException(
-                            status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, "PDF exceeds 50 MB"
-                        )
-                    chunks.append(chunk)
-            break
-        else:
-            raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Too many redirects")
+    except TimeoutError as exc:
+        raise HTTPException(
+            status.HTTP_408_REQUEST_TIMEOUT, "PDF download exceeded 30 seconds"
+        ) from exc
+    finally:
+        await transport.aclose()
     data = b"".join(chunks)
     if not data.startswith(b"%PDF"):
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "URL did not return a PDF")
+    return data
+
+
+async def _read_pdf_upload(file: UploadFile) -> bytes:
+    chunks: list[bytes] = []
+    size = 0
+    try:
+        while chunk := await file.read(UPLOAD_READ_CHUNK_BYTES):
+            size += len(chunk)
+            if size > MAX_PDF_BYTES:
+                raise HTTPException(status.HTTP_413_CONTENT_TOO_LARGE, "PDF exceeds 50 MB")
+            chunks.append(chunk)
+    finally:
+        await file.close()
+    data = b"".join(chunks)
+    if not data.startswith(b"%PDF"):
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "File is not a PDF")
     return data
 
 
@@ -279,11 +375,7 @@ async def upload_paper(
 ) -> PaperUploadResponse:
     source_url: str | None = None
     if file is not None:
-        pdf_bytes = await file.read()
-        if len(pdf_bytes) == 0 or not pdf_bytes.startswith(b"%PDF"):
-            raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "File is not a PDF")
-        if len(pdf_bytes) > MAX_PDF_BYTES:
-            raise HTTPException(status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, "PDF exceeds 50 MB")
+        pdf_bytes = await _read_pdf_upload(file)
         if not title.strip():
             raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Title is required")
         source = PaperSource.UPLOAD

@@ -6,6 +6,10 @@ from pydantic import Field, HttpUrl, model_validator
 
 from .common import SchemaModel, utcnow
 
+MAX_PDF_BYTES = 50 * 1024 * 1024
+MAX_PDF_PAGES = 200
+MAX_PDF_BASE64_LENGTH = 4 * ((MAX_PDF_BYTES + 2) // 3)
+
 
 class PaperSource(StrEnum):
     UPLOAD = "upload"

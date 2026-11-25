@@ -9,7 +9,7 @@ silently editing training targets in code.
 """
 
 from datetime import UTC, datetime
-from uuid import UUID
+from uuid import NAMESPACE_URL, UUID, uuid5
 
 from reproagent_schemas import (
     Assumption,
@@ -25,8 +25,10 @@ from reproagent_schemas import (
     ResourceBudget,
     ReviewMode,
     RiskTier,
+    RunAudit,
     RunRequest,
     RunResult,
+    RunStatus,
 )
 
 from .versions import insert_versioned
@@ -146,6 +148,10 @@ def pin_run_files(admin, run_id: str, file_ids: list[str]) -> None:
     ).execute()
 
 
+def execution_request_id(run_id: UUID, repair_attempt: int) -> UUID:
+    return uuid5(NAMESPACE_URL, f"reproagent:execution:{run_id}:attempt:{repair_attempt}")
+
+
 def build_run_request(
     experiment_id: UUID,
     plan_id: UUID,
@@ -153,9 +159,12 @@ def build_run_request(
     plan: ExperimentPlan,
     code_version: int,
     plan_version: int,
+    run_id: UUID,
+    repair_attempt: int,
 ) -> RunRequest:
     budget = ResourceBudget(max_seconds=min(plan.runtime_budget.max_seconds, 600))
     return RunRequest(
+        request_id=execution_request_id(run_id, repair_attempt),
         experiment_id=experiment_id,
         experiment_plan_id=plan_id,
         code_files=bundle.files,
@@ -166,6 +175,140 @@ def build_run_request(
         code_version=code_version,
         plan_version=plan_version,
         metrics_filename="metrics.json",
+    )
+
+
+def load_run_row(admin, run_id: str) -> dict | None:
+    rows = admin.table("execution_runs").select("*").eq("id", run_id).execute().data
+    return rows[0] if rows else None
+
+
+def mark_attempt_running(
+    admin,
+    run_row: dict,
+    *,
+    attempt: int,
+    code_version: int,
+    code_hash: str,
+    plan_id: str,
+    plan_version: int,
+    request_json: dict | None = None,
+) -> dict | None:
+    """Atomically open one attempt without reviving protected terminal states.
+
+    Recovery may continue the same running attempt. Only a strictly newer repair
+    attempt may deliberately reopen a failed/timeout row.
+    """
+    previous_attempt = run_row.get("repair_attempt", 0)
+    status = run_row.get("status")
+    if status in (RunStatus.CANCELLED.value, RunStatus.SUCCEEDED.value):
+        return None
+    if status in (RunStatus.FAILED.value, RunStatus.TIMEOUT.value):
+        if attempt != previous_attempt + 1:
+            return None
+        allowed = [RunStatus.FAILED.value, RunStatus.TIMEOUT.value]
+    else:
+        if attempt == previous_attempt:
+            allowed = [RunStatus.QUEUED.value, RunStatus.DISPATCHING.value, RunStatus.RUNNING.value]
+        elif (
+            attempt == previous_attempt + 1
+            and status in (RunStatus.QUEUED.value, RunStatus.DISPATCHING.value)
+            and not run_row.get("runner_run_id")
+            and not run_row.get("started_at")
+            and not run_row.get("finished_at")
+            and int(run_row.get("code_version") or 0) <= 0
+        ):
+            # Static validation can repair before the first Runner dispatch. A
+            # positive code version or any execution marker means an actual
+            # attempt already owned this row and must not be skipped/stolen.
+            allowed = [RunStatus.QUEUED.value, RunStatus.DISPATCHING.value]
+        else:
+            return None
+    now = datetime.now(UTC).isoformat()
+    payload = {
+        "status": RunStatus.RUNNING.value,
+        "repair_attempt": attempt,
+        "code_version": code_version,
+        "code_hash": code_hash,
+        "plan_id": plan_id,
+        "plan_version": plan_version,
+        "started_at": run_row.get("started_at") or now,
+        "updated_at": now,
+    }
+    if request_json is not None:
+        payload["request_json"] = request_json
+    if status in (RunStatus.FAILED.value, RunStatus.TIMEOUT.value):
+        # A deliberate repair is a new Runner request identity, not a reattach
+        # to the preceding attempt's already-terminal container.
+        payload["runner_run_id"] = None
+        payload["started_at"] = now
+        payload["finished_at"] = None
+    rows = (
+        admin.table("execution_runs")
+        .update(payload)
+        .eq("id", run_row["id"])
+        .eq("repair_attempt", previous_attempt)
+        .in_("status", allowed)
+        .execute()
+        .data
+    )
+    return rows[0] if rows else None
+
+
+def persist_runner_run_id(admin, run_id: str, runner_run_id: UUID, attempt: int) -> bool:
+    rows = (
+        admin.table("execution_runs")
+        .update({"runner_run_id": str(runner_run_id), "updated_at": datetime.now(UTC).isoformat()})
+        .eq("id", run_id)
+        .eq("repair_attempt", attempt)
+        .neq("status", RunStatus.CANCELLED.value)
+        .neq("status", RunStatus.SUCCEEDED.value)
+        .execute()
+        .data
+    )
+    return bool(rows)
+
+
+def finalize_execution_run(
+    admin,
+    run_id: str,
+    status: RunStatus,
+    error: str | None,
+    *,
+    attempt: int | None = None,
+    require_latest: bool = False,
+) -> bool:
+    params = {
+        "p_run_id": run_id,
+        "p_status": status.value,
+        "p_error": redact_error(error),
+    }
+    if attempt is not None:
+        params["p_repair_attempt"] = attempt
+        params["p_require_latest"] = require_latest
+    return bool(admin.rpc("reconcile_execution_run", params))
+
+
+def redact_error(error: str | None) -> str | None:
+    if error is None:
+        return None
+    from ..workflow.harness import redact
+
+    return redact(error)
+
+
+def terminal_result_from_row(row: dict) -> RunResult:
+    status = RunStatus(row["status"])
+    runtime = row.get("runtime_json") or {}
+    return RunResult(
+        run_id=UUID(row["id"]),
+        status=status,
+        exit_code=row.get("exit_code"),
+        metrics=row.get("metrics_json") or {},
+        execution_time=runtime.get("execution_time"),
+        error=row.get("error"),
+        error_category=row.get("error_category"),
+        audit=RunAudit.model_validate(row["audit_json"]) if row.get("audit_json") else None,
     )
 
 
@@ -185,6 +328,24 @@ def _upload(admin, path: str, data: bytes) -> None:
 async def async_persist_result(
     admin, run_id: str, runner_run_id: UUID, result: RunResult, runner, attempt: int
 ) -> None:
+    # Claim the exact nonterminal attempt before touching storage or artifact
+    # rows. A stale attempt, cancellation, or concurrent success must not delete
+    # the current attempt's protected output.
+    claimed = (
+        admin.table("execution_runs")
+        .update({"updated_at": datetime.now(UTC).isoformat()})
+        .eq("id", run_id)
+        .eq("repair_attempt", attempt)
+        .in_(
+            "status",
+            [RunStatus.QUEUED.value, RunStatus.DISPATCHING.value, RunStatus.RUNNING.value],
+        )
+        .execute()
+        .data
+    )
+    if not claimed or claimed[0].get("repair_attempt", attempt) != attempt:
+        return
+
     _ensure_bucket(admin)
     prefix = f"{run_id}/attempt-{attempt}"
     stdout_path = f"{prefix}/stdout.txt"
@@ -192,7 +353,25 @@ async def async_persist_result(
     _upload(admin, stdout_path, result.stdout.encode("utf-8"))
     _upload(admin, stderr_path, result.stderr.encode("utf-8"))
 
-    admin.table("execution_artifacts").delete().eq("run_id", run_id).execute()
+    existing = (
+        admin.table("execution_artifacts")
+        .select("id,metadata_json,storage_path")
+        .eq("run_id", run_id)
+        .execute()
+        .data
+    )
+    artifact_prefix = f"{prefix}/artifacts/"
+    replace_ids = [
+        row["id"]
+        for row in existing
+        if str((row.get("metadata_json") or {}).get("attempt")) == str(attempt)
+        or (
+            (row.get("metadata_json") or {}).get("attempt") is None
+            and str(row.get("storage_path") or "").startswith(artifact_prefix)
+        )
+    ]
+    if replace_ids:
+        admin.table("execution_artifacts").delete().in_("id", replace_ids).execute()
     artifact_rows = []
     for name in result.artifacts:
         try:
@@ -229,7 +408,15 @@ async def async_persist_result(
         update["error_category"] = result.error_category.value
     if result.error is not None:
         update["error"] = result.error
-    admin.table("execution_runs").update(update).eq("id", run_id).execute()
+    (
+        admin.table("execution_runs")
+        .update(update)
+        .eq("id", run_id)
+        .eq("repair_attempt", attempt)
+        .neq("status", RunStatus.CANCELLED.value)
+        .neq("status", RunStatus.SUCCEEDED.value)
+        .execute()
+    )
 
 
 def create_oom_plan(

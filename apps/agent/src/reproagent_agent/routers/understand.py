@@ -5,6 +5,8 @@ import binascii
 from fastapi import APIRouter, HTTPException, Request, status
 from reproagent_paperparse import parse_pdf
 from reproagent_schemas import (
+    MAX_PDF_BASE64_LENGTH,
+    MAX_PDF_BYTES,
     ExtractRequest,
     ExtractResponse,
     GroundRequest,
@@ -21,12 +23,19 @@ router = APIRouter(prefix="/v1", tags=["understanding"])
 
 
 def _decode_pdf(pdf_b64: str) -> bytes:
+    if len(pdf_b64) > MAX_PDF_BASE64_LENGTH:
+        raise HTTPException(status.HTTP_413_CONTENT_TOO_LARGE, "PDF exceeds 50 MB")
     try:
-        return base64.b64decode(pdf_b64, validate=True)
+        pdf_bytes = base64.b64decode(pdf_b64, validate=True)
     except (binascii.Error, ValueError) as exc:
         raise HTTPException(
             status.HTTP_422_UNPROCESSABLE_ENTITY, f"invalid PDF base64: {exc}"
         ) from exc
+    if len(pdf_bytes) > MAX_PDF_BYTES:
+        raise HTTPException(status.HTTP_413_CONTENT_TOO_LARGE, "PDF exceeds 50 MB")
+    if not pdf_bytes.startswith(b"%PDF"):
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "File is not a PDF")
+    return pdf_bytes
 
 
 @router.post("/parse", response_model=ParseResponse)

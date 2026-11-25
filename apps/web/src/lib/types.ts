@@ -114,7 +114,8 @@ export type WorkflowStatus =
   | "repairing"
   | "evaluating"
   | "completed"
-  | "failed";
+  | "failed"
+  | "cancelled";
 
 export interface WorkflowDetail {
   id: string;

@@ -73,7 +73,8 @@ def build_summary(
         and target.experiment_value is not None
     ):
         numbers = (
-            f"{target.metric}（{target.unit}）：论文 {target.paper_value:.4f} vs 实验 {target.experiment_value:.4f}"
+            f"{target.metric}（{target.unit}）：论文 {target.paper_value:.4f} "
+            f"vs 实验 {target.experiment_value:.4f}"
             f"（绝对差 {target.absolute_difference:.4f}"
             + (
                 f"，{target.percentage_point_difference:+.2f} 个百分点"

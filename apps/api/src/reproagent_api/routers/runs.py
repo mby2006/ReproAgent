@@ -6,11 +6,12 @@ persists every version. Ownership flows runs -> experiments -> projects.user_id.
 The API process never executes generated code.
 """
 
+import re
 from datetime import datetime
 from typing import Annotated, Literal
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
 from httpx import HTTPStatusError
 from pydantic import Field, ValidationError
 from reproagent_schemas import (
@@ -27,7 +28,12 @@ from ..clients.runner import RunnerClient
 from ..clients.supabase import make_service_client
 from ..services import generate_and_store_report
 from ..services.dispatch import enqueue_pending_outbox
-from ..services.runs import execution_request_id, finalize_execution_run, load_execution_plan
+from ..services.runs import (
+    execution_request_id,
+    finalize_execution_run,
+    load_execution_plan,
+    run_creation_fingerprint,
+)
 
 router = APIRouter(prefix="/v1", tags=["runs"])
 
@@ -134,6 +140,19 @@ def _get_run(admin, run_id: UUID, user_id: UUID) -> dict:
     return {col.strip(): row.get(col.strip()) for col in RUN_COLUMNS.split(",")}
 
 
+_IDEMPOTENCY_KEY_RE = re.compile(r"^[A-Za-z0-9:_-]{8,128}$")
+
+_RPC_ERROR_MESSAGES = {
+    "FORBIDDEN": "无权操作此实验",
+    "STALE_PLAN_APPROVAL": "只有最新且已批准的实验计划可以运行",
+    "PLAN_NOT_APPROVED": "实验计划尚未批准",
+    "PLAN_NOT_READY": "实验计划未满足就绪条件",
+    "DELEGATION_ACTOR_MISMATCH": "委托授权与当前操作者不匹配",
+    "ACTIVE_RUN_EXISTS": "实验已有活跃的运行",
+    "IDEMPOTENCY_CONFLICT": "幂等键冲突",
+}
+
+
 @router.post(
     "/experiments/{experiment_id}/runs",
     response_model=RunAccepted,
@@ -143,7 +162,21 @@ async def start_run(
     request: Request,
     experiment_id: UUID,
     user_id: Annotated[UUID, Depends(get_current_user_id)],
+    idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
 ) -> RunAccepted:
+    # Validate idempotency key presence and format.
+    if idempotency_key is None:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            {"code": "IDEMPOTENCY_KEY_REQUIRED", "message": "Idempotency-Key header is required"},
+        )
+    if not _IDEMPOTENCY_KEY_RE.match(idempotency_key):
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            {"code": "IDEMPOTENCY_KEY_INVALID",
+             "message": "Idempotency-Key must be 8-128 chars of [A-Za-z0-9:_-]"},
+        )
+
     admin = _admin(request)
     experiment = _get_experiment(admin, experiment_id, user_id)
     if not experiment.get("spec_id"):
@@ -158,11 +191,36 @@ async def start_run(
     if actor != user_id:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Experiment not found")
 
-    run_id = UUID(str(admin.rpc("create_execution_run", {
-        "p_experiment_id": str(experiment_id),
-        "p_plan_id": plan["id"],
-        "p_plan_version": plan["version"],
-    })))
+    fingerprint = run_creation_fingerprint(experiment_id, UUID(plan["id"]), plan["version"])
+
+    try:
+        result = admin.rpc("create_execution_run", {
+            "p_experiment_id": str(experiment_id),
+            "p_plan_id": plan["id"],
+            "p_plan_version": plan["version"],
+            "p_actor_id": str(user_id),
+            "p_idempotency_key": idempotency_key,
+            "p_request_fingerprint": fingerprint,
+        })
+        run_id = UUID(str(result))
+    except Exception as exc:
+        # Extract the database error code from the Supabase RPC exception.
+        error_msg = str(exc)
+        code = None
+        for rpc_code in _RPC_ERROR_MESSAGES:
+            if rpc_code in error_msg:
+                code = rpc_code
+                break
+        if code is None:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                {"code": "RUN_CREATION_FAILED", "message": "运行创建失败"},
+            ) from exc
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            {"code": code, "message": _RPC_ERROR_MESSAGES[code]},
+        ) from exc
+
     # Redis is only a delivery optimization. The run and its outbox intent are
     # already durable, so an outage must not turn an accepted run into a 503.
     await enqueue_pending_outbox(

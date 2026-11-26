@@ -8,6 +8,7 @@ handled by inserting a new Planner-owned plan version (reduced batch), never by
 silently editing training targets in code.
 """
 
+import hashlib
 from datetime import UTC, datetime
 from uuid import NAMESPACE_URL, UUID, uuid5
 
@@ -146,6 +147,12 @@ def pin_run_files(admin, run_id: str, file_ids: list[str]) -> None:
     admin.table("execution_run_files").insert(
         [{"run_id": run_id, "generated_file_id": fid} for fid in file_ids]
     ).execute()
+
+
+def run_creation_fingerprint(experiment_id: UUID, plan_id: UUID, plan_version: int) -> str:
+    """Deterministic identity for a run-creation intent; plan config is immutable per version."""
+    raw = f"{experiment_id}:{plan_id}:{plan_version}"
+    return hashlib.sha256(raw.encode()).hexdigest()
 
 
 def execution_request_id(run_id: UUID, repair_attempt: int) -> UUID:

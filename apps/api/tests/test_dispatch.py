@@ -12,6 +12,7 @@ from reproagent_schemas import RunAccepted, RunStatus, WorkflowStatus
 from test_runs import (
     AUTH,
     EXPERIMENT_ID,
+    IDEM_KEY,
     PLAN_ID,
     PROJECT_ID,
     USER_ID,
@@ -104,14 +105,18 @@ def test_dispatching_is_a_public_run_status():
 
 def test_start_run_uses_atomic_rpc_and_stable_outbox_dispatch(env):
     client, admin, app = env
-    response = client.post(f"/v1/experiments/{EXPERIMENT_ID}/runs", headers=AUTH)
+    response = client.post(
+        f"/v1/experiments/{EXPERIMENT_ID}/runs", headers={**AUTH, **IDEM_KEY}
+    )
     assert response.status_code == 202
     run_id = response.json()["run_id"]
-    assert admin.rpc_calls == [("create_execution_run", {
-        "p_experiment_id": str(EXPERIMENT_ID),
-        "p_plan_id": str(PLAN_ID),
-        "p_plan_version": 1,
-    })]
+    assert len(admin.rpc_calls) == 1
+    assert admin.rpc_calls[0][0] == "create_execution_run"
+    rpc_params = admin.rpc_calls[0][1]
+    assert rpc_params["p_experiment_id"] == str(EXPERIMENT_ID)
+    assert rpc_params["p_plan_id"] == str(PLAN_ID)
+    assert rpc_params["p_plan_version"] == 1
+    assert rpc_params["p_idempotency_key"] == IDEM_KEY["Idempotency-Key"]
     outbox = admin.tables["job_outbox"][0]
     assert outbox["entity_id"] == run_id
     assert outbox["job_id"] == f"run-experiment:{run_id}"
@@ -132,7 +137,9 @@ def test_redis_outage_keeps_202_and_pending_outbox_then_retries(env):
             return None
 
     app.state.arq = OutageArq()
-    response = client.post(f"/v1/experiments/{EXPERIMENT_ID}/runs", headers=AUTH)
+    response = client.post(
+        f"/v1/experiments/{EXPERIMENT_ID}/runs", headers={**AUTH, **IDEM_KEY}
+    )
     assert response.status_code == 202
     run_id = response.json()["run_id"]
     assert response.json()["status"] == "queued"

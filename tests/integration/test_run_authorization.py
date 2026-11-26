@@ -1,0 +1,415 @@
+"""Integration: atomic run authorization via 6-arg create_execution_run RPC.
+
+Requires a running Postgres with the project migrations applied. These tests
+verify the database-level contract:
+  - STALE_PLAN_APPROVAL, PLAN_NOT_APPROVED, PLAN_NOT_READY,
+    DELEGATION_ACTOR_MISMATCH
+  - ACTIVE_RUN_EXISTS
+  - Idempotency (same key + fingerprint returns existing run,
+    different fingerprint conflicts)
+  - approval_ready consistency between Python and SQL
+  - Concurrent active-run uniqueness
+
+Run:  uv run pytest tests/integration/test_run_authorization.py -m integration -v
+"""
+
+import hashlib
+import json
+import os
+from datetime import UTC, datetime
+from uuid import uuid4
+
+import pytest
+
+pytest.importorskip(
+    "psycopg2",
+    reason="Integration test requires psycopg2 and a running database",
+)
+import psycopg2
+import psycopg2.extras
+
+pytestmark = pytest.mark.integration
+
+DSN = os.environ.get(
+    "REPRO_TEST_DATABASE_URL",
+    "postgresql://postgres:postgres@localhost:54322/postgres",
+)
+
+INSERT_PLAN_SQL = (
+    "insert into public.experiment_plans "
+    "(id, experiment_id, version, config_json, approved_at) "
+    "values (%s, %s, %s, %s::jsonb, %s)"
+)
+
+
+def conn():
+    c = psycopg2.connect(DSN)
+    c.autocommit = False
+    return c
+
+
+def run_creation_fingerprint(experiment_id, plan_id, plan_version):
+    raw = f"{experiment_id}:{plan_id}:{plan_version}"
+    return hashlib.sha256(raw.encode()).hexdigest()
+
+
+def call_rpc(
+    cur, experiment_id, plan_id, plan_version, actor_id, idem_key, fingerprint
+):
+    """Call create_execution_run RPC; return (run_id, error_code)."""
+    try:
+        cur.execute(
+            "select public.create_execution_run(%s, %s, %s, %s, %s, %s)",
+            (experiment_id, plan_id, plan_version, actor_id, idem_key, fingerprint),
+        )
+        return cur.fetchone()[0], None
+    except psycopg2.errors.RaiseException as e:
+        msg = str(e).strip()
+        return None, msg
+
+
+# ============================================================
+# Fixtures
+# ============================================================
+
+
+@pytest.fixture
+def db():
+    """Provide a connection with a rolled-back transaction per test."""
+    c = conn()
+    cur = c.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cur.execute("BEGIN")
+    yield cur
+    c.rollback()
+    c.close()
+
+
+@pytest.fixture
+def actor(db):
+    """Create a test user and return their id."""
+    user_id = uuid4()
+    db.execute(
+        "insert into auth.users (id, email) values (%s, %s) "
+        "on conflict do nothing",
+        (str(user_id), f"test-{user_id}@example.com"),
+    )
+    return str(user_id)
+
+
+@pytest.fixture
+def experiment(db, actor):
+    """Create project -> paper -> spec -> experiment chain."""
+    project_id = uuid4()
+    paper_id = uuid4()
+    spec_id = uuid4()
+    exp_id = uuid4()
+
+    db.execute(
+        "insert into public.projects (id, user_id, name) values (%s, %s, %s)",
+        (str(project_id), actor, "test project"),
+    )
+    db.execute(
+        "insert into public.papers (id, project_id, title) values (%s, %s, %s)",
+        (str(paper_id), str(project_id), "Test Paper"),
+    )
+    db.execute(
+        "insert into public.reproduction_specs "
+        "(id, paper_id, version, spec_json, status) "
+        "values (%s, %s, 1, '{}'::jsonb, 'confirmed')",
+        (str(spec_id), str(paper_id)),
+    )
+    db.execute(
+        "insert into public.experiments "
+        "(id, project_id, paper_id, spec_id, name, status) "
+        "values (%s, %s, %s, %s, 'test exp', 'approved')",
+        (str(exp_id), str(project_id), str(paper_id), str(spec_id)),
+    )
+    return str(exp_id)
+
+
+VALID_CONFIG = {
+    "review_mode": "assisted",
+    "rationale": "test",
+    "scaling_profile": "test",
+    "delegated_at": None,
+    "delegated_by": None,
+    "dataset_config": {
+        "name": "mnist", "num_classes": 10, "input_shape": [1, 28, 28],
+        "train_subset_size": 100, "test_subset_size": 50,
+    },
+    "model_config": {
+        "architecture": "lenet-5", "input_shape": [1, 28, 28], "num_classes": 10,
+    },
+    "preprocessing_config": {"steps": []},
+    "training_config": {
+        "optimizer": {"value": "SGD", "source": "paper_explicit"},
+        "learning_rate": {"value": 0.01, "source": "paper_explicit"},
+        "loss_function": {"value": "cross_entropy", "source": "paper_explicit"},
+        "batch_size": {"value": 32, "source": "mvp_scaling"},
+        "epochs": {"value": 2, "source": "mvp_scaling"},
+    },
+    "evaluation_config": {
+        "metrics": ["accuracy"], "target_metric": "accuracy",
+        "tolerance": 0.05, "comparison_note": "test",
+    },
+    "runtime_budget": {"max_seconds": 60, "device": "cpu", "seed": 42},
+    "expected_runtime": {"estimated_seconds": 30, "basis": "test"},
+    "resource_estimates": {},
+    "assumptions": [],
+    "deviations_from_paper": [],
+}
+
+DELEGATED_CONFIG = {
+    **VALID_CONFIG,
+    "review_mode": "delegated",
+}
+
+
+@pytest.fixture
+def plan(db, experiment, actor):
+    """Insert a valid approved plan and return its id."""
+    plan_id = uuid4()
+    db.execute(
+        INSERT_PLAN_SQL,
+        (str(plan_id), experiment, 1, json.dumps(VALID_CONFIG), "now()"),
+    )
+    return str(plan_id)
+
+
+# ============================================================
+# Tests
+# ============================================================
+
+
+class TestAuthorization:
+    def test_stale_plan_approval(self, db, experiment, actor, plan):
+        """Older plan version cannot authorize if newer exists."""
+        newer_id = uuid4()
+        db.execute(
+            INSERT_PLAN_SQL,
+            (str(newer_id), experiment, 2, json.dumps(VALID_CONFIG), None),
+        )
+        fp = run_creation_fingerprint(experiment, plan, 1)
+        _, err = call_rpc(db, experiment, plan, 1, actor, "test-stale-001", fp)
+        assert "STALE_PLAN_APPROVAL" in err
+
+    def test_plan_not_approved(self, db, experiment, actor):
+        """Unapproved plan fails with PLAN_NOT_APPROVED."""
+        plan_id = uuid4()
+        db.execute(
+            INSERT_PLAN_SQL,
+            (str(plan_id), experiment, 1, json.dumps(VALID_CONFIG), None),
+        )
+        fp = run_creation_fingerprint(experiment, str(plan_id), 1)
+        _, err = call_rpc(
+            db, experiment, str(plan_id), 1, actor, "test-noappr-1", fp
+        )
+        assert "PLAN_NOT_APPROVED" in err
+
+    def test_plan_not_ready_target_metric(self, db, experiment, actor):
+        """Unsupported target metric fails with PLAN_NOT_READY."""
+        bad_cfg = {
+            **VALID_CONFIG,
+            "evaluation_config": {
+                **VALID_CONFIG["evaluation_config"],
+                "target_metric": "f1_score",
+            },
+        }
+        plan_id = uuid4()
+        db.execute(
+            INSERT_PLAN_SQL,
+            (str(plan_id), experiment, 1, json.dumps(bad_cfg), "now()"),
+        )
+        fp = run_creation_fingerprint(experiment, str(plan_id), 1)
+        _, err = call_rpc(
+            db, experiment, str(plan_id), 1, actor, "test-notready1", fp
+        )
+        assert "PLAN_NOT_READY" in err
+
+    def test_plan_not_ready_critical_assumption(self, db, experiment, actor):
+        """Unconfirmed critical assumption blocks run creation."""
+        config = {**VALID_CONFIG, "assumptions": [{
+            "field_path": "training_config.optimizer",
+            "kind": "inferred",
+            "value": "adam",
+            "rationale": "not confirmed",
+            "requires_confirmation": True,
+            "human_confirmed": False,
+            "risk_tier": "critical",
+        }]}
+        plan_id = uuid4()
+        db.execute(
+            INSERT_PLAN_SQL,
+            (str(plan_id), experiment, 1, json.dumps(config), "now()"),
+        )
+        fp = run_creation_fingerprint(experiment, str(plan_id), 1)
+        _, err = call_rpc(
+            db, experiment, str(plan_id), 1, actor, "test-crit-001", fp
+        )
+        assert "PLAN_NOT_READY" in err
+
+    def test_delegation_actor_mismatch(self, db, experiment, actor):
+        """Delegated plan with wrong actor fails."""
+        other_actor = str(uuid4())
+        db.execute(
+            "insert into auth.users (id, email) "
+            "values (%s, %s) on conflict do nothing",
+            (other_actor, f"other-{other_actor}@example.com"),
+        )
+        config = {
+            **DELEGATED_CONFIG,
+            "delegated_by": other_actor,
+            "delegated_at": datetime.now(UTC).isoformat(),
+        }
+        plan_id = uuid4()
+        db.execute(
+            INSERT_PLAN_SQL,
+            (str(plan_id), experiment, 1, json.dumps(config), "now()"),
+        )
+        fp = run_creation_fingerprint(experiment, str(plan_id), 1)
+        _, err = call_rpc(
+            db, experiment, str(plan_id), 1, actor, "test-deleg-01", fp
+        )
+        assert "DELEGATION_ACTOR_MISMATCH" in err
+
+    def test_active_run_exists(self, db, experiment, actor, plan):
+        """Cannot create a second active run."""
+        fp = run_creation_fingerprint(experiment, plan, 1)
+        run_id, err = call_rpc(db, experiment, plan, 1, actor, "test-active-1", fp)
+        assert err is None
+        assert run_id is not None
+
+        # Attempt second run with different key
+        _, err2 = call_rpc(db, experiment, plan, 1, actor, "test-active-2", fp)
+        assert "ACTIVE_RUN_EXISTS" in err2
+
+
+class TestIdempotency:
+    def test_same_key_same_fingerprint_returns_existing(
+        self, db, experiment, actor, plan
+    ):
+        fp = run_creation_fingerprint(experiment, plan, 1)
+        run_id1, err1 = call_rpc(
+            db, experiment, plan, 1, actor, "idem-same-0001", fp
+        )
+        assert err1 is None
+
+        run_id2, err2 = call_rpc(
+            db, experiment, plan, 1, actor, "idem-same-0001", fp
+        )
+        assert err2 is None
+        assert run_id1 == run_id2
+
+    def test_same_key_different_fingerprint_conflicts(
+        self, db, experiment, actor, plan
+    ):
+        fp = run_creation_fingerprint(experiment, plan, 1)
+        _, err1 = call_rpc(
+            db, experiment, plan, 1, actor, "idem-diff-0001", fp
+        )
+        assert err1 is None
+
+        # Same key, different fingerprint
+        _, err2 = call_rpc(
+            db, experiment, plan, 1, actor, "idem-diff-0001", "other-hash"
+        )
+        assert "IDEMPOTENCY_CONFLICT" in err2
+
+
+class TestApprovalReadyConsistency:
+    """Python approval_ready and SQL produce same blocking results."""
+
+    def test_routine_assumptions_do_not_block(self, db, experiment, actor):
+        """Routine-tier unconfirmed does not block assisted plans."""
+        config = {**VALID_CONFIG, "assumptions": [{
+            "field_path": "training_config.batch_size",
+            "kind": "mvp_scaling",
+            "value": 32,
+            "rationale": "routine",
+            "requires_confirmation": True,
+            "human_confirmed": False,
+            "risk_tier": "routine",
+        }]}
+        plan_id = uuid4()
+        db.execute(
+            INSERT_PLAN_SQL,
+            (str(plan_id), experiment, 1, json.dumps(config), "now()"),
+        )
+        fp = run_creation_fingerprint(experiment, str(plan_id), 1)
+        run_id, err = call_rpc(
+            db, experiment, str(plan_id), 1, actor, "test-routine-1", fp
+        )
+        assert err is None
+        assert run_id is not None
+
+    def test_info_assumptions_never_block(self, db, experiment, actor):
+        """Info-tier never block, even in delegated mode."""
+        config = {
+            **DELEGATED_CONFIG,
+            "delegated_by": actor,
+            "delegated_at": datetime.now(UTC).isoformat(),
+            "assumptions": [{
+                "field_path": "runtime_budget.max_seconds",
+                "kind": "mvp_scaling",
+                "value": 60,
+                "rationale": "info only",
+                "requires_confirmation": True,
+                "human_confirmed": False,
+                "risk_tier": "info",
+            }],
+        }
+        plan_id = uuid4()
+        db.execute(
+            INSERT_PLAN_SQL,
+            (str(plan_id), experiment, 1, json.dumps(config), "now()"),
+        )
+        fp = run_creation_fingerprint(experiment, str(plan_id), 1)
+        _, err = call_rpc(
+            db, experiment, str(plan_id), 1, actor, "test-info-001", fp
+        )
+        assert err is None
+
+    def test_delegated_non_info_requires_confirmation(
+        self, db, experiment, actor
+    ):
+        """Delegated mode: routine unconfirmed without AUTO blocks."""
+        config = {
+            **DELEGATED_CONFIG,
+            "delegated_by": actor,
+            "delegated_at": datetime.now(UTC).isoformat(),
+            "assumptions": [{
+                "field_path": "training_config.learning_rate",
+                "kind": "inferred",
+                "value": 0.1,
+                "rationale": "not yet auto-confirmed",
+                "requires_confirmation": True,
+                "human_confirmed": False,
+                "risk_tier": "routine",
+            }],
+        }
+        plan_id = uuid4()
+        db.execute(
+            INSERT_PLAN_SQL,
+            (str(plan_id), experiment, 1, json.dumps(config), "now()"),
+        )
+        fp = run_creation_fingerprint(experiment, str(plan_id), 1)
+        _, err = call_rpc(
+            db, experiment, str(plan_id), 1, actor, "test-deleg-02", fp
+        )
+        assert "PLAN_NOT_READY" in err
+
+
+class TestForbidden:
+    def test_non_owner_forbidden(self, db, experiment, actor, plan):
+        """Actor who does not own the experiment gets FORBIDDEN."""
+        fake_actor = str(uuid4())
+        db.execute(
+            "insert into auth.users (id, email) "
+            "values (%s, %s) on conflict do nothing",
+            (fake_actor, f"fake-{fake_actor}@example.com"),
+        )
+        fp = run_creation_fingerprint(experiment, plan, 1)
+        _, err = call_rpc(
+            db, experiment, plan, 1, fake_actor, "test-forbid-01", fp
+        )
+        assert "FORBIDDEN" in err

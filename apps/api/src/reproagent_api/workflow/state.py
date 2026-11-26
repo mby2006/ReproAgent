@@ -66,6 +66,7 @@ class WorkflowState(TypedDict, total=False):
     status: str
     current_node: str
     error: str
+    support_code: str
 
 
 def initial_state(workflow: dict, budget_config: BudgetConfig) -> WorkflowState:

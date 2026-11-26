@@ -6,6 +6,8 @@ only LeNet-5 + MNIST; anything else is rejected loudly.
 """
 
 import math
+from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 from reproagent_schemas import (
     Assumption,
@@ -28,6 +30,9 @@ from reproagent_schemas import (
     RuntimeBudget,
     TrainingConfig,
 )
+
+if TYPE_CHECKING:
+    from reproagent_schemas import ParsedDocument
 
 from .assumptions import (
     as_float,
@@ -57,6 +62,15 @@ class UnsupportedPaperError(ValueError):
     """v1 planner only handles LeNet-5 + MNIST."""
 
 
+@dataclass(frozen=True)
+class SupportCheck:
+    """Outcome of the deterministic paper support gate."""
+
+    supported: bool
+    code: str  # "SUPPORTED" | "SCANNED_PDF" | "UNSUPPORTED_DATASET" | "UNSUPPORTED_MODEL"
+    message: str
+
+
 def _guard_lenet_mnist(card: ReproductionCard) -> None:
     dataset = str(card.dataset.value or "").lower()
     if card.dataset.status is EvidenceStatus.MISSING or "mnist" not in dataset:
@@ -65,6 +79,35 @@ def _guard_lenet_mnist(card: ReproductionCard) -> None:
     method = str(card.method.value or "").lower()
     if "lenet" not in arch and "lenet" not in method:
         raise UnsupportedPaperError("v1 仅支持 LeNet-5 架构；Card 未明确 LeNet")
+
+
+def check_supported(
+    document: "ParsedDocument", card: ReproductionCard | None
+) -> SupportCheck:
+    """Deterministic support gate: OCR scanned PDF or unsupported model/dataset.
+
+    The model/dataset check is delegated to ``_guard_lenet_mnist`` (the single
+    source of truth for what v1 supports). Callers must not duplicate that
+    string-matching logic.
+    """
+    if document.ocr_required_pages:
+        return SupportCheck(
+            supported=False, code="SCANNED_PDF", message="扫描 PDF 需要 OCR，当前版本不支持"
+        )
+    if card is None:
+        raise ValueError("card is required after extraction")
+    try:
+        _guard_lenet_mnist(card)
+    except UnsupportedPaperError as exc:
+        message = str(exc)
+        if "MNIST" in message:
+            return SupportCheck(
+                supported=False, code="UNSUPPORTED_DATASET", message="v1 仅支持 MNIST 数据集"
+            )
+        return SupportCheck(
+            supported=False, code="UNSUPPORTED_MODEL", message="v1 仅支持 LeNet-5 架构"
+        )
+    return SupportCheck(supported=True, code="SUPPORTED", message="LeNet-5 \u00d7 MNIST")
 
 
 def _build_optimizer(card: ReproductionCard, assumptions: list[Assumption]) -> PlanParam:

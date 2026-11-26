@@ -127,7 +127,12 @@ async def ingest_paper(state: dict, ctx: WorkflowContext) -> dict:
 
 async def extract_paper(state: dict, ctx: WorkflowContext) -> dict:
     response = await ctx.agent.parse_pdf(ParseRequest(pdf_b64=state["pdf_b64"]))
-    return {"document": response.document}
+    document = response.document
+    # Hard gate: reject scanned PDFs immediately before any further processing.
+    if document.ocr_required_pages:
+        error = "SCANNED_PDF: 扫描 PDF 需要 OCR，当前版本不支持"
+        return {"document": document, "error": error, "support_code": "SCANNED_PDF"}
+    return {"document": document}
 
 
 async def build_reproduction_spec(state: dict, ctx: WorkflowContext) -> dict:
@@ -136,7 +141,26 @@ async def build_reproduction_spec(state: dict, ctx: WorkflowContext) -> dict:
         ExtractRequest(document=state["document"], title_hint=state.get("paper_title"))
     )
     budget = record_usages(state, ctx.budget_config, response.usages)
-    return {"card_raw": response.card_raw, "usages": response.usages, "budget": budget}
+    # Hard gate: validate the extracted card against supported scope.
+    card_raw = response.card_raw
+    try:
+        from reproagent_schemas import ReproductionCard
+
+        card = ReproductionCard.model_validate(card_raw)
+        support = await ctx.agent.check_support(state["document"], card)
+        if not support.supported:
+            error = f"{support.code}: {support.message}"
+            return {
+                "card_raw": card_raw,
+                "usages": response.usages,
+                "budget": budget,
+                "error": error,
+                "support_code": support.code,
+            }
+    except Exception:
+        # If card validation fails, let the downstream ground_spec handle it.
+        pass
+    return {"card_raw": card_raw, "usages": response.usages, "budget": budget}
 
 
 async def validate_evidence(state: dict, ctx: WorkflowContext) -> dict:

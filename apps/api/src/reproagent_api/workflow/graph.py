@@ -146,14 +146,40 @@ def route_after_classify(state: WorkflowState) -> str:
     return "repair_code"
 
 
+def route_after_extract(state: WorkflowState) -> str:
+    if state.get("error"):
+        return "persist_results"
+    return "build_reproduction_spec"
+
+
+def route_after_spec(state: WorkflowState) -> str:
+    if state.get("error"):
+        return "persist_results"
+    return "validate_evidence"
+
+
 def build_workflow_graph(ctx: WorkflowContext, checkpointer):
     graph = StateGraph(WorkflowState)
     for name, fn in NODE_ORDER:
         graph.add_node(name, _traced(name, ctx, fn))
     graph.add_edge(START, "ingest_paper")
     graph.add_edge("ingest_paper", "extract_paper")
-    graph.add_edge("extract_paper", "build_reproduction_spec")
-    graph.add_edge("build_reproduction_spec", "validate_evidence")
+    graph.add_conditional_edges(
+        "extract_paper",
+        route_after_extract,
+        {
+            "build_reproduction_spec": "build_reproduction_spec",
+            "persist_results": "persist_results",
+        },
+    )
+    graph.add_conditional_edges(
+        "build_reproduction_spec",
+        route_after_spec,
+        {
+            "validate_evidence": "validate_evidence",
+            "persist_results": "persist_results",
+        },
+    )
     graph.add_edge("validate_evidence", "human_review")
     graph.add_edge("human_review", "plan_experiment")
     graph.add_edge("plan_experiment", "human_approve_plan")

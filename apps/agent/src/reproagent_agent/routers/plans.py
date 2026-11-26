@@ -1,9 +1,34 @@
 from fastapi import APIRouter, HTTPException, Request, status
-from reproagent_schemas import PlanRequest, PlanResponse
+from reproagent_schemas import (
+    ParsedDocument,
+    PlanRequest,
+    PlanResponse,
+    ReproductionCard,
+    SchemaModel,
+)
 
-from ..planning import ScalingConfig, UnsupportedPaperError
+from ..planning import ScalingConfig, UnsupportedPaperError, check_supported
 
 router = APIRouter(prefix="/v1", tags=["planning"])
+
+
+class SupportCheckRequest(SchemaModel):
+    document: ParsedDocument
+    card: ReproductionCard | None = None
+
+
+class SupportCheckResponse(SchemaModel):
+    supported: bool
+    code: str
+    message: str
+
+
+@router.post("/papers/support-check", response_model=SupportCheckResponse)
+async def support_check(body: SupportCheckRequest) -> SupportCheckResponse:
+    result = check_supported(body.document, body.card)
+    return SupportCheckResponse(
+        supported=result.supported, code=result.code, message=result.message
+    )
 
 
 @router.post("/plan", response_model=PlanResponse)

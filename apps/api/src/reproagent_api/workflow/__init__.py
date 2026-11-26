@@ -7,6 +7,8 @@ from .graph import (
     resume_workflow,
     route_after_classify,
     route_after_execute,
+    route_after_extract,
+    route_after_spec,
     route_after_validate,
     start_workflow,
 )
@@ -27,6 +29,8 @@ __all__ = [
     "resume_workflow",
     "route_after_classify",
     "route_after_execute",
+    "route_after_extract",
+    "route_after_spec",
     "route_after_validate",
     "start_workflow",
 ]

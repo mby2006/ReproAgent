@@ -58,7 +58,7 @@ from .comparison import (
     VerifyPairRequest,
     VerifyPairResponse,
 )
-from .evidence import EvidenceField, EvidenceStatus
+from .evidence import EvidenceField, EvidenceStatus, GroundingStatus
 from .execution import (
     DEPENDENCY_WHITELIST,
     OPTIMIZER_NAMES,
@@ -248,6 +248,7 @@ __all__ = [
     "FinalStatus",
     "GroundRequest",
     "GroundResponse",
+    "GroundingStatus",
     "HealthResponse",
     "HealthStatus",
     "IdentifiedModel",

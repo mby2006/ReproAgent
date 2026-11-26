@@ -9,6 +9,7 @@ from reproagent_schemas import (
     EvidenceField,
     EvidenceStatus,
     FieldEdit,
+    GroundingStatus,
     ParsedDocument,
     ReportedResult,
     ReproductionCard,
@@ -109,6 +110,113 @@ class TestEvidenceField:
     def test_generic_value_types(self):
         assert explicit(0.001).value == 0.001
         assert explicit([1, 28, 28]).value == [1, 28, 28]
+
+
+class TestGroundingStatus:
+    def test_grounding_status_round_trip(self):
+        field = EvidenceField(
+            value="sgd",
+            status=EvidenceStatus.INFERRED,
+            grounding_status=GroundingStatus.LOCATED_UNSUPPORTED,
+            candidate_quote="Layer C3 has 16 feature maps.",
+            candidate_page=5,
+            grounding_reason="引用说明 C3 层结构，不支持 optimizer=sgd",
+        )
+        assert EvidenceField.model_validate_json(field.model_dump_json()) == field
+
+    def test_rejected_candidate_is_not_accepted_evidence(self):
+        field = EvidenceField(
+            value="sgd",
+            status=EvidenceStatus.INFERRED,
+            grounding_status=GroundingStatus.LOCATED_UNSUPPORTED,
+            candidate_quote="Layer C3 has 16 feature maps.",
+            candidate_page=5,
+            grounding_reason="引用说明 C3 层结构，不支持字段值",
+        )
+        assert field.source_page is None
+        assert field.source_section is None
+        assert field.evidence_quote is None
+
+    def test_default_grounding_status_is_not_checked(self):
+        assert explicit("x").grounding_status is GroundingStatus.NOT_CHECKED
+
+    def test_verified_requires_paper_status(self):
+        with pytest.raises(ValidationError):
+            EvidenceField(
+                value="sgd",
+                status=EvidenceStatus.INFERRED,
+                evidence_quote="a quote",
+                source_page=2,
+                grounding_status=GroundingStatus.VERIFIED,
+            )
+
+    def test_verified_ok_with_paper_explicit(self):
+        field = EvidenceField(
+            value="sgd",
+            status=EvidenceStatus.PAPER_EXPLICIT,
+            evidence_quote="a quote",
+            source_page=2,
+            grounding_status=GroundingStatus.VERIFIED,
+        )
+        assert field.grounding_status is GroundingStatus.VERIFIED
+
+    def test_rejected_status_forbids_accepted_citation(self):
+        with pytest.raises(ValidationError):
+            EvidenceField(
+                value="sgd",
+                status=EvidenceStatus.INFERRED,
+                evidence_quote="a quote",
+                grounding_status=GroundingStatus.CITATION_NOT_FOUND,
+                grounding_reason="无法定位",
+            )
+        with pytest.raises(ValidationError):
+            EvidenceField(
+                value="sgd",
+                status=EvidenceStatus.PAPER_EXPLICIT,
+                evidence_quote="a quote",
+                source_page=2,
+                grounding_status=GroundingStatus.LOCATED_UNSUPPORTED,
+                grounding_reason="语义不支持",
+            )
+
+    def test_rejected_status_requires_grounding_reason(self):
+        with pytest.raises(ValidationError):
+            EvidenceField(
+                value="sgd",
+                status=EvidenceStatus.INFERRED,
+                grounding_status=GroundingStatus.CITATION_NOT_FOUND,
+                candidate_quote="x",
+                candidate_page=2,
+            )
+
+    def test_not_checked_must_not_carry_grounding_reason(self):
+        with pytest.raises(ValidationError):
+            EvidenceField(
+                value="sgd",
+                status=EvidenceStatus.INFERRED,
+                grounding_reason="stale reason without a check",
+            )
+
+    def test_missing_rejects_candidate_fields(self):
+        with pytest.raises(ValidationError):
+            EvidenceField(
+                status=EvidenceStatus.MISSING,
+                candidate_quote="Layer C3 has 16 feature maps.",
+                candidate_page=5,
+            )
+
+    def test_human_confirmation_does_not_upgrade_rejected_grounding(self):
+        field = EvidenceField(
+            value="sgd",
+            status=EvidenceStatus.INFERRED,
+            grounding_status=GroundingStatus.LOCATED_UNSUPPORTED,
+            candidate_quote="Layer C3 has 16 feature maps.",
+            candidate_page=5,
+            grounding_reason="引用仅描述层结构",
+            human_confirmed=True,
+        )
+        assert field.grounding_status is GroundingStatus.LOCATED_UNSUPPORTED
+        assert field.human_confirmed is True
 
 
 class TestReproductionCard:

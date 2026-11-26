@@ -13,6 +13,7 @@ from reproagent_schemas import (
     ParsedDocument,
     ReportedResult,
     ReproductionCard,
+    ReviewDecision,
     SpecOrigin,
     TextBlock,
     UnderstandRequest,
@@ -217,6 +218,39 @@ class TestGroundingStatus:
         )
         assert field.grounding_status is GroundingStatus.LOCATED_UNSUPPORTED
         assert field.human_confirmed is True
+
+
+class TestReviewDecision:
+    def test_grounding_fields_default_none(self):
+        decision = ReviewDecision(field_path="optimizer", before="sgd", after="adam")
+        assert decision.grounding_reason is None
+        assert decision.previous_evidence is None
+
+    def test_grounding_fields_round_trip(self):
+        decision = ReviewDecision(
+            field_path="optimizer",
+            before="sgd",
+            after="adam",
+            grounding_reason="字段值已改变，原引用不能作为新值的论文证据",
+            previous_evidence={
+                "status": "paper_explicit",
+                "grounding_status": "verified",
+                "value": "sgd",
+                "evidence_quote": "We use SGD.",
+                "source_page": 5,
+                "source_section": "3.1",
+            },
+        )
+        restored = ReviewDecision.model_validate_json(decision.model_dump_json())
+        assert restored == decision
+        assert restored.previous_evidence["evidence_quote"] == "We use SGD."
+
+    def test_is_a_declared_field_not_extra(self):
+        # ReviewDecision forbids extras, so these must be real declared fields.
+        with pytest.raises(ValidationError):
+            ReviewDecision(field_path="x", before=1, after=2, bogus=3)
+        ReviewDecision(field_path="x", before=1, after=2, grounding_reason="r")
+        ReviewDecision(field_path="x", before=1, after=2, previous_evidence={"status": "inferred"})
 
 
 class TestReproductionCard:

@@ -63,6 +63,8 @@ class ReviewDecision(SchemaModel):
     recommendation_reasoning: str | None = None
     recommendation_risk: str | None = None
     preselection_threshold: float | None = Field(default=None, ge=0, le=1)
+    grounding_reason: str | None = None
+    previous_evidence: dict[str, Any] | None = None
 
 
 class OwnedModel(SchemaModel):

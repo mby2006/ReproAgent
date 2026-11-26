@@ -14,6 +14,7 @@ from uuid import UUID, uuid4
 import httpx
 import pytest
 from fastapi.testclient import TestClient
+from postgrest.exceptions import APIError as PostgrestAPIError
 from reproagent_agent.codegen import (
     classify_error,
     generate_code,
@@ -31,8 +32,11 @@ from reproagent_api.routers import runs
 from reproagent_api.services.runs import async_persist_result, execution_request_id
 from reproagent_api.workflow import make_memory_checkpointer
 from reproagent_schemas import (
+    Assumption,
+    AssumptionKind,
     ClassifyRequest,
     CodegenRequest,
+    ConfirmationSource,
     EvaluateRequest,
     EvidenceField,
     EvidenceStatus,
@@ -42,6 +46,8 @@ from reproagent_schemas import (
     ReportedResult,
     ReproductionCard,
     ReviewRequest,
+    ReviewMode,
+    RiskTier,
     RunAudit,
     RunResult,
     RunStatus,
@@ -60,6 +66,19 @@ TOKENS = {"good-token": USER_ID, "bob-token": BOB_ID}
 AUTH = {"Authorization": "Bearer good-token"}
 BOB_AUTH = {"Authorization": "Bearer bob-token"}
 IDEM_KEY = {"Idempotency-Key": "test-key-00001"}
+
+
+def _rpc_error(code: str, sqlstate: str = "P0001") -> PostgrestAPIError:
+    """Build the PostgREST error the 6-arg RPC really raises.
+
+    ``RAISE EXCEPTION '<code>' USING errcode = '<sqlstate>'`` surfaces through
+    supabase-py as ``APIError`` whose ``message`` is the bare code and whose
+    ``code`` is only the (shared) SQLSTATE. The fakes raise this exact shape so
+    the router's structured error mapping is exercised, not a loose RuntimeError.
+    """
+    return PostgrestAPIError(
+        {"code": sqlstate, "message": code, "hint": None, "details": None}
+    )
 
 
 class FakeAuth:
@@ -419,11 +438,11 @@ class FakeAdmin:
         ]
         max_version = max(r["version"] for r in plans_for_exp) if plans_for_exp else 0
         if params["p_plan_version"] != max_version:
-            raise RuntimeError("STALE_PLAN_APPROVAL")
+            raise _rpc_error("STALE_PLAN_APPROVAL")
 
         # Approval check
         if not plan.get("approved_at"):
-            raise RuntimeError("PLAN_NOT_APPROVED")
+            raise _rpc_error("PLAN_NOT_APPROVED")
 
         # Active run check (before idempotency for non-matching key)
         active = [
@@ -443,11 +462,11 @@ class FakeAdmin:
 
         if existing_idem is not None:
             if existing_idem["request_fingerprint"] != request_fingerprint:
-                raise RuntimeError("IDEMPOTENCY_CONFLICT")
+                raise _rpc_error("IDEMPOTENCY_CONFLICT")
             return existing_idem["run_id"]
 
         if active:
-            raise RuntimeError("ACTIVE_RUN_EXISTS")
+            raise _rpc_error("ACTIVE_RUN_EXISTS")
 
         run_id = str(uuid4())
         self.tables["execution_runs"].append({
@@ -1635,21 +1654,127 @@ def test_idempotency_conflict_different_fingerprint(env):
 
 
 def test_rpc_stale_plan_approval(env):
-    """RPC-level STALE_PLAN_APPROVAL when plan_version is not max."""
+    """RPC-level STALE_PLAN_APPROVAL maps the structured code to a 409."""
     client, admin, _ = env
-    # Override the RPC to simulate stale
+
     def stale_rpc(name, params):
         admin.rpc_calls.append((name, params))
         if name == "create_execution_run":
-            raise RuntimeError("STALE_PLAN_APPROVAL")
+            raise _rpc_error("STALE_PLAN_APPROVAL")
         return None
 
     admin.rpc = stale_rpc
-    # Need to bypass Python fast-fail: patch load_execution_plan to pass
-    # Fake: make load_execution_plan return the v1 plan even though v2 is latest
-    # (the RPC would reject it server-side)
+    # The seeded plan is the latest approved plan, so the Python fast-fail is
+    # bypassed here only because the fake RPC itself refuses the call; the router
+    # must read the structured code from the PostgREST error, not the repr.
     response = client.post(
         f"/v1/experiments/{EXPERIMENT_ID}/runs", headers={**AUTH, **IDEM_KEY}
     )
-    # Python fast-fail catches this (since we added plan v2 as latest unapproved)
     assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "STALE_PLAN_APPROVAL"
+    assert admin.rpc_calls != []
+
+
+def test_rpc_unknown_sqlstate_is_server_error_not_conflict(env):
+    """A PostgREST error without a known authorization code is a 500, not a 409."""
+    client, admin, _ = env
+
+    def boom_rpc(name, params):
+        admin.rpc_calls.append((name, params))
+        # Same shared SQLSTATE the RPC uses, but an unrelated message.
+        raise _rpc_error("permission denied for table execution_runs", sqlstate="42501")
+
+    admin.rpc = boom_rpc
+    response = client.post(
+        f"/v1/experiments/{EXPERIMENT_ID}/runs", headers={**AUTH, **IDEM_KEY}
+    )
+    assert response.status_code == 500
+    assert response.json()["detail"]["code"] == "RUN_CREATION_FAILED"
+
+
+def test_rpc_malformed_run_id_is_server_error(env):
+    """A non-UUID value from a successful RPC surfaces as 500, not a 409 conflict."""
+    client, admin, _ = env
+
+    def garbage_rpc(name, params):
+        admin.rpc_calls.append((name, params))
+        return "not-a-uuid"
+
+    admin.rpc = garbage_rpc
+    response = client.post(
+        f"/v1/experiments/{EXPERIMENT_ID}/runs", headers={**AUTH, **IDEM_KEY}
+    )
+    assert response.status_code == 500
+    assert response.json()["detail"]["code"] == "RUN_CREATION_FAILED"
+    assert admin.tables["execution_runs"] == []
+
+
+def test_rpc_non_postgrest_error_is_not_swallowed_as_conflict(env):
+    """An unexpected Python error from the RPC path must not become a 409."""
+    client, admin, _ = env
+
+    def bug_rpc(name, params):
+        admin.rpc_calls.append((name, params))
+        raise KeyError("p_actor_id")
+
+    admin.rpc = bug_rpc
+    with pytest.raises(KeyError):
+        client.post(
+            f"/v1/experiments/{EXPERIMENT_ID}/runs", headers={**AUTH, **IDEM_KEY}
+        )
+
+
+# --- Python approval_ready rules (mirrors the SQL authorization contract) -----
+#
+# These scenarios pin down ExperimentPlan.approval_ready(actor) so the Python side
+# cannot silently drift from the rules the create_execution_run RPC re-implements.
+# The SQL half of the equivalence (the RPC making the same accept/reject decision)
+# lives in tests/integration/test_run_authorization.py::TestApprovalReadyEquivalence
+# and requires a live database: run with `pytest -m integration`.
+_APPROVAL_READY_CASES = [
+    ("assisted_clean", "assisted", "accuracy", [], "none", True),
+    ("unsupported_metric", "assisted", "f1_score", [], "none", False),
+    ("critical_unconfirmed_blocks", "assisted", "accuracy", [("critical", False, None)], "none", False),
+    ("critical_confirmed_ok", "assisted", "accuracy", [("critical", True, None)], "none", True),
+    ("routine_unconfirmed_ok", "assisted", "accuracy", [("routine", False, None)], "none", True),
+    ("info_unconfirmed_ok", "assisted", "accuracy", [("info", False, None)], "none", True),
+    ("delegated_clean", "delegated", "accuracy", [], "self", True),
+    ("delegated_critical_blocks", "delegated", "accuracy", [("critical", False, None)], "self", False),
+    ("delegated_routine_blocks", "delegated", "accuracy", [("routine", False, None)], "self", False),
+    ("delegated_info_ok", "delegated", "accuracy", [("info", False, None)], "self", True),
+    ("delegated_auto_routine_ok", "delegated", "accuracy", [("routine", False, "auto")], "self", True),
+    ("delegated_actor_mismatch", "delegated", "accuracy", [], "other", False),
+]
+
+
+def _approval_case_plan(review_mode, target_metric, assumptions, delegation, actor, other):
+    base = build_plan(make_card())
+    plan = base.model_copy(update={"evaluation_config": base.evaluation_config.model_copy(
+        update={"target_metric": target_metric}
+    )})
+    if assumptions:
+        plan = plan.model_copy(update={"assumptions": [
+            Assumption(
+                field_path=f"training_config.case_{i}", kind=AssumptionKind.INFERRED,
+                value=0.1, rationale="scenario", requires_confirmation=True,
+                human_confirmed=human, confirmed_by=(ConfirmationSource(confirmed) if confirmed else None),
+                risk_tier=RiskTier(tier),
+            )
+            for i, (tier, human, confirmed) in enumerate(assumptions)
+        ]})
+    if review_mode == "delegated":
+        delegated_by = actor if delegation == "self" else other
+        plan = plan.model_copy(update={
+            "review_mode": ReviewMode.DELEGATED,
+            "delegated_at": datetime.now(UTC),
+            "delegated_by": delegated_by,
+        })
+    return plan
+
+
+@pytest.mark.parametrize(("name", "review_mode", "metric", "assumptions", "delegation", "expected"),
+                         _APPROVAL_READY_CASES, ids=[c[0] for c in _APPROVAL_READY_CASES])
+def test_approval_ready_python_rules(name, review_mode, metric, assumptions, delegation, expected):
+    actor, other = USER_ID, BOB_ID
+    plan = _approval_case_plan(review_mode, metric, assumptions, delegation, actor, other)
+    assert plan.approval_ready(actor) is expected, name

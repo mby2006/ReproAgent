@@ -17,7 +17,7 @@ import hashlib
 import json
 import os
 from datetime import UTC, datetime
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 
@@ -27,6 +27,14 @@ pytest.importorskip(
 )
 import psycopg2
 import psycopg2.extras
+from reproagent_schemas import (
+    Assumption,
+    AssumptionKind,
+    ConfirmationSource,
+    ExperimentPlan,
+    ReviewMode,
+    RiskTier,
+)
 
 pytestmark = pytest.mark.integration
 
@@ -127,6 +135,9 @@ def experiment(db, actor):
     return str(exp_id)
 
 
+# VALID_CONFIG is deliberately a schema-valid ExperimentPlan payload so the same
+# dict can be validated by Python (approval_ready) and inserted as config_json for
+# the SQL RPC, proving both paths decide identically on identical input.
 VALID_CONFIG = {
     "review_mode": "assisted",
     "rationale": "test",
@@ -142,9 +153,18 @@ VALID_CONFIG = {
     },
     "preprocessing_config": {"steps": []},
     "training_config": {
-        "optimizer": {"value": "SGD", "source": "paper_explicit"},
-        "learning_rate": {"value": 0.01, "source": "paper_explicit"},
-        "loss_function": {"value": "cross_entropy", "source": "paper_explicit"},
+        "optimizer": {
+            "value": "SGD", "source": "paper_explicit",
+            "evidence_quote": "...SGD...", "source_page": 8,
+        },
+        "learning_rate": {
+            "value": 0.01, "source": "paper_explicit",
+            "evidence_quote": "...0.01...", "source_page": 8,
+        },
+        "loss_function": {
+            "value": "cross_entropy", "source": "paper_explicit",
+            "evidence_quote": "...cross entropy...", "source_page": 8,
+        },
         "batch_size": {"value": 32, "source": "mvp_scaling"},
         "epochs": {"value": 2, "source": "mvp_scaling"},
     },
@@ -167,11 +187,17 @@ DELEGATED_CONFIG = {
 
 @pytest.fixture
 def plan(db, experiment, actor):
-    """Insert a valid approved plan and return its id."""
+    """Insert a valid approved plan and return its id.
+
+    ``approved_at`` must be a real timestamp value. Passing the Python string
+    ``"now()"`` as a bind parameter is invalid: PostgreSQL cannot cast the
+    literal text ``'now()'`` to ``timestamptz``. psycopg2 adapts a ``datetime``
+    object to a timestamp literal, so we bind ``datetime.now(UTC)`` instead.
+    """
     plan_id = uuid4()
     db.execute(
         INSERT_PLAN_SQL,
-        (str(plan_id), experiment, 1, json.dumps(VALID_CONFIG), "now()"),
+        (str(plan_id), experiment, 1, json.dumps(VALID_CONFIG), datetime.now(UTC)),
     )
     return str(plan_id)
 
@@ -218,7 +244,7 @@ class TestAuthorization:
         plan_id = uuid4()
         db.execute(
             INSERT_PLAN_SQL,
-            (str(plan_id), experiment, 1, json.dumps(bad_cfg), "now()"),
+            (str(plan_id), experiment, 1, json.dumps(bad_cfg), datetime.now(UTC)),
         )
         fp = run_creation_fingerprint(experiment, str(plan_id), 1)
         _, err = call_rpc(
@@ -240,7 +266,7 @@ class TestAuthorization:
         plan_id = uuid4()
         db.execute(
             INSERT_PLAN_SQL,
-            (str(plan_id), experiment, 1, json.dumps(config), "now()"),
+            (str(plan_id), experiment, 1, json.dumps(config), datetime.now(UTC)),
         )
         fp = run_creation_fingerprint(experiment, str(plan_id), 1)
         _, err = call_rpc(
@@ -264,7 +290,7 @@ class TestAuthorization:
         plan_id = uuid4()
         db.execute(
             INSERT_PLAN_SQL,
-            (str(plan_id), experiment, 1, json.dumps(config), "now()"),
+            (str(plan_id), experiment, 1, json.dumps(config), datetime.now(UTC)),
         )
         fp = run_creation_fingerprint(experiment, str(plan_id), 1)
         _, err = call_rpc(
@@ -333,7 +359,7 @@ class TestApprovalReadyConsistency:
         plan_id = uuid4()
         db.execute(
             INSERT_PLAN_SQL,
-            (str(plan_id), experiment, 1, json.dumps(config), "now()"),
+            (str(plan_id), experiment, 1, json.dumps(config), datetime.now(UTC)),
         )
         fp = run_creation_fingerprint(experiment, str(plan_id), 1)
         run_id, err = call_rpc(
@@ -361,7 +387,7 @@ class TestApprovalReadyConsistency:
         plan_id = uuid4()
         db.execute(
             INSERT_PLAN_SQL,
-            (str(plan_id), experiment, 1, json.dumps(config), "now()"),
+            (str(plan_id), experiment, 1, json.dumps(config), datetime.now(UTC)),
         )
         fp = run_creation_fingerprint(experiment, str(plan_id), 1)
         _, err = call_rpc(
@@ -390,7 +416,7 @@ class TestApprovalReadyConsistency:
         plan_id = uuid4()
         db.execute(
             INSERT_PLAN_SQL,
-            (str(plan_id), experiment, 1, json.dumps(config), "now()"),
+            (str(plan_id), experiment, 1, json.dumps(config), datetime.now(UTC)),
         )
         fp = run_creation_fingerprint(experiment, str(plan_id), 1)
         _, err = call_rpc(
@@ -413,3 +439,103 @@ class TestForbidden:
             db, experiment, plan, 1, fake_actor, "test-forbid-01", fp
         )
         assert "FORBIDDEN" in err
+
+
+# (kind, expected_ready) pairs shared with the offline Python-only unit test in
+# apps/api/tests/test_runs.py::test_approval_ready_python_rules. The SQL half of
+# the equivalence only runs here, against a live Postgres: pytest -m integration.
+_APPROVAL_READY_CASES = [
+    ("assisted_clean", True),
+    ("unsupported_metric", False),
+    ("critical_unconfirmed", False),
+    ("critical_confirmed", True),
+    ("routine_unconfirmed", True),
+    ("info_unconfirmed", True),
+    ("delegated_clean", True),
+    ("delegated_critical", False),
+    ("delegated_routine", False),
+    ("delegated_info", True),
+    ("delegated_auto_routine", True),
+    ("delegated_actor_mismatch", False),
+]
+
+
+def _assumption(field_path: str, tier: RiskTier, *, human: bool,
+                confirmed: ConfirmationSource | None = None) -> dict:
+    return Assumption(
+        field_path=field_path, kind=AssumptionKind.INFERRED, value="scenario",
+        rationale="scenario", requires_confirmation=True, human_confirmed=human,
+        confirmed_by=confirmed, risk_tier=tier,
+    ).model_dump(mode="json")
+
+
+def _approval_ready_config(kind: str, actor: str) -> dict:
+    """Return a schema-valid plan config for one approval_ready scenario.
+
+    Every scenario is built as an ``ExperimentPlan`` and serialised, so the exact
+    dict handed to PostgreSQL is the same model the Python ``approval_ready``
+    predicate is evaluated against.
+    """
+    config = dict(VALID_CONFIG)
+    other_actor = "00000000-0000-0000-0000-0000000000ff"
+    delegated = kind.startswith("delegated_")
+    if delegated:
+        config["review_mode"] = ReviewMode.DELEGATED.value
+        config["delegated_by"] = other_actor if kind == "delegated_actor_mismatch" else actor
+        config["delegated_at"] = datetime.now(UTC).isoformat()
+    if kind == "unsupported_metric":
+        config["evaluation_config"] = {
+            **config["evaluation_config"], "target_metric": "f1_score"
+        }
+    elif kind != "delegated_clean":
+        assumptions = {
+            "critical_unconfirmed": ("critical", False, None),
+            "critical_confirmed": ("critical", True, None),
+            "routine_unconfirmed": ("routine", False, None),
+            "info_unconfirmed": ("info", False, None),
+            "delegated_critical": ("critical", False, None),
+            "delegated_routine": ("routine", False, None),
+            "delegated_info": ("info", False, None),
+            "delegated_auto_routine": ("routine", False, "auto"),
+        }.get(kind)
+        if assumptions is not None:
+            tier, human, confirmed = assumptions
+            config["assumptions"] = [_assumption(
+                "training_config.optimizer", RiskTier(tier), human=human,
+                confirmed=(ConfirmationSource(confirmed) if confirmed else None),
+            )]
+    return config
+
+
+class TestApprovalReadyEquivalence:
+    """The SQL authorization accepts/rejects exactly as ExperimentPlan.approval_ready does."""
+
+    @pytest.mark.parametrize(("kind", "expected_ready"), _APPROVAL_READY_CASES)
+    def test_python_and_sql_agree(self, db, experiment, actor, kind, expected_ready):
+        config = _approval_ready_config(kind, actor)
+        plan = ExperimentPlan.model_validate(config)
+        python_ready = plan.approval_ready(UUID(actor))
+        # The Python predicate matches the documented expectation for this scenario.
+        assert python_ready is expected_ready, f"Python approval_ready drifted: {kind}"
+
+        # Feed the identical serialised config to the database and assert the RPC
+        # makes the same decision. Ownership/latest/approval are held constant, so
+        # the accept/reject outcome depends only on the readiness rules.
+        plan_id = uuid4()
+        db.execute(
+            INSERT_PLAN_SQL,
+            (str(plan_id), experiment, 1,
+             json.dumps(plan.model_dump(mode="json")), datetime.now(UTC)),
+        )
+        fp = run_creation_fingerprint(experiment, str(plan_id), 1)
+        run_id, err = call_rpc(
+            db, experiment, str(plan_id), 1, actor, f"equiv-{kind}-key", fp
+        )
+        if expected_ready:
+            assert err is None, f"SQL rejected a plan Python accepts ({kind}): {err}"
+            assert run_id is not None
+        else:
+            assert err is not None, f"SQL accepted a plan Python rejects: {kind}"
+            assert "PLAN_NOT_READY" in err or "DELEGATION_ACTOR_MISMATCH" in err, (
+                f"unexpected SQL rejection for {kind}: {err}"
+            )

@@ -13,6 +13,7 @@ from uuid import UUID
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
 from httpx import HTTPStatusError
+from postgrest.exceptions import APIError as PostgrestAPIError
 from pydantic import Field, ValidationError
 from reproagent_schemas import (
     ErrorCategory,
@@ -153,6 +154,23 @@ _RPC_ERROR_MESSAGES = {
 }
 
 
+def _rpc_error_code(exc: PostgrestAPIError) -> str | None:
+    """Read the authorization code the ``create_execution_run`` RPC raised.
+
+    The RPC signals every authorization rejection with
+    ``RAISE EXCEPTION '<CODE>' USING errcode = 'P0001'`` (42501 for FORBIDDEN).
+    PostgREST wraps that into ``APIError``: ``exc.message`` is the bare ``RAISE``
+    text, while ``exc.code`` is only the SQLSTATE, which is shared by all the
+    ``P0001`` checks and therefore cannot tell PLAN_NOT_APPROVED from
+    PLAN_NOT_READY. So the symbolic name is taken from the structured ``message``
+    field, matched against the exact known vocabulary (never a loose substring of
+    an arbitrary repr). Anything unrecognised is not an authorization decision and
+    returns ``None`` so the caller surfaces it as a server error instead of a 409.
+    """
+    message = (exc.message or "").strip()
+    return message if message in _RPC_ERROR_MESSAGES else None
+
+
 @router.post(
     "/experiments/{experiment_id}/runs",
     response_model=RunAccepted,
@@ -193,6 +211,8 @@ async def start_run(
 
     fingerprint = run_creation_fingerprint(experiment_id, UUID(plan["id"]), plan["version"])
 
+    # Catch only the structured PostgREST authorization failure. A transport or
+    # programming error is not a client conflict and must not be turned into a 409.
     try:
         result = admin.rpc("create_execution_run", {
             "p_experiment_id": str(experiment_id),
@@ -202,23 +222,27 @@ async def start_run(
             "p_idempotency_key": idempotency_key,
             "p_request_fingerprint": fingerprint,
         })
-        run_id = UUID(str(result))
-    except Exception as exc:
-        # Extract the database error code from the Supabase RPC exception.
-        error_msg = str(exc)
-        code = None
-        for rpc_code in _RPC_ERROR_MESSAGES:
-            if rpc_code in error_msg:
-                code = rpc_code
-                break
+    except PostgrestAPIError as exc:
+        code = _rpc_error_code(exc)
         if code is None:
             raise HTTPException(
-                status.HTTP_409_CONFLICT,
+                status.HTTP_500_INTERNAL_SERVER_ERROR,
                 {"code": "RUN_CREATION_FAILED", "message": "运行创建失败"},
             ) from exc
         raise HTTPException(
             status.HTTP_409_CONFLICT,
             {"code": code, "message": _RPC_ERROR_MESSAGES[code]},
+        ) from exc
+
+    # A malformed run identifier from a successful RPC is a server-side fault, not
+    # an authorization decision, so it surfaces as 500 rather than being swallowed
+    # into the 409 mapping above.
+    try:
+        run_id = UUID(str(result))
+    except ValueError as exc:
+        raise HTTPException(
+            status.HTTP_500_INTERNAL_SERVER_ERROR,
+            {"code": "RUN_CREATION_FAILED", "message": "运行创建失败"},
         ) from exc
 
     # Redis is only a delivery optimization. The run and its outbox intent are

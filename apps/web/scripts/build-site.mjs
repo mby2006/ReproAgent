@@ -3,7 +3,7 @@ import { rmSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { validateArtifact } from "./verify-artifact.mjs";
+import { validateArtifact, verifyArchive } from "./verify-artifact.mjs";
 
 const mode = process.argv[2];
 if (mode !== "live" && mode !== "static") {
@@ -32,4 +32,8 @@ if (mode === "static") {
   writeFileSync(resolve(webRoot, "out/site-mode.json"), `${JSON.stringify({ mode })}\n`);
 }
 validateArtifact(mode, mode === "static" ? resolve(webRoot, "out") : nextDirectory);
+if (mode === "static") {
+  const archive = await verifyArchive(resolve(webRoot, "out"));
+  console.log(`Archive run ${archive.run}: verifiedFiles: ${archive.verifiedFiles}`);
+}
 console.log(`Built and verified ${mode} artifact`);

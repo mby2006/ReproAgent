@@ -2,6 +2,7 @@ import SiteLink from "@/components/SiteLink";
 import { PredictionReader } from "@/components/PredictionReader";
 import PublicHeader from "@/components/PublicHeader";
 import ParameterTable from "@/components/ParameterTable";
+import { isStaticSite } from "@/lib/site";
 import metrics from "../../../../public/examples/lenet/metrics.json";
 import predictions from "../../../../public/examples/lenet/prediction_examples.json";
 import conditions from "../../../../public/examples/lenet/conditions.json";
@@ -22,6 +23,13 @@ export default function LeNetExample() {
       <p className="text-lg leading-relaxed text-fg-2">想象一张手写支票。两个人写的“5”可能很不一样，金额里的两个数字还可能连在一起。1998 年，LeCun 等人研究了怎样让电脑从样例中学会识别笔迹，并把它用在读取支票这样的任务上。</p>
       <p className="leading-relaxed">我们用简化的 LeNet-5 重做其中一个小实验。给模型一张已经单独截好的数字图片，让它从 0 到 9 中选一个答案。遇到训练时没见过的图片，它能认对多少？</p>
       <a className="text-sm text-info underline" href={pdf+"#page=1"}>阅读论文摘要 · 第 1 页</a>
+      <dl className="grid gap-x-8 gap-y-1.5 rounded-xl border border-line bg-bg-2/40 px-4 py-3 text-sm sm:grid-cols-2" aria-label="归档身份信息">
+        <div className="flex gap-2"><dt className="text-fg-3">归档 ID</dt><dd><code className="font-mono">{manifest.run}</code></dd></div>
+        <div className="flex gap-2"><dt className="text-fg-3">对比组</dt><dd>LeNet-5 × MNIST 缩放复现（缩放版实验，仅复刻论文一小部分）</dd></div>
+        <div className="flex flex-wrap gap-2 sm:col-span-2"><dt className="text-fg-3">模型 SHA-256</dt><dd><code className="break-all font-mono">{manifest.model_sha256}</code></dd></div>
+        <div className="flex flex-wrap gap-2 sm:col-span-2"><dt className="text-fg-3">镜像 digest</dt><dd><code className="break-all font-mono">{manifest.image}</code></dd></div>
+        <div className="flex gap-2"><dt className="text-fg-3">完成时间</dt><dd>{manifest.finished_at}</dd></div>
+      </dl>
     </header>
     <nav className="example-nav" aria-label="实验目录">
       <a href="#method">模型怎样学</a><a href="#results">两次考试的成绩</a><a href="#try">自己认一张</a><a href="#evidence">核查实验依据</a>
@@ -64,11 +72,12 @@ export default function LeNetExample() {
       <ParameterTable rows={conditions} pdfUrl={pdf} fileHref={path => assets+"/"+path+(path.endsWith(".py")?".txt":"")}/>
     </details>
     <footer className="space-y-4 border-t border-line pt-5 text-sm">
-      <p className="text-fg-2">已完成的隔离容器运行 · {manifest.finished_at.slice(0,10)} · 模型指纹 <code>{manifest.run}</code> · 随机种子 {metrics.seed}</p>
+      <p className="text-fg-2">已完成的隔离容器运行 · 归档 ID <code>{manifest.run}</code> · 完成时间 {manifest.finished_at.slice(0,10)} · 随机种子 {metrics.seed}</p>
+      <p className="text-xs leading-relaxed text-fg-3">运行标识是归档 ID；模型 SHA-256 是模型文件指纹，两者不是同一概念。本页为缩放版复现归档，九个归档文件的 SHA-256 可用 manifest.json 离线逐项核验。</p>
       <div className="flex flex-wrap gap-4">
         <a className="btn btn-primary" download href={assets+"/report.md"}>下载实验报告</a>
         <a className="btn btn-ghost" href={assets+"/manifest.json"}>核查产物指纹</a>
-        <SiteLink className="btn btn-ghost" href="/papers">登录后运行自己的实验</SiteLink>
+        {!isStaticSite && <SiteLink className="btn btn-ghost" href="/papers">登录后运行自己的实验</SiteLink>}
       </div>
     </footer>
   </main></>;

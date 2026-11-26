@@ -60,6 +60,6 @@
 | 损失函数 | 第 II.C 节讨论两种评分方式，图 5 这一组的具体选用未确认（[PDF 第 9 页](https://princetonuniversity.github.io/NEU-PSY-502/_static/pdf/Class%204/LeCunn1998.pdf#page=9)） | cross entropy | cross entropy（config.yaml） | 原文给出均方误差及带类别竞争项的准则。本次代码用交叉熵给预测的错误程度打分。 |
 | 测试错误率 | 0.95%（无形变训练）（[PDF 第 11 页](https://princetonuniversity.github.io/NEU-PSY-502/_static/pdf/Class%204/LeCunn1998.pdf#page=11)） | error_rate | 11.23%（metrics.json） | 训练规模、模型细节与测试集不同；单次运行无法归因。 |
 
-运行标识 01993dd36ff17102（模型 SHA-256 前 16 位），完成于 2026-11-21T08:02:35.867905+00:00。
+归档 ID（运行标识）01993dd36ff17102；模型 SHA-256 是模型文件指纹，两者不是同一概念。本次运行完成于 2026-11-21T08:02:35.867905+00:00。
 
 来源：LeCun 等，Gradient-Based Learning Applied to Document Recognition (1998)，DOI 10.1109/5.726791。配置、模型及指标文件与案例同时提供。

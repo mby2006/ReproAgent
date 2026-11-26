@@ -29,7 +29,7 @@ export default function Home() {
           <h1>读懂论文，<br />从一次实验开始。</h1>
           <p className="hero-intro">同一张手写数字，你和模型会给出什么答案？从一次 LeNet-5 实验中，了解模型如何学习，再对照论文核查结果。</p>
           <div className="hero-actions">
-            <SiteLink className="btn btn-primary" href={example}>体验手写数字实验 <IconArrowRight /></SiteLink>
+            <SiteLink className="btn btn-primary" href={example}>运行 LeNet-5 × MNIST 复现实验 <IconArrowRight /></SiteLink>
             {!isStaticSite && <SiteLink className="text-action" href="/papers">复现自己的论文</SiteLink>}
           </div>
         </div>

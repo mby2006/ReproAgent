@@ -5,8 +5,10 @@ import { useRouter, useSearchParams } from "next/navigation";
 import { Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import AuthGate from "@/components/AuthGate";
 import DeletePaperButton from "@/components/DeletePaperButton";
+import PublicHeader from "@/components/PublicHeader";
 import Shell from "@/components/Shell";
 import PaperClient from "./PaperClient";
+import { isStaticSite } from "@/lib/site";
 import {
   IconArrowRight,
   IconLink,
@@ -316,10 +318,33 @@ function PapersWorkspace() {
   );
 }
 
+// 静态归档模式没有后端与登录：/papers 只作为游客入口，
+// 引导到可直接浏览、可离线核验的公共归档，不挂载工作台。
+function PapersArchive() {
+  return (
+    <>
+      <PublicHeader />
+      <main id="content" tabIndex={-1} className="public-container space-y-5 py-10">
+        <h1 className="display text-3xl font-bold">论文复现归档</h1>
+        <p className="leading-relaxed text-fg-2">公开归档可直接浏览；运行自己的实验需使用登录工作台。</p>
+        <SiteLink className="btn btn-primary" href="/examples/lenet-mnist">
+          浏览 LeNet-5 × MNIST 缩放复现归档
+          <IconArrowRight className="h-4 w-4" />
+        </SiteLink>
+      </main>
+    </>
+  );
+}
+
 // 静态托管下没有动态段：同一篇论文的详情用 /papers?id= 打开，列表保持 /papers。
-function PapersRoute() {
+function PapersDynamic() {
   const id = useSearchParams().get("id");
   return id ? <PaperClient paperId={id} /> : <PapersWorkspace />;
+}
+
+function PapersRoute() {
+  if (isStaticSite) return <PapersArchive />;
+  return <PapersDynamic />;
 }
 
 export default function PapersPage() {

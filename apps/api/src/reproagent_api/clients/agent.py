@@ -1,5 +1,3 @@
-from dataclasses import dataclass
-
 import httpx
 from reproagent_schemas import (
     CandidateRequest,
@@ -20,6 +18,7 @@ from reproagent_schemas import (
     GroundRequest,
     GroundResponse,
     JobAccepted,
+    PaperSupportCheck,
     ParsedDocument,
     ParseRequest,
     ParseResponse,
@@ -40,15 +39,6 @@ from reproagent_schemas import (
 )
 
 from ..config import ApiSettings
-
-
-@dataclass(frozen=True)
-class PaperSupportResult:
-    """Structured response from the agent paper support gate."""
-
-    supported: bool
-    code: str
-    message: str
 
 
 class AgentClient:
@@ -101,7 +91,7 @@ class AgentClient:
 
     async def check_support(
         self, document: ParsedDocument, card: ReproductionCard | None
-    ) -> PaperSupportResult:
+    ) -> PaperSupportCheck:
         payload = {
             "document": document.model_dump(mode="json"),
             "card": card.model_dump(mode="json") if card is not None else None,
@@ -109,7 +99,7 @@ class AgentClient:
         response = await self._client.post("/v1/papers/support-check", json=payload, timeout=30.0)
         response.raise_for_status()
         data = response.json()
-        return PaperSupportResult(
+        return PaperSupportCheck(
             supported=data["supported"], code=data["code"], message=data["message"]
         )
 

@@ -10,6 +10,7 @@ import base64
 from datetime import UTC, datetime
 from uuid import UUID, uuid4
 
+from pydantic import ValidationError
 from reproagent_schemas import (
     ClassifyRequest,
     CodegenRequest,
@@ -147,6 +148,12 @@ async def build_reproduction_spec(state: dict, ctx: WorkflowContext) -> dict:
         from reproagent_schemas import ReproductionCard
 
         card = ReproductionCard.model_validate(card_raw)
+    except ValidationError:
+        # Malformed card: let the downstream ground_spec surface the real error.
+        card = None
+    if card is not None:
+        # Transport/HTTP errors from the gate must propagate (fail closed):
+        # a support-check outage cannot silently dispatch an unsupported paper.
         support = await ctx.agent.check_support(state["document"], card)
         if not support.supported:
             error = f"{support.code}: {support.message}"
@@ -157,9 +164,6 @@ async def build_reproduction_spec(state: dict, ctx: WorkflowContext) -> dict:
                 "error": error,
                 "support_code": support.code,
             }
-    except Exception:
-        # If card validation fails, let the downstream ground_spec handle it.
-        pass
     return {"card_raw": card_raw, "usages": response.usages, "budget": budget}
 
 

@@ -106,6 +106,24 @@ def workflow_agent_transport(
                     "usages": [usage.model_dump(mode="json")],
                 },
             )
+        if path == "/v1/papers/support-check":
+            from reproagent_agent.planning import check_supported
+
+            parsed_doc = ParsedDocument.model_validate(body["document"])
+            parsed_card = (
+                ReproductionCard.model_validate(body["card"])
+                if body.get("card") is not None
+                else None
+            )
+            result = check_supported(parsed_doc, parsed_card)
+            return httpx.Response(
+                200,
+                json={
+                    "supported": result.supported,
+                    "code": result.code,
+                    "message": result.message,
+                },
+            )
         if path == "/v1/ground":
             grounded = ReproductionCard.model_validate(body["card_raw"])
             return httpx.Response(200, json={"card": grounded.model_dump(mode="json")})

@@ -6,7 +6,6 @@ only LeNet-5 + MNIST; anything else is rejected loudly.
 """
 
 import math
-from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from reproagent_schemas import (
@@ -20,6 +19,7 @@ from reproagent_schemas import (
     ExpectedRuntime,
     ExperimentPlan,
     ModelConfig,
+    PaperSupportCheck,
     ParamSource,
     PlanParam,
     PreprocessingConfig,
@@ -57,28 +57,39 @@ from .scaling import (
     ScalingConfig,
 )
 
+# The support-gate model is shared with the API client via reproagent_schemas.
+# ``SupportCheck`` is kept as a local alias so in-repo callers/tests are stable.
+SupportCheck = PaperSupportCheck
+
 
 class UnsupportedPaperError(ValueError):
-    """v1 planner only handles LeNet-5 + MNIST."""
+    """v1 planner only handles LeNet-5 + MNIST.
 
+    ``code`` is a stable machine-readable reason (``UNSUPPORTED_DATASET`` /
+    ``UNSUPPORTED_MODEL``) so the support gate does not have to string-match
+    the message text.
+    """
 
-@dataclass(frozen=True)
-class SupportCheck:
-    """Outcome of the deterministic paper support gate."""
+    code: str = "UNSUPPORTED_PAPER"
 
-    supported: bool
-    code: str  # "SUPPORTED" | "SCANNED_PDF" | "UNSUPPORTED_DATASET" | "UNSUPPORTED_MODEL"
-    message: str
+    def __init__(self, message: str, *, code: str | None = None) -> None:
+        super().__init__(message)
+        if code is not None:
+            self.code = code
 
 
 def _guard_lenet_mnist(card: ReproductionCard) -> None:
     dataset = str(card.dataset.value or "").lower()
     if card.dataset.status is EvidenceStatus.MISSING or "mnist" not in dataset:
-        raise UnsupportedPaperError("v1 仅支持 MNIST 数据集；Card 未明确 MNIST")
+        raise UnsupportedPaperError(
+            "v1 仅支持 MNIST 数据集；Card 未明确 MNIST", code="UNSUPPORTED_DATASET"
+        )
     arch = str(card.model_architecture.value or "").lower()
     method = str(card.method.value or "").lower()
     if "lenet" not in arch and "lenet" not in method:
-        raise UnsupportedPaperError("v1 仅支持 LeNet-5 架构；Card 未明确 LeNet")
+        raise UnsupportedPaperError(
+            "v1 仅支持 LeNet-5 架构；Card 未明确 LeNet", code="UNSUPPORTED_MODEL"
+        )
 
 
 def check_supported(
@@ -87,8 +98,8 @@ def check_supported(
     """Deterministic support gate: OCR scanned PDF or unsupported model/dataset.
 
     The model/dataset check is delegated to ``_guard_lenet_mnist`` (the single
-    source of truth for what v1 supports). Callers must not duplicate that
-    string-matching logic.
+    source of truth for what v1 supports); the raised error's ``code`` attribute
+    maps to the gate code, so no string matching on the message is needed.
     """
     if document.ocr_required_pages:
         return SupportCheck(
@@ -99,14 +110,16 @@ def check_supported(
     try:
         _guard_lenet_mnist(card)
     except UnsupportedPaperError as exc:
-        message = str(exc)
-        if "MNIST" in message:
+        if exc.code not in ("UNSUPPORTED_DATASET", "UNSUPPORTED_MODEL"):
             return SupportCheck(
-                supported=False, code="UNSUPPORTED_DATASET", message="v1 仅支持 MNIST 数据集"
+                supported=False, code="UNSUPPORTED_PAPER", message=str(exc)
             )
-        return SupportCheck(
-            supported=False, code="UNSUPPORTED_MODEL", message="v1 仅支持 LeNet-5 架构"
+        message = (
+            "v1 仅支持 MNIST 数据集"
+            if exc.code == "UNSUPPORTED_DATASET"
+            else "v1 仅支持 LeNet-5 架构"
         )
+        return SupportCheck(supported=False, code=exc.code, message=message)
     return SupportCheck(supported=True, code="SUPPORTED", message="LeNet-5 \u00d7 MNIST")
 
 

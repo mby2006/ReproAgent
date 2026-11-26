@@ -143,6 +143,7 @@ def _gate_agent_transport(
     card: ReproductionCard,
     *,
     support_check_endpoint: bool = True,
+    support_check_status: int | None = None,
 ) -> httpx.MockTransport:
     """Agent transport stub: supports parse/extract/ground/support-check."""
     usage = LLMUsage(
@@ -164,6 +165,10 @@ def _gate_agent_transport(
                 },
             )
         if path == "/v1/papers/support-check":
+            if support_check_status is not None:
+                return httpx.Response(
+                    support_check_status, json={"detail": "support gate unavailable"}
+                )
             from reproagent_agent.planning import check_supported
             from reproagent_schemas import ReproductionCard as RC
 
@@ -187,7 +192,14 @@ def _gate_agent_transport(
     return httpx.MockTransport(handler)
 
 
-def _ctx(admin, results: list, doc: ParsedDocument, card: ReproductionCard):
+def _ctx(
+    admin,
+    results: list,
+    doc: ParsedDocument,
+    card: ReproductionCard,
+    *,
+    support_check_status: int | None = None,
+):
     settings = ApiSettings(
         supabase_anon_key="anon-test",
         supabase_service_role_key="service-test",
@@ -197,7 +209,10 @@ def _ctx(admin, results: list, doc: ParsedDocument, card: ReproductionCard):
     recorder = RecordingRunner()
     ctx = WorkflowContext(
         admin=admin,
-        agent=AgentClient(settings, transport=_gate_agent_transport(doc, card)),
+        agent=AgentClient(
+            settings,
+            transport=_gate_agent_transport(doc, card, support_check_status=support_check_status),
+        ),
         runner=RunnerClient(settings, transport=recorder.transport()),
         settings=settings,
         budget_config=BudgetConfig(),
@@ -270,3 +285,20 @@ async def test_supported_lenet_mnist_proceeds_past_gate():
     assert admin.tables["workflows"][0]["status"] == WorkflowStatus.AWAITING_SPEC_REVIEW.value
     assert admin.tables["workflows"][0].get("error") is None
     assert ctx.recorder.dispatch_count == 0  # type: ignore  # gate doesn't block, just hasn't reached runner yet
+
+
+@pytest.mark.asyncio
+async def test_support_check_transport_error_fails_closed():
+    """A support-check outage must fail the workflow, never silently dispatch."""
+    admin = FakeAdmin(_seed(), {str(PROJECT_ID): str(USER_ID)})
+    ctx = _ctx(admin, [], clean_document(), make_card(), support_check_status=500)
+    try:
+        await start_workflow(ctx, make_memory_checkpointer(), _state(admin))
+    finally:
+        await ctx.agent.aclose()
+        await ctx.runner.aclose()
+    # The gate error propagates instead of being swallowed by the node.
+    assert admin.tables["workflows"][0]["status"] == WorkflowStatus.FAILED.value
+    assert admin.tables["workflows"][0]["error"] is not None
+    # Crucially, no Runner container/run was ever created (fail closed).
+    assert ctx.recorder.dispatch_count == 0  # type: ignore

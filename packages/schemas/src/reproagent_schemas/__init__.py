@@ -159,6 +159,7 @@ from .spec import (
     ReproductionSpec,
     TrainingSpec,
 )
+from .support import PaperSupportCheck, SupportCode
 from .understanding import (
     CardEditRequest,
     CardVersion,
@@ -266,6 +267,7 @@ __all__ = [
     "Paper",
     "PaperSource",
     "PaperStatus",
+    "PaperSupportCheck",
     "ParamSource",
     "ParseRequest",
     "ParseResponse",
@@ -302,6 +304,7 @@ __all__ = [
     "SchemaModel",
     "SpecOrigin",
     "StaticValidateRequest",
+    "SupportCode",
     "TableData",
     "TextBlock",
     "TrainingConfig",

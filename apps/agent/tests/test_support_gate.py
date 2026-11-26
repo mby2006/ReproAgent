@@ -6,7 +6,11 @@ before any Runner container is created.
 
 import pytest
 from reproagent_agent.planning import check_supported
-from reproagent_agent.planning.engine import SupportCheck
+from reproagent_agent.planning.engine import (
+    SupportCheck,
+    UnsupportedPaperError,
+    _guard_lenet_mnist,
+)
 from reproagent_schemas import (
     EvidenceField,
     EvidenceStatus,
@@ -122,3 +126,46 @@ class TestCardRequiredAfterExtraction:
         doc = make_document()
         with pytest.raises(ValueError, match="card is required"):
             check_supported(doc, None)
+
+
+class TestErrorCodeAttribute:
+    """Important #2: the gate discriminates on ``exc.code``, not message text."""
+
+    def test_dataset_guard_error_has_code(self):
+        card = minimal_card(dataset=explicit("CIFAR-10 images"))
+        with pytest.raises(UnsupportedPaperError) as excinfo:
+            _guard_lenet_mnist(card)
+        assert excinfo.value.code == "UNSUPPORTED_DATASET"
+        # message text still mentions MNIST for human readability
+        assert "MNIST" in str(excinfo.value)
+
+    def test_model_guard_error_has_code(self):
+        card = minimal_card(
+            model_architecture=explicit("ResNet-50"),
+            method=explicit("residual learning"),
+        )
+        with pytest.raises(UnsupportedPaperError) as excinfo:
+            _guard_lenet_mnist(card)
+        assert excinfo.value.code == "UNSUPPORTED_MODEL"
+
+    def test_dataset_code_drives_gate_not_message_text(self):
+        # Prove the branch keys off ``exc.code``: monkeypatch the guard to raise
+        # a dataset error whose message text would have fooled the old
+        # ``"MNIST" in str(exc)`` string matcher (no "MNIST" substring present).
+        import reproagent_agent.planning.engine as engine
+
+        original = engine._guard_lenet_mnist
+        try:
+            def fake_guard(card):
+                raise UnsupportedPaperError("dataset rejected", code="UNSUPPORTED_DATASET")
+
+            engine._guard_lenet_mnist = fake_guard
+            result = check_supported(make_document(), minimal_card())
+        finally:
+            engine._guard_lenet_mnist = original
+        assert result.supported is False
+        assert result.code == "UNSUPPORTED_DATASET"
+
+    def test_default_code_when_not_specified(self):
+        exc = UnsupportedPaperError("boom")
+        assert exc.code == "UNSUPPORTED_PAPER"

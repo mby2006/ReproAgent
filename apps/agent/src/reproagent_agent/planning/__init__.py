@@ -1,4 +1,9 @@
-from .engine import SupportCheck, UnsupportedPaperError, build_plan, check_supported
+from .engine import (
+    SupportCheck,
+    UnsupportedPaperError,
+    build_plan,
+    check_supported,
+)
 from .scaling import ScalingConfig
 
 __all__ = [

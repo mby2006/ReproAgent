@@ -98,8 +98,13 @@ function buildEditables(plan: ExperimentPlan): Editable[] {
   return list;
 }
 
+function planPaperValue(param?: PlanParam) {
+  return param?.source === "paper_explicit" ? param.paper_value ?? null : null;
+}
+
 function planPaperEvidence(param?: PlanParam) {
-  if (!param || (param.source_page == null && !param.evidence_quote && param.paper_value == null)) return null;
+  if (param?.source !== "paper_explicit") return null;
+  if (param.source_page == null && !param.evidence_quote && param.paper_value == null) return null;
   return {
     kind: "paper",
     source_page: param.source_page ?? null,
@@ -110,29 +115,80 @@ function planPaperEvidence(param?: PlanParam) {
 
 function planConditionRows(plan: ExperimentPlan, actual: string): Array<Record<string, unknown>> {
   const t = plan.training_config;
-  const reported = plan.evaluation_config.reported_value;
   return [
     { key: "dataset", label: "数据集", paper: null, plan: plan.dataset_config.name, actual, note: null },
     { key: "architecture", label: "模型结构", paper: null, plan: plan.model_config.architecture, actual, note: plan.model_config.description ?? null },
-    { key: "optimizer", label: "优化器", paper: t.optimizer.paper_value, plan: t.optimizer.value, actual, paper_evidence: planPaperEvidence(t.optimizer), note: t.optimizer.rationale },
-    { key: "learning_rate", label: "学习率", paper: t.learning_rate.paper_value, plan: t.learning_rate.value, actual, paper_evidence: planPaperEvidence(t.learning_rate), note: t.learning_rate.rationale },
-    { key: "loss_function", label: "损失函数", paper: t.loss_function.paper_value, plan: t.loss_function.value, actual, paper_evidence: planPaperEvidence(t.loss_function), note: t.loss_function.rationale },
-    { key: "batch_size", label: "批大小", paper: t.batch_size.paper_value, plan: t.batch_size.value, actual, paper_evidence: planPaperEvidence(t.batch_size), note: t.batch_size.rationale },
-    { key: "epochs", label: "训练轮数", paper: t.epochs.paper_value, plan: t.epochs.value, actual, paper_evidence: planPaperEvidence(t.epochs), note: t.epochs.rationale },
+    { key: "optimizer", label: "优化器", paper: planPaperValue(t.optimizer), plan: t.optimizer.value, actual, paper_evidence: planPaperEvidence(t.optimizer), note: t.optimizer.rationale },
+    { key: "learning_rate", label: "学习率", paper: planPaperValue(t.learning_rate), plan: t.learning_rate.value, actual, paper_evidence: planPaperEvidence(t.learning_rate), note: t.learning_rate.rationale },
+    { key: "loss_function", label: "损失函数", paper: planPaperValue(t.loss_function), plan: t.loss_function.value, actual, paper_evidence: planPaperEvidence(t.loss_function), note: t.loss_function.rationale },
+    { key: "batch_size", label: "批大小", paper: planPaperValue(t.batch_size), plan: t.batch_size.value, actual, paper_evidence: planPaperEvidence(t.batch_size), note: t.batch_size.rationale },
+    { key: "epochs", label: "训练轮数", paper: planPaperValue(t.epochs), plan: t.epochs.value, actual, paper_evidence: planPaperEvidence(t.epochs), note: t.epochs.rationale },
     {
       key: "target_metric",
       label: "评价指标",
-      paper: reported == null ? null : `${reported}${plan.evaluation_config.reported_condition ? `（${plan.evaluation_config.reported_condition}）` : ""}`,
+      // EvaluationConfig has no evidence status. A page number alone cannot
+      // distinguish an explicit paper result from an inferred candidate.
+      paper: null,
       plan: plan.evaluation_config.target_metric,
       actual,
-      paper_evidence: plan.evaluation_config.reported_source_page == null ? null : {
-        kind: "paper",
-        source_page: plan.evaluation_config.reported_source_page,
-        detail: reported == null ? null : String(reported),
-      },
+      paper_evidence: null,
       note: plan.evaluation_config.comparison_note,
     },
   ];
+}
+
+export type ConditionReportState =
+  | { status: "loading" }
+  | { status: "ready"; report: RunReport }
+  | { status: "unavailable" }
+  | { status: "unknown" };
+
+function conditionActualValue(state: ConditionReportState) {
+  if (state.status === "loading") return "正在确认";
+  if (state.status === "unavailable") return "尚未执行";
+  if (state.status === "unknown") return "无法确认";
+  return "无可用证据";
+}
+
+export function conditionRowsForPlan(plan: ExperimentPlan, state: ConditionReportState, planVersion: number) {
+  const effectiveState = state.status === "ready" && state.report.report_json.references.plan_version !== planVersion
+    ? { status: "unknown" as const }
+    : state;
+  const comparisons = effectiveState.status === "ready" ? effectiveState.report.report_json.parameter_comparisons : undefined;
+  if (comparisons?.length) return selectConditionSummary(comparisons);
+  return selectConditionSummary(planConditionRows(plan, conditionActualValue(effectiveState)));
+}
+
+export async function loadConditionReport(
+  experimentId: string,
+  planVersion: number,
+  fetcher: typeof apiFetch = apiFetch,
+  signal?: AbortSignal,
+): Promise<ConditionReportState> {
+  let runs: RunSummary[];
+  try {
+    runs = await fetcher<RunSummary[]>(`/v1/experiments/${experimentId}/runs`, { signal });
+  } catch {
+    return { status: "unknown" };
+  }
+  if (runs.length === 0) return { status: "unavailable" };
+
+  let onlyUnavailable = true;
+  for (const run of runs) {
+    if (signal?.aborted) return { status: "unknown" };
+    try {
+      const report = await fetcher<RunReport>(`/v1/runs/${run.id}/report`, { signal });
+      if (report.report_json.references.plan_version === planVersion) {
+        return { status: "ready", report };
+      }
+      onlyUnavailable = false;
+    } catch (err) {
+      if (err instanceof ApiError && err.code === "REPORT_UNAVAILABLE") continue;
+      // A newer run can fail while an older persisted report remains valid.
+      onlyUnavailable = false;
+    }
+  }
+  return { status: onlyUnavailable ? "unavailable" : "unknown" };
 }
 
 function EditRow({ item, active, onClick, delegated }: { item: Editable; active: boolean; onClick: () => void; delegated: boolean }) {
@@ -281,7 +337,7 @@ function PlanInner({ experimentId }: { experimentId: string }) {
     [router, search],
   );
   const [experiment, setExperiment] = useState<ExperimentDetail | null>(null);
-  const [report, setReport] = useState<RunReport | null>(null);
+  const [conditionReportState, setConditionReportState] = useState<ConditionReportState>({ status: "loading" });
   const [pdfUrl, setPdfUrl] = useState<string | null>(null);
   const [versions, setVersions] = useState<PlanVersionMeta[]>([]);
   const [current, setCurrent] = useState<PlanVersion | null>(null);
@@ -369,23 +425,14 @@ function PlanInner({ experimentId }: { experimentId: string }) {
   }, [experiment?.paper_id]);
 
   useEffect(() => {
-    let cancelled = false;
-    setReport(null);
-    void (async () => {
-      try {
-        const runs = await apiFetch<RunSummary[]>(`/v1/experiments/${experimentId}/runs`);
-        const latest = runs[0];
-        if (!latest) return;
-        const next = await apiFetch<RunReport>(`/v1/runs/${latest.id}/report`);
-        if (!cancelled) setReport(next);
-      } catch (err) {
-        if (cancelled) return;
-        if (err instanceof ApiError && err.code === "REPORT_UNAVAILABLE") return;
-        // Condition evidence is supplementary; plan review must remain usable if it cannot load.
-      }
-    })();
-    return () => { cancelled = true; };
-  }, [experimentId, current?.id, wfStatus]);
+    if (current?.version == null) return;
+    const controller = new AbortController();
+    setConditionReportState({ status: "loading" });
+    void loadConditionReport(experimentId, current.version, apiFetch, controller.signal).then((state) => {
+      if (!controller.signal.aborted) setConditionReportState(state);
+    });
+    return () => controller.abort();
+  }, [experimentId, current?.version, wfStatus]);
 
   useEffect(() => {
     if (!wfStatus || wfStatus === "planning") return;
@@ -632,13 +679,15 @@ function PlanInner({ experimentId }: { experimentId: string }) {
   }
 
   const plan = current?.plan;
-  const activeConditionReport = report?.report_json.references.plan_version === current?.version ? report : null;
+  const conditionPlanVersion = current?.version;
+  const activeConditionReport = conditionReportState.status === "ready" &&
+    conditionReportState.report.report_json.references.plan_version === conditionPlanVersion
+    ? conditionReportState.report
+    : null;
   const conditionRows = useMemo(() => {
-    if (!plan) return [];
-    const comparisons = activeConditionReport?.report_json.parameter_comparisons;
-    if (comparisons?.length) return selectConditionSummary(comparisons);
-    return selectConditionSummary(planConditionRows(plan, report ? "无可用证据" : "尚未执行"));
-  }, [plan, activeConditionReport, report]);
+    if (!plan || conditionPlanVersion == null) return [];
+    return conditionRowsForPlan(plan, conditionReportState, conditionPlanVersion);
+  }, [plan, conditionReportState, conditionPlanVersion]);
   const editables = plan ? buildEditables(plan) : [];
   const assumptions = plan?.assumptions ?? [];
   const isPending = (a: Assumption) => a.requires_confirmation && !isReviewHandled(a, delegated);
@@ -946,7 +995,7 @@ function PlanInner({ experimentId }: { experimentId: string }) {
                 </p>
                 {plan.evaluation_config.reported_value != null && (
                   <p className="font-mono text-[12px] text-fg-3">
-                    原文报告：{plan.evaluation_config.reported_value}
+                    提取报告值（论文出处未验证）：{plan.evaluation_config.reported_value}
                     {plan.evaluation_config.reported_condition
                       ? `（${plan.evaluation_config.reported_condition}）`
                       : ""}

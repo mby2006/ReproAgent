@@ -159,3 +159,85 @@ Evidence screenshots:
 ## Concerns
 
 - Workbench browser verification used deterministic route fixtures to prove layout and data-flow behavior; it was not a newly executed scientific training run. The public archive used real manifest data, and evaluator key names/evidence fields were checked against `apps/agent/src/reproagent_agent/evaluation/parameters.py`. No fixture data is committed.
+
+## Fix round 1/5
+
+- Session model: inherited because model selection is unavailable in this harness.
+- Base: `e74e5d0e9fec43239e8569fd938005b67d22ea28`
+- Fix commit: `437f4f559b587707716bf3d252d8de565c87b2cc`
+
+### Root causes
+
+1. Plan-derived condition rows copied `PlanParam.paper_value`, `evidence_quote`, and `source_page` without checking `PlanParam.source`. The planner can attach candidate evidence to `INFERRED` params, so the summary promoted unverified candidates into the paper column. `EvaluationConfig` also lacks an evidence-status flag, making `reported_value` plus `reported_source_page` insufficient proof of paper provenance.
+2. The report effect collapsed every non-`REPORT_UNAVAILABLE` failure into the same empty state as “no report”. Row rendering then used `report ? 无可用证据 : 尚未执行`, so network and report-generation failures falsely asserted that execution had not happened.
+3. The effect inspected only `runs[0]`. Because runs are newest-first, a newer unavailable/failed/wrong-version report hid an older persisted report that still matched the current immutable plan version.
+
+### Changes
+
+- Added provenance gates for pre-report paper values and citations: only `PlanParam.source === "paper_explicit"` can populate the paper column or paper evidence.
+- Suppressed the plan's target-metric reported result as paper evidence before an evaluator report because `EvaluationConfig` has no trustworthy verification flag. The separate evaluation card now labels it `提取报告值（论文出处未验证）` instead of `原文报告`.
+- Added an explicit `ConditionReportState` discriminated state: `loading`, `ready`, `unavailable`, and `unknown`.
+  - `loading` renders `正在确认`.
+  - Confirmed no-report states render `尚未执行`.
+  - Network/service/report-generation failures and unusable version matches render `无法确认`.
+  - Ready reports without comparisons render `无可用证据`.
+- Added `loadConditionReport`, which walks runs newest-to-oldest, continues through `REPORT_UNAVAILABLE` and other report errors, and accepts only a report whose `report_json.references.plan_version` matches the current plan version.
+- Added a render-time plan-version guard so a stale ready report cannot flash comparisons after switching plan versions.
+- Preserved the fixed eight-item order, `无可用证据` missing-value copy, five-column detailed table, responsive three-column summary, and report version/final-attempt metadata behavior.
+
+### TDD evidence
+
+#### RED
+
+First focused run after adding `PlanClient.test.mjs` failed all 10 new tests because the condition-row and report-selection seams were not exported. After adding the test seams without correcting behavior, the focused suite produced 7 behavioral failures, including:
+
+- inferred optimizer `adam` rendered as paper evidence instead of `无可用证据`;
+- unverified target result `99.1（test）` rendered as paper evidence;
+- newest `REPORT_UNAVAILABLE` and `REPORT_GENERATION_FAILED` did not fall through to the older matching report;
+- generation/network failures became `unavailable` and would render `尚未执行`;
+- a report for another plan version was not rejected correctly.
+
+A further RED test proved that a stale `ready` report for plan v1 could still render after switching to plan v2.
+
+#### GREEN
+
+```text
+cd apps/web && node --test src/app/experiments/PlanClient.test.mjs src/lib/conditions.test.mjs
+tests 13
+pass 13
+fail 0
+```
+
+The new tests cover inferred paper candidates, explicit paper provenance, unverified target metrics, unavailable and generation-failed newest reports, network failures, older matching reports, wrong-plan-version reports, stale version switches, confirmed no-report states, loading, and ready reports without comparisons.
+
+### Verification
+
+All commands were run after the final source edits:
+
+```text
+cd apps/web && pnpm test
+  78 tests, 78 passed, 0 failed
+
+cd apps/web && pnpm lint
+  passed
+
+cd apps/web && pnpm exec tsc --noEmit
+  passed
+
+cd apps/web && pnpm build
+  Next.js 16.4.6 live production build passed
+  Built and verified live artifact
+
+cd apps/web && pnpm build:static
+  Archive run 01993dd36ff17102: verifiedFiles: 9
+  Built and verified static artifact
+
+git diff --check
+  passed (only the existing LF/CRLF working-copy warning)
+```
+
+### Limitations
+
+- This fix round added deterministic API-boundary regression tests but did not repeat the prior real-browser acceptance or execute a new scientific training run.
+- No acceptance evidence artifacts, production accounts, or secrets were created or used.
+- Existing unrelated untracked paths `apps/web/report-v2.md`, `docs/superpowers/`, and `report-v2.md` were left untouched.

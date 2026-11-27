@@ -525,6 +525,22 @@ export interface ParameterComparison {
   note: string;
 }
 
+export type ConditionSummaryValue = string | number | boolean;
+
+export interface ConditionSummaryRow {
+  item: string;
+  key: string;
+  label: string;
+  paper: ConditionSummaryValue;
+  plan: ConditionSummaryValue;
+  actual: ConditionSummaryValue;
+  source: ConditionSummaryValue;
+  note: ConditionSummaryValue;
+  paper_evidence: EvidenceRef | null;
+  actual_evidence: EvidenceRef | null;
+  decision: string | null;
+}
+
 export interface EvaluationReport {
   reader_summary?: string | null;
   target_metric?: string | null;

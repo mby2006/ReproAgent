@@ -2,13 +2,14 @@
 
 import SiteLink from "@/components/SiteLink";
 import { useRouter, useSearchParams } from "next/navigation";
-import { Suspense, useCallback, useEffect, useRef, useState } from "react";
+import { Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import AuthGate from "@/components/AuthGate";
 import Shell from "@/components/Shell";
 import WorkflowInsights from "@/components/WorkflowInsights";
+import ParameterTable, { ConditionSummary } from "@/components/ParameterTable";
 import { IconArrowLeft, IconCheck, IconWarn } from "@/components/icons";
 import RunPanel from "./RunPanel";
-import { adoptPlanRecommendations, apiFetch, delegatePlan, explainPlan, overridePlanTier, recommendPlan, resumeWorkflow, retryWorkflow } from "@/lib/api";
+import { ApiError, adoptPlanRecommendations, apiFetch, apiHref, delegatePlan, explainPlan, overridePlanTier, recommendPlan, resumeWorkflow, retryWorkflow } from "@/lib/api";
 import { ConfirmationBadge, DelegationDialog, DelegationNotice, ExplanationCard, PreselectionHint, RecommendationCard, ReviewModeSelector, ReviewRequestStatus } from "@/components/ReviewControls";
 import { hasDelegation, isReviewHandled, ordinaryReviewMode, useReviewMode, useReviewRequest, useReviewSelection } from "@/lib/useReview";
 import { useWorkflow } from "@/lib/useWorkflow";
@@ -24,9 +25,12 @@ import type {
   PlanVersion,
   PlanVersionMeta,
   RiskTier,
+  RunReport,
+  RunSummary,
 } from "@/lib/types";
 import { RISK_META, SOURCE_META, TONE_BADGE, fmtDate, tierOf } from "@/lib/ui";
 import { fieldLabel, kindHint, shortValue } from "@/lib/fieldLabels";
+import { selectConditionSummary } from "@/lib/conditions.mjs";
 
 const EXPERIMENT_STATUS: Record<string, string> = {
   planning: "计划中",
@@ -92,6 +96,43 @@ function buildEditables(plan: ExperimentPlan): Editable[] {
     { path: "evaluation_config.tolerance", label: "对比容差", value: plan.evaluation_config.tolerance },
   );
   return list;
+}
+
+function planPaperEvidence(param?: PlanParam) {
+  if (!param || (param.source_page == null && !param.evidence_quote && param.paper_value == null)) return null;
+  return {
+    kind: "paper",
+    source_page: param.source_page ?? null,
+    quote: param.evidence_quote ?? null,
+    detail: param.paper_value == null ? null : String(param.paper_value),
+  };
+}
+
+function planConditionRows(plan: ExperimentPlan, actual: string): Array<Record<string, unknown>> {
+  const t = plan.training_config;
+  const reported = plan.evaluation_config.reported_value;
+  return [
+    { key: "dataset", label: "数据集", paper: null, plan: plan.dataset_config.name, actual, note: null },
+    { key: "architecture", label: "模型结构", paper: null, plan: plan.model_config.architecture, actual, note: plan.model_config.description ?? null },
+    { key: "optimizer", label: "优化器", paper: t.optimizer.paper_value, plan: t.optimizer.value, actual, paper_evidence: planPaperEvidence(t.optimizer), note: t.optimizer.rationale },
+    { key: "learning_rate", label: "学习率", paper: t.learning_rate.paper_value, plan: t.learning_rate.value, actual, paper_evidence: planPaperEvidence(t.learning_rate), note: t.learning_rate.rationale },
+    { key: "loss_function", label: "损失函数", paper: t.loss_function.paper_value, plan: t.loss_function.value, actual, paper_evidence: planPaperEvidence(t.loss_function), note: t.loss_function.rationale },
+    { key: "batch_size", label: "批大小", paper: t.batch_size.paper_value, plan: t.batch_size.value, actual, paper_evidence: planPaperEvidence(t.batch_size), note: t.batch_size.rationale },
+    { key: "epochs", label: "训练轮数", paper: t.epochs.paper_value, plan: t.epochs.value, actual, paper_evidence: planPaperEvidence(t.epochs), note: t.epochs.rationale },
+    {
+      key: "target_metric",
+      label: "评价指标",
+      paper: reported == null ? null : `${reported}${plan.evaluation_config.reported_condition ? `（${plan.evaluation_config.reported_condition}）` : ""}`,
+      plan: plan.evaluation_config.target_metric,
+      actual,
+      paper_evidence: plan.evaluation_config.reported_source_page == null ? null : {
+        kind: "paper",
+        source_page: plan.evaluation_config.reported_source_page,
+        detail: reported == null ? null : String(reported),
+      },
+      note: plan.evaluation_config.comparison_note,
+    },
+  ];
 }
 
 function EditRow({ item, active, onClick, delegated }: { item: Editable; active: boolean; onClick: () => void; delegated: boolean }) {
@@ -240,6 +281,8 @@ function PlanInner({ experimentId }: { experimentId: string }) {
     [router, search],
   );
   const [experiment, setExperiment] = useState<ExperimentDetail | null>(null);
+  const [report, setReport] = useState<RunReport | null>(null);
+  const [pdfUrl, setPdfUrl] = useState<string | null>(null);
   const [versions, setVersions] = useState<PlanVersionMeta[]>([]);
   const [current, setCurrent] = useState<PlanVersion | null>(null);
   const [selected, setSelected] = useState<Editable | null>(null);
@@ -315,6 +358,34 @@ function PlanInner({ experimentId }: { experimentId: string }) {
     loadExperiment().catch((err) => setError(err.message));
     loadVersions().catch(() => {});
   }, [loadExperiment, loadVersions]);
+
+  useEffect(() => {
+    if (!experiment?.paper_id) return;
+    const controller = new AbortController();
+    apiFetch<{ url: string }>(`/v1/papers/${experiment.paper_id}/pdf`, { signal: controller.signal })
+      .then((result) => { if (!controller.signal.aborted) setPdfUrl(apiHref(result.url)); })
+      .catch(() => {});
+    return () => controller.abort();
+  }, [experiment?.paper_id]);
+
+  useEffect(() => {
+    let cancelled = false;
+    setReport(null);
+    void (async () => {
+      try {
+        const runs = await apiFetch<RunSummary[]>(`/v1/experiments/${experimentId}/runs`);
+        const latest = runs[0];
+        if (!latest) return;
+        const next = await apiFetch<RunReport>(`/v1/runs/${latest.id}/report`);
+        if (!cancelled) setReport(next);
+      } catch (err) {
+        if (cancelled) return;
+        if (err instanceof ApiError && err.code === "REPORT_UNAVAILABLE") return;
+        // Condition evidence is supplementary; plan review must remain usable if it cannot load.
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [experimentId, current?.id, wfStatus]);
 
   useEffect(() => {
     if (!wfStatus || wfStatus === "planning") return;
@@ -561,6 +632,13 @@ function PlanInner({ experimentId }: { experimentId: string }) {
   }
 
   const plan = current?.plan;
+  const activeConditionReport = report?.report_json.references.plan_version === current?.version ? report : null;
+  const conditionRows = useMemo(() => {
+    if (!plan) return [];
+    const comparisons = activeConditionReport?.report_json.parameter_comparisons;
+    if (comparisons?.length) return selectConditionSummary(comparisons);
+    return selectConditionSummary(planConditionRows(plan, report ? "无可用证据" : "尚未执行"));
+  }, [plan, activeConditionReport, report]);
   const editables = plan ? buildEditables(plan) : [];
   const assumptions = plan?.assumptions ?? [];
   const isPending = (a: Assumption) => a.requires_confirmation && !isReviewHandled(a, delegated);
@@ -719,6 +797,25 @@ function PlanInner({ experimentId }: { experimentId: string }) {
           );
         })}
       </nav>
+
+      {plan && view === "plan" && (
+        <>
+          <ConditionSummary
+            rows={conditionRows}
+            pdfUrl={pdfUrl}
+            reportVersion={activeConditionReport?.version}
+            executionAttempt={activeConditionReport?.execution_attempt}
+          />
+          {!!activeConditionReport?.report_json.parameter_comparisons?.length && (
+            <details className="card px-4 py-3">
+              <summary className="cursor-pointer text-[13.5px] text-fg-2">查看完整五列对照表（偏差、证据与影响）</summary>
+              <div className="mt-3">
+                <ParameterTable rows={activeConditionReport.report_json.parameter_comparisons} pdfUrl={pdfUrl} />
+              </div>
+            </details>
+          )}
+        </>
+      )}
 
       {workflow && <WorkflowInsights key={workflow.id} workflow={workflow} onRetry={retry} retrying={retrying} />}
 

@@ -1,8 +1,9 @@
 import SiteLink from "@/components/SiteLink";
 import { PredictionReader } from "@/components/PredictionReader";
 import PublicHeader from "@/components/PublicHeader";
-import ParameterTable from "@/components/ParameterTable";
+import ParameterTable, { ConditionSummary } from "@/components/ParameterTable";
 import { isStaticSite } from "@/lib/site";
+import { selectConditionSummary } from "@/lib/conditions.mjs";
 import metrics from "../../../../public/examples/lenet/metrics.json";
 import predictions from "../../../../public/examples/lenet/prediction_examples.json";
 import conditions from "../../../../public/examples/lenet/conditions.json";
@@ -11,6 +12,7 @@ import manifest from "../../../../public/examples/lenet/manifest.json";
 const pdf = "https://princetonuniversity.github.io/NEU-PSY-502/_static/pdf/Class%204/LeCunn1998.pdf";
 const assets = "/examples/lenet";
 const number = (n: number) => n.toLocaleString("zh-CN");
+const conditionSummary = selectConditionSummary(conditions);
 
 export const metadata = {title:"电脑怎样认出手写数字？一次 LeNet-5 小实验 · ReproAgent"};
 
@@ -31,6 +33,7 @@ export default function LeNetExample() {
         <div className="flex gap-2"><dt className="text-fg-3">完成时间</dt><dd>{manifest.finished_at}</dd></div>
       </dl>
     </header>
+    <ConditionSummary rows={conditionSummary} pdfUrl={pdf} fileHref={path => assets+"/"+path+(path.endsWith(".py")?".txt":"")}/>
     <nav className="example-nav" aria-label="实验目录">
       <a href="#method">模型怎样学</a><a href="#results">两次考试的成绩</a><a href="#try">自己认一张</a><a href="#evidence">核查实验依据</a>
     </nav>

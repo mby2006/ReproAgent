@@ -11,7 +11,7 @@
     "verify:static": "node scripts/verify-artifact.mjs static",
     "start": "next start",
     "lint": "eslint",
-    "test": "node --test src/components/*.test.mjs src/lib/*.test.mjs src/app/*/*.test.mjs"
+    "test": "node --test src/components/*.test.mjs src/lib/*.test.mjs src/app/*/*.test.mjs scripts/*.test.mjs"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.119.0",
@@ -26,6 +26,7 @@
     "@types/react-dom": "^19",
     "eslint": "^9",
     "eslint-config-next": "16.4.6",
+    "playwright-core": "^1.65.1",
     "tailwindcss": "4.3.3",
     "typescript": "^5"
   },

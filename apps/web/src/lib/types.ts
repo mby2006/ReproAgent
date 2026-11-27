@@ -37,6 +37,7 @@ export interface RecommendResponse {
 }
 
 export type EvidenceStatus = "paper_explicit" | "paper_described" | "inferred" | "missing";
+export type GroundingStatus = "not_checked" | "verified" | "citation_not_found" | "located_unsupported";
 
 export interface EvidenceField {
   value: string | number | boolean | null;
@@ -44,6 +45,9 @@ export interface EvidenceField {
   source_page: number | null;
   source_section: string | null;
   evidence_quote: string | null;
+  grounding_status?: GroundingStatus;
+  candidate_quote?: string | null;
+  candidate_page?: number | null;
   confidence: number;
   human_confirmed: boolean;
   confirmed_by?: ConfirmationSource | null;

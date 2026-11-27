@@ -74,6 +74,15 @@ export default function LeNetExample() {
     <footer className="space-y-4 border-t border-line pt-5 text-sm">
       <p className="text-fg-2">已完成的隔离容器运行 · 归档 ID <code>{manifest.run}</code> · 完成时间 {manifest.finished_at.slice(0,10)} · 随机种子 {metrics.seed}</p>
       <p className="text-xs leading-relaxed text-fg-3">运行标识是归档 ID；模型 SHA-256 是模型文件指纹，两者不是同一概念。本页为缩放版复现归档，九个归档文件的 SHA-256 可用 manifest.json 离线逐项核验。</p>
+      <details className="rounded-xl border border-line bg-bg-2/40 p-3 text-sm">
+        <summary className="cursor-pointer font-medium text-fg-2">查看九个归档文件</summary>
+        <ul className="mt-3 grid gap-2 sm:grid-cols-2" aria-label="九个归档文件">
+          {Object.entries(manifest.files).map(([file, hash]) => <li key={file} className="flex min-w-0 items-center justify-between gap-3">
+            <a className="min-w-0 truncate text-info underline" href={`${assets}/${file}`} download>{file}</a>
+            <code className="shrink-0 font-mono text-[10px] text-fg-3" title={hash}>{hash.slice(0, 12)}…</code>
+          </li>)}
+        </ul>
+      </details>
       <div className="flex flex-wrap gap-4">
         <a className="btn btn-primary" download href={assets+"/report.md"}>下载实验报告</a>
         <a className="btn btn-ghost" href={assets+"/manifest.json"}>核查产物指纹</a>

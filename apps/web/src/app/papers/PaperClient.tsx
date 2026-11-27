@@ -7,6 +7,7 @@ import AuthGate from "@/components/AuthGate";
 import DeletePaperButton from "@/components/DeletePaperButton";
 import Shell from "@/components/Shell";
 import WorkflowInsights from "@/components/WorkflowInsights";
+import { FieldEvidence } from "./FieldEvidence";
 import {
   IconArrowLeft,
   IconArrowRight,
@@ -624,15 +625,7 @@ function PaperInner({ paperId }: { paperId: string }) {
                 <h3 className="display min-w-0 truncate text-sm font-semibold">{selected.label}</h3>
                 <StatusBadge field={selected.field} />
               </div>
-              {selected.field.evidence_quote ? (
-                <blockquote className="quote">“{selected.field.evidence_quote}”</blockquote>
-              ) : (
-                <p className="text-sm text-fg-3">
-                  {selected.field.status === "missing"
-                    ? "论文中未找到该信息。"
-                    : "无原文引文（推断值，请人工确认）。"}
-                </p>
-              )}
+              <FieldEvidence field={selected.field} />
               <div className="space-y-1.5">
                 <p className="font-mono text-[10.5px] text-fg-3">
                   {selected.field.source_page !== null && `p.${selected.field.source_page} · `}

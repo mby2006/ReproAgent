@@ -33,19 +33,17 @@ from reproagent_api.workflow.nodes import (
     execute_code,
     persist_results,
 )
-from reproagent_schemas import RunResult, RunStatus, WorkflowStatus
+from reproagent_schemas import RunStatus, WorkflowStatus
 from test_run_lifecycle import seed_execution
 from test_runs import (
-    EXPERIMENT_ID,
-    FakeAdmin,
-    FakeArq,
     PROJECT_ID,
     USER_ID,
+    FakeAdmin,
+    FakeArq,
     make_result,
     runner_transport,
 )
 from test_workflow_graph import (
-    PAPER_ID,
     THREAD_ID,
     _state,
     _workflow,
@@ -484,9 +482,8 @@ def test_cancel_endpoint_requires_ownership(env):
 
 
 def test_cancel_endpoint_cancels_the_active_run_and_runner(env):
-    from test_runs import _seed_run
-
     from test_papers import USER_ID as API_USER_ID
+    from test_runs import _seed_run
 
     admin = _seed_wf("executing")
     run_id = _seed_run(admin, status="running")

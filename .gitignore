@@ -39,6 +39,9 @@ Thumbs.db
 .vscode/
 
 # 本地会话产生的临时目录与工具绑定文件，不入库
+.agents/
+_bmad/
+_bmad-output/
 .assisted-review-preview/
 .workbuddy/
 .tmp_dev_block.txt

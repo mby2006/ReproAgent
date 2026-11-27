@@ -6,6 +6,7 @@ cd "$ROOT"
 
 uv run ruff check .
 uv run pytest
+uv run pytest scripts/test_smoke_live_v2.py
 pnpm lint:web
 pnpm --filter web test
 pnpm --filter web exec tsc --noEmit

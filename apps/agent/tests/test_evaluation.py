@@ -680,6 +680,11 @@ def test_evaluate_preserves_exact_final_attempt_references_and_evidence():
     assert response.report.references.runner_run_id == "runner-final-attempt"
     assert "final/model.pt" in response.markdown
     assert "first/model.pt" not in response.markdown
+    assert "| 执行尝试 | 2 |" in response.markdown
+    assert (
+        f"| Runner Request ID | {request.references.execution_request_id} |"
+        in response.markdown
+    )
 
 
 def test_evaluate_failed_run_execution_failed():

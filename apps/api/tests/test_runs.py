@@ -645,6 +645,8 @@ def seed_tables(*, approved=True, with_spec=True):
             }
         ],
         "execution_runs": [],
+        "execution_attempts": [],
+        "execution_attempt_files": [],
         "workflows": [],
         "comparisons": [],
         "job_outbox": [],
@@ -1121,8 +1123,8 @@ def test_worker_success_persists_versions_and_artifacts(monkeypatch):
     assert len(admin.tables["generated_files"]) == 5
     assert len(admin.tables["execution_run_files"]) == 5
     assert {f["version"] for f in admin.tables["generated_files"]} == {1}
-    # logs + artifacts uploaded to storage
-    assert f"{run_id}/attempt-0/stdout.txt" in admin.storage.files
+    # logs + artifacts uploaded to storage; attempt paths are 1-based history ordinals
+    assert f"{run_id}/attempt-1/stdout.txt" in admin.storage.files
     assert len(admin.tables["execution_artifacts"]) == 2
     # report auto-generated on the terminal path, grounded in real run data
     reports = admin.tables["reproduction_reports"]

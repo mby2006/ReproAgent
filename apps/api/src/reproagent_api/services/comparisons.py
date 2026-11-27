@@ -760,7 +760,7 @@ async def _execute_attempt(
             bundle,
             f"comparison seed {seed} group {group.key.value}",
         )
-        pin_run_files(admin, str(run_id), file_ids)
+        pin_run_files(admin, str(run_id), file_ids, attempt=1)
         request = build_run_request(
             experiment_id,
             UUID(plan_row["id"]),

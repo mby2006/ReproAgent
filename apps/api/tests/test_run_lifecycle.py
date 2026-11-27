@@ -568,3 +568,262 @@ async def test_runner_exception_finalizes_run_without_leaking_terminal_race(fail
     assert run["finished_at"]
     if failure == "poll":
         assert runner.cancelled == [runner.result.run_id]
+
+
+# --- Task 7: append-only attempt history ------------------------------------
+
+
+def _seed_attempt_run(*, attempt=0, status="dispatching"):
+    """Return (admin, state, bundle, run_id, plan_id) with attempt history tables seeded."""
+    admin, state, bundle = seed_execution(status=status, attempt=attempt)
+    admin.tables.setdefault("execution_attempts", [])
+    admin.tables.setdefault("execution_attempt_files", [])
+    admin.tables.setdefault("generated_files", [])
+    return admin, state, bundle, state["run_id"], state["plan_id"]
+
+
+def _insert_generated_files(admin, experiment_id, prefix, count=3, version=1):
+    ids = []
+    for i in range(count):
+        fid = str(uuid4())
+        admin.tables["generated_files"].append({
+            "id": fid,
+            "experiment_id": experiment_id,
+            "version": version,
+            "path": f"{prefix}/file_{i}.py",
+            "sha256": f"sha-{prefix}-{i}",
+            "content": "",
+            "change_reason": "seed",
+            "related_error": None,
+        })
+        ids.append(fid)
+    return ids
+
+
+def test_pin_attempt_files_second_attempt_does_not_erase_first():
+    from reproagent_api.services.runs import pin_attempt_files
+
+    admin, state, _, run_id, _ = _seed_attempt_run(attempt=0)
+    first_ids = _insert_generated_files(admin, state["experiment_id"], "v1", version=1)
+    second_ids = _insert_generated_files(admin, state["experiment_id"], "v2", version=2)
+
+    pin_attempt_files(admin, run_id, 1, first_ids)
+    pin_attempt_files(admin, run_id, 2, second_ids)
+
+    attempts = sorted(
+        row["attempt"] for row in admin.tables["execution_attempts"]
+        if row["run_id"] == run_id
+    )
+    assert attempts == [1, 2]
+
+    first_pinned = {
+        row["generated_file_id"] for row in admin.tables["execution_attempt_files"]
+        if row["run_id"] == run_id and row["attempt"] == 1
+    }
+    second_pinned = {
+        row["generated_file_id"] for row in admin.tables["execution_attempt_files"]
+        if row["run_id"] == run_id and row["attempt"] == 2
+    }
+    assert first_pinned == set(first_ids)
+    assert second_pinned == set(second_ids)
+
+
+def test_list_attempts_returns_attempts_in_order_with_files():
+    from reproagent_api.services.runs import list_attempts, pin_attempt_files
+
+    admin, state, _, run_id, _ = _seed_attempt_run(attempt=0)
+    first_ids = _insert_generated_files(admin, state["experiment_id"], "v1", count=2)
+    second_ids = _insert_generated_files(admin, state["experiment_id"], "v2", count=2)
+
+    pin_attempt_files(admin, run_id, 1, first_ids)
+    pin_attempt_files(admin, run_id, 2, second_ids)
+
+    history = list_attempts(admin, run_id)
+    assert [a["attempt"] for a in history] == [1, 2]
+    assert {f["generated_file_id"] for f in history[0]["files"]} == set(first_ids)
+    assert {f["generated_file_id"] for f in history[1]["files"]} == set(second_ids)
+
+
+def test_pin_attempt_files_is_idempotent_for_same_attempt_and_files():
+    from reproagent_api.services.runs import pin_attempt_files
+
+    admin, state, _, run_id, _ = _seed_attempt_run(attempt=0)
+    ids = _insert_generated_files(admin, state["experiment_id"], "v1", count=3)
+
+    pin_attempt_files(admin, run_id, 1, ids)
+    pin_attempt_files(admin, run_id, 1, ids)
+
+    attempt_rows = [r for r in admin.tables["execution_attempts"]
+                    if r["run_id"] == run_id and r["attempt"] == 1]
+    assert len(attempt_rows) == 1
+    file_rows = [r for r in admin.tables["execution_attempt_files"]
+                 if r["run_id"] == run_id and r["attempt"] == 1]
+    assert len(file_rows) == 3  # not duplicated
+
+
+def test_pin_run_files_updates_projection_but_keeps_history():
+    """pin_run_files remains the final-attempt projection writer; history appends."""
+    from reproagent_api.services.runs import pin_run_files
+
+    admin, state, _, run_id, plan_id = _seed_attempt_run(attempt=0)
+    first_ids = _insert_generated_files(admin, state["experiment_id"], "v1", count=2)
+    second_ids = _insert_generated_files(admin, state["experiment_id"], "v2", count=2)
+    # Populate run row with plan_id/code_version so pin_run_files can read them.
+    admin.tables["execution_runs"][0]["plan_id"] = plan_id
+    admin.tables["execution_runs"][0]["code_version"] = 1
+    admin.tables["execution_runs"][0]["plan_version"] = 1
+
+    # attempt=1 (1-based) pin: writes projection and history.
+    pin_run_files(admin, run_id, first_ids, attempt=1)
+    # attempt=2: projection replaced with second batch, history preserved.
+    admin.tables["execution_runs"][0]["code_version"] = 2
+    pin_run_files(admin, run_id, second_ids, attempt=2)
+
+    projection = {
+        r["generated_file_id"] for r in admin.tables["execution_run_files"]
+        if r["run_id"] == run_id
+    }
+    assert projection == set(second_ids)
+
+    first_pinned = {
+        r["generated_file_id"] for r in admin.tables["execution_attempt_files"]
+        if r["run_id"] == run_id and r["attempt"] == 1
+    }
+    second_pinned = {
+        r["generated_file_id"] for r in admin.tables["execution_attempt_files"]
+        if r["run_id"] == run_id and r["attempt"] == 2
+    }
+    assert first_pinned == set(first_ids)
+    assert second_pinned == set(second_ids)
+
+
+def test_mark_attempt_running_writes_history_row():
+    from reproagent_api.services.runs import mark_attempt_running
+
+    # A failed Run with repair_attempt=0 permits a deliberate repair to attempt=1
+    # (repair_attempt) / history attempt=2.
+    admin, state, bundle, run_id, plan_id = _seed_attempt_run(attempt=0, status="failed")
+    run = admin.tables["execution_runs"][0]
+
+    claimed = mark_attempt_running(
+        admin, run, attempt=1, code_version=2, code_hash=bundle.code_hash,
+        plan_id=plan_id, plan_version=1,
+    )
+
+    assert claimed is not None
+    rows = [r for r in admin.tables["execution_attempts"]
+            if r["run_id"] == run_id and r["attempt"] == 2]
+    assert len(rows) == 1  # 1-based mapping: repair_attempt 1 -> attempt 2
+    assert rows[0]["plan_id"] == plan_id
+    assert rows[0]["code_version"] == 2
+    assert rows[0]["status"] == "running"
+
+
+def test_async_persist_result_writes_attempt_on_artifacts():
+    """async_persist_result records 1-based attempt on artifact rows and storage path."""
+    import asyncio
+
+    from reproagent_api.services.runs import async_persist_result
+
+    admin, state, _, run_id, plan_id = _seed_attempt_run(attempt=0, status="running")
+    runner_run_id = uuid4()
+    admin.tables["execution_runs"][0]["runner_run_id"] = str(runner_run_id)
+    result = RunResult(
+        run_id=runner_run_id,
+        status=RunStatus.SUCCEEDED,
+        exit_code=0,
+        stdout="ok",
+        stderr="",
+        execution_time=0.1,
+        metrics={"metric_value": 0.9},
+        artifacts=["metrics.json"],
+    )
+
+    class _Runner:
+        async def get_artifact_bytes(self, run_id, name):
+            return b"payload"
+
+    # repair_attempt=0 -> attempt=1 in the DB and 1-based storage path.
+    asyncio.run(async_persist_result(admin, run_id, runner_run_id, result, _Runner(), 0))
+
+    arts = [r for r in admin.tables["execution_artifacts"] if r["run_id"] == run_id]
+    assert len(arts) == 1
+    assert arts[0]["attempt"] == 1
+    assert arts[0]["storage_path"].startswith(f"{run_id}/attempt-1/")
+
+
+def test_async_persist_result_never_erases_prior_attempt_artifacts():
+    """A repair persists its own artifacts; the earlier attempt's rows survive."""
+    import asyncio
+
+    from reproagent_api.services.runs import async_persist_result
+
+    admin, state, _, run_id, _ = _seed_attempt_run(attempt=1, status="running")
+    # Pre-existing artifact from the first attempt (attempt=1 in history terms).
+    admin.tables["execution_artifacts"].append({
+        "id": str(uuid4()),
+        "run_id": run_id,
+        "attempt": 1,
+        "artifact_type": "metrics.json",
+        "storage_path": f"{run_id}/attempt-1/artifacts/metrics.json",
+        "metadata_json": {"attempt": 1},
+        "created_at": "2026-01-01T00:00:00+00:00",
+    })
+    runner_run_id = uuid4()
+    admin.tables["execution_runs"][0]["runner_run_id"] = str(runner_run_id)
+    result = RunResult(
+        run_id=runner_run_id,
+        status=RunStatus.FAILED,
+        exit_code=1,
+        stdout="",
+        stderr="bad",
+        execution_time=0.2,
+        metrics={},
+        artifacts=["metrics.json"],
+        error="boom",
+    )
+
+    class _Runner:
+        async def get_artifact_bytes(self, run_id, name):
+            return b"payload2"
+
+    # repair_attempt=1 -> history attempt=2 storage path.
+    asyncio.run(async_persist_result(admin, run_id, runner_run_id, result, _Runner(), 1))
+
+    arts = sorted(
+        (r for r in admin.tables["execution_artifacts"] if r["run_id"] == run_id),
+        key=lambda r: r["attempt"],
+    )
+    assert [a["attempt"] for a in arts] == [1, 2]
+    assert arts[0]["storage_path"] == f"{run_id}/attempt-1/artifacts/metrics.json"
+    assert arts[1]["storage_path"] == f"{run_id}/attempt-2/artifacts/metrics.json"
+
+
+def test_terminal_attempt_history_cannot_be_reopened_by_stale_writer():
+    """A stale finalize_execution_run never overwrites a sealed attempt row.
+
+    The projection RPC reflects whatever the run row's own state machine allows;
+    the attempt-history row is separately guarded so a succeeded attempt is
+    never downgraded to failed by a late writer.
+    """
+    from reproagent_api.services.runs import finalize_execution_run
+
+    admin, state, _, run_id, _ = _seed_attempt_run(attempt=0, status="running")
+    # Pre-seal the attempt history row as succeeded.
+    admin.tables["execution_attempts"].append({
+        "id": str(uuid4()),
+        "run_id": run_id,
+        "attempt": 1,
+        "plan_id": state["plan_id"],
+        "plan_version": 1,
+        "code_version": 1,
+        "status": "succeeded",
+        "finished_at": "2026-01-01T00:00:02+00:00",
+    })
+
+    finalize_execution_run(admin, run_id, RunStatus.FAILED, "late failure", attempt=0)
+
+    row = admin.tables["execution_attempts"][0]
+    # The attempt row stays succeeded: the guarded update refuses to regress it.
+    assert row["status"] == "succeeded"
+    assert row["finished_at"] == "2026-01-01T00:00:02+00:00"

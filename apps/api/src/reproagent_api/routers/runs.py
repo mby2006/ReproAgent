@@ -319,11 +319,33 @@ async def get_prediction_examples(
     run = _get_run(admin, run_id, user_id)
     if run["status"] != RunStatus.SUCCEEDED.value:
         raise HTTPException(404, "本次运行没有预测样本")
-    path = f"{run_id}/attempt-{run['repair_attempt']}/artifacts/prediction_examples.json"
-    rows = (admin.table("execution_artifacts").select("storage_path")
-            .eq("run_id", str(run_id)).eq("storage_path", path).execute().data)
+    # 1-based history ordinal; legacy attempt-0 rows are backfilled to attempt=1
+    # during migration and are looked up by the same attempt column.
+    history_attempt = run["repair_attempt"] + 1
+    rows = (
+        admin.table("execution_artifacts")
+        .select("storage_path")
+        .eq("run_id", str(run_id))
+        .eq("attempt", history_attempt)
+        .eq("artifact_type", "prediction_examples.json")
+        .execute()
+        .data
+    )
+    if not rows:
+        # Legacy compatibility: pre-migration rows kept their original 0-based
+        # storage path even after their attempt column was backfilled.
+        legacy_path = f"{run_id}/attempt-{run['repair_attempt']}/artifacts/prediction_examples.json"
+        rows = (
+            admin.table("execution_artifacts")
+            .select("storage_path")
+            .eq("run_id", str(run_id))
+            .eq("storage_path", legacy_path)
+            .execute()
+            .data
+        )
     if not rows:
         raise HTTPException(404, "这次运行未保存逐样本预测")
+    path = rows[0]["storage_path"]
     data = admin.storage.from_("runs").download(path)
     try:
         return PredictionExamples.model_validate_json(data)

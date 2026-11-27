@@ -35,9 +35,9 @@ from reproagent_schemas import (
 from ..services.review import validate_review_response
 from ..services.runs import (
     async_persist_result,
-    execution_request_id,
     build_run_request,
     create_oom_plan,
+    execution_request_id,
     finalize_execution_run,
     insert_code_version,
     load_confirmed_card,
@@ -533,14 +533,15 @@ async def execute_code(state: dict, ctx: WorkflowContext) -> dict:
             ctx.admin, state["experiment_id"], state["code_version"], bundle,
             change_reason, related_error,
         )
-        pin_run_files(ctx.admin, run_id, file_ids)
+        # ``pin_run_files`` takes the 1-based attempt ordinal (history_attempt).
+        pin_run_files(ctx.admin, run_id, file_ids, attempt=attempt + 1)
     else:
         code_version, file_ids = reused
         pins = ctx.admin.table("execution_run_files").select("generated_file_id").eq(
             "run_id", run_id
         ).execute().data
         if not pins:
-            pin_run_files(ctx.admin, run_id, file_ids)
+            pin_run_files(ctx.admin, run_id, file_ids, attempt=attempt + 1)
 
     claimed = mark_attempt_running(
         ctx.admin, row, attempt=attempt, code_version=code_version, code_hash=bundle.code_hash,

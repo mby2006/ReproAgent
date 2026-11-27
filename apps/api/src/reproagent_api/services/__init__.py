@@ -6,7 +6,10 @@ from .runs import (
     async_persist_result,
     build_run_request,
     create_oom_plan,
+    ensure_attempt_row,
     insert_code_version,
+    list_attempts,
+    pin_attempt_files,
     pin_run_files,
 )
 from .versions import insert_versioned
@@ -23,9 +26,12 @@ __all__ = [
     "build_evaluate_request",
     "build_run_request",
     "create_oom_plan",
+    "ensure_attempt_row",
     "generate_and_store_report",
     "insert_code_version",
     "insert_versioned",
+    "list_attempts",
+    "pin_attempt_files",
     "pin_run_files",
     "render_card_markdown",
 ]

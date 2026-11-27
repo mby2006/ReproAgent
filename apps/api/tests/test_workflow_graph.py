@@ -165,6 +165,8 @@ def seed_workflow() -> dict:
         "experiments": [],
         "experiment_plans": [],
         "execution_runs": [],
+        "execution_attempts": [],
+        "execution_attempt_files": [],
         "generated_files": [],
         "execution_run_files": [],
         "execution_artifacts": [],

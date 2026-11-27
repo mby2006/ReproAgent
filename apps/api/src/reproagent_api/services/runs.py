@@ -142,11 +142,166 @@ def insert_code_version(
     return insert_versioned(next_version, insert)
 
 
-def pin_run_files(admin, run_id: str, file_ids: list[str]) -> None:
+def pin_run_files(admin, run_id: str, file_ids: list[str], *, attempt: int | None = None) -> None:
+    """Project the latest attempt's file bindings and append to attempt history.
+
+    ``execution_run_files`` stays a final-attempt projection. The authoritative
+    history lives in ``execution_attempts`` + ``execution_attempt_files``; a new
+    attempt never erases a previous attempt's bindings.
+
+    ``attempt`` is 1-based. Callers still holding the 0-based ``repair_attempt``
+    should pass ``attempt = repair_attempt + 1``; when omitted, the attempt is
+    derived from the run row's ``repair_attempt`` (also mapped 1-based).
+    """
+    if attempt is None:
+        rows = (
+            admin.table("execution_runs").select("repair_attempt")
+            .eq("id", run_id).execute().data
+        )
+        attempt = (rows[0].get("repair_attempt", 0) + 1) if rows else 1
+    if attempt < 1:
+        raise ValueError(f"attempt must be 1-based, got {attempt}")
+    # Append the immutable history FIRST so an error inside the projection
+    # cannot lose evidence that these files were bound.
+    pin_attempt_files(admin, run_id, attempt, file_ids)
     admin.table("execution_run_files").delete().eq("run_id", run_id).execute()
     admin.table("execution_run_files").insert(
         [{"run_id": run_id, "generated_file_id": fid} for fid in file_ids]
     ).execute()
+
+
+def _attempt_row_from_run(run_row: dict, attempt: int, *, status: str | None = None) -> dict:
+    runner_request = run_row.get("runner_request_id")
+    return {
+        "run_id": run_row["id"],
+        "attempt": attempt,
+        "plan_id": run_row.get("plan_id"),
+        "plan_version": run_row.get("plan_version") or 1,
+        "code_version": run_row.get("code_version") or 0,
+        "status": status or run_row.get("status") or RunStatus.QUEUED.value,
+        "runner_request_id": str(runner_request) if runner_request else None,
+        "runner_run_id": run_row.get("runner_run_id"),
+    }
+
+
+def pin_attempt_files(admin, run_id: str, attempt: int, file_ids: list[str]) -> None:
+    """Bind a set of generated files to a specific attempt, append-only.
+
+    Ensures the parent ``execution_attempts`` row exists for ``(run_id, attempt)``
+    using the run row's current plan/code/status, then idempotently inserts each
+    ``(run_id, attempt, generated_file_id)`` binding. Pre-existing bindings for
+    other attempts are never touched.
+    """
+    if attempt < 1:
+        raise ValueError(f"attempt must be 1-based, got {attempt}")
+    run_rows = admin.table("execution_runs").select("*").eq("id", run_id).execute().data
+    if not run_rows:
+        raise ValueError("Attempt pinning requires an existing execution run")
+    run_row = run_rows[0]
+    ensure_attempt_row(admin, run_row, attempt)
+    for fid in file_ids:
+        admin.table("execution_attempt_files").upsert(
+            {"run_id": run_id, "attempt": attempt, "generated_file_id": fid},
+            on_conflict="run_id,attempt,generated_file_id",
+            ignore_duplicates=True,
+        ).execute()
+
+
+def ensure_attempt_row(admin, run_row: dict, attempt: int, *, status: str | None = None) -> dict:
+    """Idempotently insert an ``execution_attempts`` row derived from the run row.
+
+    Existing rows are preserved: history is append-only. The returned dict is the
+    authoritative row after the operation. Callers that need to *update* a
+    non-terminal attempt's status (e.g. mark it running) should do so explicitly
+    so that terminal states are never silently overwritten.
+    """
+    if attempt < 1:
+        raise ValueError(f"attempt must be 1-based, got {attempt}")
+    existing = (
+        admin.table("execution_attempts")
+        .select("*")
+        .eq("run_id", run_row["id"])
+        .eq("attempt", attempt)
+        .execute()
+        .data
+    )
+    if existing:
+        return existing[0]
+    payload = _attempt_row_from_run(run_row, attempt, status=status)
+    inserted = admin.table("execution_attempts").upsert(
+        payload, on_conflict="run_id,attempt", ignore_duplicates=True,
+    ).execute().data
+    if inserted:
+        return inserted[0]
+    rows = (
+        admin.table("execution_attempts")
+        .select("*")
+        .eq("run_id", run_row["id"])
+        .eq("attempt", attempt)
+        .execute()
+        .data
+    )
+    return rows[0] if rows else payload
+
+
+def update_attempt_status(
+    admin, run_id: str, attempt: int, status: str, *,
+    error: str | None = None, runner_request_id: str | None = None,
+    runner_run_id: str | None = None, finished_at: str | None = None,
+) -> None:
+    """Advance one attempt row without touching terminal states.
+
+    Protected (``succeeded``/``cancelled``) attempts never regress. Terminal
+    writes always stamp ``finished_at`` exactly once.
+    """
+    if attempt < 1:
+        raise ValueError(f"attempt must be 1-based, got {attempt}")
+    patch = {"status": status, "updated_at": datetime.now(UTC).isoformat()}
+    if error is not None:
+        patch["error_message"] = error
+    if runner_request_id is not None:
+        patch["runner_request_id"] = runner_request_id
+    if runner_run_id is not None:
+        patch["runner_run_id"] = runner_run_id
+    if finished_at is not None:
+        patch["finished_at"] = finished_at
+    admin.table("execution_attempts").update(patch).eq("run_id", run_id).eq("attempt", attempt).neq(
+        "status", RunStatus.SUCCEEDED.value
+    ).neq("status", RunStatus.CANCELLED.value).execute()
+
+
+def list_attempts(admin, run_id: str) -> list[dict]:
+    """Return the append-only attempt history for a run with pinned files.
+
+    Ordered ascending by ``attempt`` (1-based). Each entry contains ``files`` --
+    the exact set of generated-file bindings pinned to that attempt. This is the
+    authoritative record: ``execution_run_files`` is only the latest projection.
+    """
+    attempts = (
+        admin.table("execution_attempts")
+        .select("*")
+        .eq("run_id", run_id)
+        .order("attempt")
+        .execute()
+        .data
+    )
+    if not attempts:
+        return []
+    bindings = (
+        admin.table("execution_attempt_files")
+        .select("attempt,generated_file_id")
+        .eq("run_id", run_id)
+        .execute()
+        .data
+    )
+    by_attempt: dict[int, list[dict]] = {}
+    for row in bindings:
+        by_attempt.setdefault(row["attempt"], []).append(
+            {"generated_file_id": row["generated_file_id"]}
+        )
+    for entry in attempts:
+        entry["files"] = by_attempt.get(entry["attempt"], [])
+    return attempts
 
 
 def run_creation_fingerprint(experiment_id: UUID, plan_id: UUID, plan_version: int) -> str:
@@ -205,6 +360,10 @@ def mark_attempt_running(
 
     Recovery may continue the same running attempt. Only a strictly newer repair
     attempt may deliberately reopen a failed/timeout row.
+
+    ``attempt`` here is the 0-based ``repair_attempt`` on ``execution_runs``. The
+    1-based ``execution_attempts.attempt`` ordinal used for the history table is
+    derived at the boundary: ``history_attempt = attempt + 1``.
     """
     previous_attempt = run_row.get("repair_attempt", 0)
     status = run_row.get("status")
@@ -259,7 +418,24 @@ def mark_attempt_running(
         .execute()
         .data
     )
-    return rows[0] if rows else None
+    if not rows:
+        return None
+    # Append the attempt row (1-based) so the history records the same moment the
+    # projection transitioned to running. Existing history is never overwritten.
+    history_attempt = attempt + 1
+    updated_run = rows[0]
+    ensure_attempt_row(admin, updated_run, history_attempt, status=RunStatus.RUNNING.value)
+    # The ensure helper only inserts if the row is absent; for a re-drive of the
+    # same attempt (recovery) the row already exists in a non-terminal state and
+    # must be advanced to running alongside the projection.
+    admin.table("execution_attempts").update(
+        {"status": RunStatus.RUNNING.value, "code_version": code_version,
+         "plan_id": plan_id, "plan_version": plan_version,
+         "dispatch_started_at": updated_run.get("started_at") or now}
+    ).eq("run_id", updated_run["id"]).eq("attempt", history_attempt).neq(
+        "status", RunStatus.SUCCEEDED.value
+    ).neq("status", RunStatus.CANCELLED.value).execute()
+    return updated_run
 
 
 def persist_runner_run_id(admin, run_id: str, runner_run_id: UUID, attempt: int) -> bool:
@@ -293,7 +469,26 @@ def finalize_execution_run(
     if attempt is not None:
         params["p_repair_attempt"] = attempt
         params["p_require_latest"] = require_latest
-    return bool(admin.rpc("reconcile_execution_run", params))
+    finalized = bool(admin.rpc("reconcile_execution_run", params))
+    if finalized:
+        # Mirror the terminal status onto the authoritative attempt history so a
+        # later repair/dispatch never reopens a closed attempt row.
+        history_attempt = (attempt + 1) if attempt is not None else None
+        if history_attempt is not None:
+            now = datetime.now(UTC).isoformat()
+            patch = {"status": status.value, "finished_at": now}
+            if error is not None:
+                patch["error_message"] = redact_error(error)
+            (
+                admin.table("execution_attempts")
+                .update(patch)
+                .eq("run_id", run_id)
+                .eq("attempt", history_attempt)
+                .neq("status", RunStatus.SUCCEEDED.value)
+                .neq("status", RunStatus.CANCELLED.value)
+                .execute()
+            )
+    return finalized
 
 
 def redact_error(error: str | None) -> str | None:
@@ -335,9 +530,15 @@ def _upload(admin, path: str, data: bytes) -> None:
 async def async_persist_result(
     admin, run_id: str, runner_run_id: UUID, result: RunResult, runner, attempt: int
 ) -> None:
-    # Claim the exact nonterminal attempt before touching storage or artifact
-    # rows. A stale attempt, cancellation, or concurrent success must not delete
-    # the current attempt's protected output.
+    """Persist one Runner result against its owning attempt.
+
+    ``attempt`` here is the 0-based ``repair_attempt`` still stored on
+    ``execution_runs``. The 1-based history ordinal (``repair_attempt + 1``) is
+    what lands in ``execution_artifacts.attempt`` and the storage path, so the
+    per-attempt history matches ``execution_attempts.attempt``. A stale attempt,
+    cancellation, or concurrent success must not delete the current attempt's
+    protected output.
+    """
     claimed = (
         admin.table("execution_runs")
         .update({"updated_at": datetime.now(UTC).isoformat()})
@@ -353,8 +554,11 @@ async def async_persist_result(
     if not claimed or claimed[0].get("repair_attempt", attempt) != attempt:
         return
 
+    # 1-based attempt ordinal: {run_id}/attempt-<repair_attempt+1>/...
+    history_attempt = attempt + 1
+
     _ensure_bucket(admin)
-    prefix = f"{run_id}/attempt-{attempt}"
+    prefix = f"{run_id}/attempt-{history_attempt}"
     stdout_path = f"{prefix}/stdout.txt"
     stderr_path = f"{prefix}/stderr.txt"
     _upload(admin, stdout_path, result.stdout.encode("utf-8"))
@@ -362,20 +566,20 @@ async def async_persist_result(
 
     existing = (
         admin.table("execution_artifacts")
-        .select("id,metadata_json,storage_path")
+        .select("id,metadata_json,storage_path,attempt")
         .eq("run_id", run_id)
         .execute()
         .data
     )
     artifact_prefix = f"{prefix}/artifacts/"
+    # Only the current attempt's rows are ever replaced; other attempts keep
+    # their artifacts so a repair never erases a prior attempt's evidence.
     replace_ids = [
         row["id"]
         for row in existing
-        if str((row.get("metadata_json") or {}).get("attempt")) == str(attempt)
-        or (
-            (row.get("metadata_json") or {}).get("attempt") is None
-            and str(row.get("storage_path") or "").startswith(artifact_prefix)
-        )
+        if row.get("attempt") == history_attempt
+        or str((row.get("metadata_json") or {}).get("attempt")) == str(history_attempt)
+        or str(row.get("storage_path") or "").startswith(artifact_prefix)
     ]
     if replace_ids:
         admin.table("execution_artifacts").delete().in_("id", replace_ids).execute()
@@ -392,8 +596,9 @@ async def async_persist_result(
                 "run_id": run_id,
                 "artifact_type": name,
                 "storage_path": storage_path,
+                "attempt": history_attempt,
                 "metadata_json": {
-                    "attempt": attempt,
+                    "attempt": history_attempt,
                     "code_hash": result.audit.code_hash if result.audit else None,
                 },
             }
@@ -409,8 +614,6 @@ async def async_persist_result(
         "stdout_path": stdout_path,
         "stderr_path": stderr_path,
     }
-    # Preserve the last detected error category across a successful repair retry;
-    # only overwrite when this result actually carries an error.
     if result.error_category is not None:
         update["error_category"] = result.error_category.value
     if result.error is not None:

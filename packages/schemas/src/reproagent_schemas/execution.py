@@ -10,6 +10,7 @@ read them without guessing.
 import hashlib
 import json
 import re
+from datetime import datetime
 from enum import StrEnum
 from typing import Any
 from uuid import UUID, uuid4
@@ -176,6 +177,46 @@ class RunResult(SchemaModel):
     error_category: ErrorCategory | None = None
     error: str | None = None
     audit: RunAudit | None = None
+    # 1-based attempt ordinal within a Run. Populated by the API when it
+    # persists a Runner result; the Runner itself is attempt-agnostic.
+    attempt: int | None = Field(default=None, ge=1)
+
+
+class ExecutionAttemptFile(SchemaModel):
+    """One pinned generated-file reference inside an execution attempt."""
+
+    generated_file_id: UUID
+    path: str | None = None
+    sha256: str | None = None
+
+
+class ExecutionAttempt(SchemaModel):
+    """Append-only record of one dispatch/persist cycle inside a Run.
+
+    Attempt numbering is 1-based: ``attempt = execution_runs.repair_attempt + 1``.
+    A repair or OOM retry creates a NEW attempt row; the previous attempt row and
+    its pinned file bindings are never overwritten. ``execution_runs`` and
+    ``execution_run_files`` may mirror the latest attempt as a projection, but the
+    attempts table is the authoritative history.
+    """
+
+    id: UUID
+    run_id: UUID
+    attempt: int = Field(ge=1)
+    plan_id: UUID | None = None
+    plan_version: int = Field(ge=1)
+    code_version: int = Field(ge=0)
+    status: RunStatus
+    runner_request_id: UUID | None = None
+    runner_run_id: str | None = None
+    dispatch_started_at: datetime | None = None
+    runner_accepted_at: datetime | None = None
+    finished_at: datetime | None = None
+    timing_json: dict[str, Any] = Field(default_factory=dict)
+    error_code: str | None = None
+    error_message: str | None = None
+    created_at: datetime
+    files: list[ExecutionAttemptFile] = Field(default_factory=list)
 
 
 class ReproducibilityReport(SchemaModel):

@@ -284,10 +284,19 @@ class Rpc:
                         sql.SQL(
                             {
                                 "p_run_id": "uuid",
+                                "p_experiment_id": "uuid",
+                                "p_plan_id": "uuid",
+                                "p_plan_version": "integer",
+                                "p_actor_id": "uuid",
                                 "p_file_ids": "uuid[]",
                                 "p_report_json": "jsonb",
+                                "p_artifact_rows": "jsonb",
+                                "p_metrics_json": "jsonb",
+                                "p_audit_json": "jsonb",
                                 "p_attempt": "integer",
                                 "p_generation_ms": "numeric",
+                                "p_execution_time": "numeric",
+                                "p_exit_code": "integer",
                                 "p_repair_attempt": "integer",
                                 "p_require_latest": "boolean",
                             }.get(key, "text")
@@ -296,9 +305,15 @@ class Rpc:
                     for key in self.params
                 ),
             ),
-            [Jsonb(value) if isinstance(value, dict) else value for value in self.params.values()],
+            [
+                Jsonb(value)
+                if isinstance(value, dict)
+                or (isinstance(value, list) and key == "p_artifact_rows")
+                else value
+                for key, value in self.params.items()
+            ],
         )
-        if cursor.description and cursor.description[0].type_code == 16:
+        if cursor.description and len(cursor.description) == 1:
             value = next(iter(cursor.fetchone().values()))
             return Result([], scalar=value if value is not None else False)
         return Result(cursor.fetchall())
@@ -378,6 +393,8 @@ class RunnerFixture:
                     self.on_accept(run_id)
                 accepted = RunAccepted(run_id=run_id, status=RunStatus.QUEUED)
                 return httpx.Response(202, json=accepted.model_dump(mode="json"))
+            if request.url.path.endswith("/artifacts/metrics.json"):
+                return self.artifact(UUID(request.url.path.split("/")[2]), "metrics.json")
             run_id = UUID(request.url.path.rsplit("/", 1)[-1])
             if self.on_poll is not None:
                 self.on_poll(run_id)
@@ -469,6 +486,11 @@ class Harness:
                 f"{ids['other']}@example.test",
             ),
         )
+        c.execute("set local role service_role")
+        role = c.execute(
+            "select current_user, rolsuper, rolbypassrls from pg_roles where rolname=current_user"
+        ).fetchone()
+        assert role == {"current_user": "service_role", "rolsuper": False, "rolbypassrls": True}
         c.execute(
             "insert into public.projects (id,user_id,name) values (%s,%s,'matrix'),(%s,%s,'other')",
             (str(ids["project"]), str(ids["owner"]), str(ids["other_project"]), str(ids["other"])),
@@ -702,6 +724,160 @@ async def test_persisted_timeout_survives_runner_transport_failure(harness):
     assert len(harness.runner.requests) == 1
 
 
+@pytest.mark.parametrize(
+    ("terminal", "expected_workflow"),
+    [
+        ("cancelled", WorkflowStatus.CANCELLED),
+        ("failed", WorkflowStatus.FAILED),
+        ("timeout", WorkflowStatus.FAILED),
+        ("succeeded", WorkflowStatus.COMPLETED),
+    ],
+)
+async def test_terminal_write_after_result_claim_preserves_artifacts_and_audit(
+    harness, monkeypatch, terminal, expected_workflow
+):
+    """Real SQL RPC protects evidence sealed after claim but before replacement."""
+    from reproagent_api.services import runs
+
+    harness.runner.outcomes = [
+        outcome(RunStatus.SUCCEEDED).model_copy(update={"artifacts": ["late.json"]})
+    ]
+    original_upload = runs._upload
+    protected = {}
+    terminal_snapshot = {}
+
+    def seal_after_claim(admin, path, data):
+        nonlocal protected, terminal_snapshot
+        original_upload(admin, path, data)
+        if not path.endswith("/stdout.txt") or protected:
+            return
+        run = harness.run()
+        run_id = run["id"]
+        protected_id = uuid4()
+        harness.db.execute(
+            "insert into public.execution_artifacts "
+            "(id,run_id,attempt,artifact_type,storage_path,metadata_json) "
+            "values (%s,%s,1,'protected.json',%s,%s)",
+            (
+                protected_id,
+                run_id,
+                f"{run_id}/attempt-1/artifacts/protected.json",
+                Jsonb({"attempt": 1}),
+            ),
+        )
+        error_category = "TIMEOUT" if terminal == "timeout" else "UNKNOWN_ERROR"
+        harness.db.execute(
+            "update public.execution_runs set status=%s,error=%s,error_category=%s,"
+            "metrics_json=%s,audit_json=%s,stdout_path=%s,stderr_path=%s where id=%s",
+            (
+                terminal,
+                "persisted terminal truth",
+                error_category,
+                Jsonb({"protected": True}),
+                Jsonb({"seed": 42}),
+                "protected/stdout.txt",
+                "protected/stderr.txt",
+                run_id,
+            ),
+        )
+        harness.db.execute(
+            "update public.execution_attempts set status=%s,finished_at=now(),"
+            "error_message='persisted terminal truth' where run_id=%s and attempt=1",
+            (terminal, run_id),
+        )
+        if terminal == "cancelled":
+            harness.db.execute(
+                "update public.workflows set status='cancelled',error=%s where id=%s",
+                ("cancelled: workflow cancelled by user", harness.ids["workflow"]),
+            )
+        protected = harness.db.execute(
+            "select * from public.execution_artifacts where id=%s", (protected_id,)
+        ).fetchone()
+        terminal_snapshot = harness.db.execute(
+            "select * from public.execution_runs where id=%s", (run_id,)
+        ).fetchone()
+
+    monkeypatch.setattr(runs, "_upload", seal_after_claim)
+    state = await harness.drive()
+
+    assert protected
+    assert state["execution_result"].status.value == terminal
+    assert harness.run()["status"] == terminal
+    assert harness.workflow()["status"] == expected_workflow.value
+    artifacts = harness.db.execute(
+        "select * from public.execution_artifacts where run_id=%s", (harness.run()["id"],)
+    ).fetchall()
+    assert artifacts == [protected]
+    persisted = harness.run()
+    for field in (
+        "error", "error_category", "metrics_json", "audit_json", "stdout_path",
+        "stderr_path", "finished_at",
+    ):
+        assert persisted[field] == terminal_snapshot[field], field
+    attempt = harness.db.execute(
+        "select * from public.execution_attempts where run_id=%s and attempt=1",
+        (harness.run()["id"],),
+    ).fetchone()
+    assert attempt["status"] == terminal
+    assert attempt["error_message"] == "persisted terminal truth"
+    await recover(harness)
+    assert harness.run()["status"] == terminal
+    assert harness.workflow()["status"] == expected_workflow.value
+
+
+def test_result_persistence_rolls_back_delete_and_audit_on_insert_failure(harness):
+    """A malformed artifact cannot partially erase current evidence or update audit."""
+    run_id = harness.db.execute(
+        "insert into public.execution_runs "
+        "(id,experiment_id,plan_id,code_version,plan_version,status,repair_attempt) "
+        "values (%s,%s,%s,1,1,'running',0) returning id",
+        (uuid4(), str(harness.ids["experiment"]), str(harness.ids["plan"])),
+    ).fetchone()["id"]
+    harness.db.execute(
+        "insert into public.execution_attempts "
+        "(run_id,attempt,plan_id,plan_version,code_version,status) "
+        "values (%s,1,%s,1,1,'running')",
+        (run_id, str(harness.ids["plan"])),
+    )
+    protected_id = uuid4()
+    harness.db.execute(
+        "insert into public.execution_artifacts "
+        "(id,run_id,attempt,artifact_type,storage_path,metadata_json) "
+        "values (%s,%s,1,'protected.json',%s,'{}'::jsonb)",
+        (protected_id, run_id, f"{run_id}/attempt-1/artifacts/protected.json"),
+    )
+    before_artifacts = harness.db.execute(
+        "select * from public.execution_artifacts where run_id=%s", (run_id,)
+    ).fetchall()
+    before_run = harness.row("execution_runs", run_id)
+    harness.db.execute("savepoint result_insert_failure")
+    try:
+        with pytest.raises(psycopg.errors.NotNullViolation):
+            harness.admin.rpc(
+                "persist_execution_result",
+                {
+                    "p_run_id": run_id,
+                    "p_repair_attempt": 0,
+                    "p_artifact_rows": [{"artifact_type": "late.json", "metadata_json": {}}],
+                    "p_exit_code": 0,
+                    "p_metrics_json": {"late": True},
+                    "p_execution_time": 2.5,
+                    "p_audit_json": {"late": True},
+                    "p_stdout_path": "late/stdout.txt",
+                    "p_stderr_path": "late/stderr.txt",
+                    "p_error_category": None,
+                    "p_error": None,
+                },
+            ).execute()
+    finally:
+        harness.db.execute("rollback to savepoint result_insert_failure")
+        harness.db.execute("release savepoint result_insert_failure")
+    assert harness.db.execute(
+        "select * from public.execution_artifacts where run_id=%s", (run_id,)
+    ).fetchall() == before_artifacts
+    assert harness.row("execution_runs", run_id) == before_run
+
+
 async def test_fourth_ordinary_repair_is_refused_and_versions_form_parent_chain(harness):
     harness.runner.outcomes = [outcome(RunStatus.FAILED, "SyntaxError: broken")] * 4
     state = await harness.drive()
@@ -757,6 +933,11 @@ async def test_fourth_ordinary_repair_is_refused_and_versions_form_parent_chain(
 
 
 async def test_third_oom_replan_is_refused_and_report_uses_final_attempt(harness):
+    assert harness.db.execute(
+        "select current_user, rolsuper, rolbypassrls from pg_roles where rolname=current_user"
+    ).fetchone() == {
+        "current_user": "service_role", "rolsuper": False, "rolbypassrls": True
+    }
     harness.runner.outcomes = [outcome(RunStatus.FAILED, "CUDA out of memory", 137)] * 3
     state = await harness.drive()
     run, workflow = harness.run(), harness.workflow()
@@ -879,6 +1060,60 @@ async def test_critical_assumption_change_stops_oom_retry(harness):
     )
 
 
+def test_service_role_grants_are_scoped_to_production_writes(harness):
+    expected = {
+        "projects": {"select", "insert"},
+        "papers": {"select", "insert", "update", "delete"},
+        "reproduction_specs": {"select", "insert"},
+        "experiments": {"select", "insert", "update"},
+        "experiment_plans": {"select", "insert", "update"},
+        "generated_files": {"select", "insert"},
+        "execution_runs": {"select", "insert", "update"},
+        "execution_attempts": {"select", "insert", "update"},
+        "execution_attempt_files": {"select", "insert"},
+        "execution_run_files": {"select", "insert", "delete"},
+        "reproduction_reports": {"select", "insert"},
+        "execution_artifacts": {"select", "insert", "delete"},
+        "workflows": {"select", "insert", "update"},
+        "agent_traces": {"select", "insert"},
+        "job_outbox": {"select", "insert", "update"},
+        "execution_run_idempotency": {"select", "insert"},
+        "storage.objects": {"select", "insert", "delete"},
+        "storage.buckets": {"select", "insert"},
+    }
+    privileges = ("select", "insert", "update", "delete", "truncate", "references", "trigger")
+    for table, allowed in expected.items():
+        relation = table if "." in table else f"public.{table}"
+        actual = harness.db.execute(
+            sql.SQL("select {} from pg_roles where rolname='service_role'").format(
+                sql.SQL(", ").join(
+                    sql.SQL(
+                        "has_table_privilege('service_role'::name, {}::text, {}::text) as {}"
+                    ).format(
+                        sql.Literal(relation),
+                        sql.Literal(privilege),
+                        sql.Identifier(privilege),
+                    )
+                    for privilege in privileges
+                )
+            )
+        ).fetchone()
+        assert {key for key, value in actual.items() if value} == allowed, table
+    execute_acl = harness.db.execute(
+        "select "
+        "has_function_privilege('anon', 'public.persist_execution_result("
+        "uuid,integer,jsonb,integer,jsonb,numeric,jsonb,text,text,text,text)', 'execute') "
+        "as anon, "
+        "has_function_privilege('authenticated', 'public.persist_execution_result("
+        "uuid,integer,jsonb,integer,jsonb,numeric,jsonb,text,text,text,text)', 'execute') "
+        "as authenticated, "
+        "has_function_privilege('service_role', 'public.persist_execution_result("
+        "uuid,integer,jsonb,integer,jsonb,numeric,jsonb,text,text,text,text)', 'execute') "
+        "as service_role"
+    ).fetchone()
+    assert execute_acl == {"anon": False, "authenticated": False, "service_role": True}
+
+
 def test_two_account_denied_reads_and_writes_under_rls(harness):
     c, ids = harness.db, harness.ids
     run_id = c.execute(
@@ -961,6 +1196,90 @@ def test_two_account_denied_reads_and_writes_under_rls(harness):
     finally:
         c.execute("rollback to savepoint ownership_matrix")
         c.execute("release savepoint ownership_matrix")
+
+
+def test_service_role_owner_positive_workflow_writes(harness, monkeypatch):
+    """Normal owner writes run as service_role, with RLS bypass made explicit."""
+    from reproagent_api.auth import get_current_user_id
+    from reproagent_api.routers import experiments, runs
+
+    c, ids = harness.db, harness.ids
+    for module in (experiments, runs):
+        monkeypatch.setattr(module, "make_service_client", lambda settings: harness.admin)
+    app = create_app(harness.settings)
+    app.dependency_overrides[get_current_user_id] = lambda: ids["owner"]
+    client = TestClient(app)
+
+    edited = client.post(
+        f"/v1/experiments/{ids['experiment']}/plans",
+        json={
+            "base_version": 1,
+            "changes": [{"field_path": "training_config.batch_size", "value": 32}],
+            "change_reason": "service-role positive control",
+        },
+    )
+    assert edited.status_code == 201, edited.text
+    assert edited.json()["version"] == 2
+    approved = client.post(f"/v1/experiments/{ids['experiment']}/plans/2/approve")
+    assert approved.status_code == 200, approved.text
+    assert approved.json()["approved_at"] is not None
+
+    headers = {"Idempotency-Key": "service-role-positive-run"}
+    created = client.post(f"/v1/experiments/{ids['experiment']}/runs", headers=headers)
+    assert created.status_code == 202, created.text
+    run_id = created.json()["run_id"]
+    replay = client.post(f"/v1/experiments/{ids['experiment']}/runs", headers=headers)
+    assert replay.status_code == 202, replay.text
+    assert replay.json()["run_id"] == run_id
+    assert c.execute(
+        "select count(*) as count from public.job_outbox where entity_id=%s", (run_id,)
+    ).fetchone()["count"] == 1
+    assert c.execute(
+        "select count(*) as count from public.execution_run_idempotency where run_id=%s", (run_id,)
+    ).fetchone()["count"] == 1
+    appended = harness.admin.rpc(
+        "append_report_version",
+        {"p_run_id": run_id, "p_report_json": {"owner": True}, "p_markdown": "owner report"},
+    ).execute().data
+    assert appended[0]["version"] == 1
+    cancelled = client.post(f"/v1/runs/{run_id}/cancel")
+    assert cancelled.status_code == 200, cancelled.text
+    assert cancelled.json()["status"] == "cancelled"
+    assert c.execute("select current_user").fetchone()["current_user"] == "service_role"
+
+
+async def test_service_role_owner_positive_execution_projection_and_report(harness):
+    """Generated code, attempts, projection, artifacts, traces and workflow are writable."""
+    harness.runner.outcomes = [
+        outcome(RunStatus.SUCCEEDED).model_copy(update={"artifacts": ["metrics.json"]})
+    ]
+    state = await harness.drive()
+    run = harness.run()
+    assert state["status"] == WorkflowStatus.COMPLETED.value
+    assert run["status"] == "succeeded"
+    assert harness.workflow()["status"] == "completed"
+    assert harness.db.execute("select current_user").fetchone()["current_user"] == "service_role"
+    for table, expected in (
+        ("generated_files", 5),
+        ("execution_attempts", 1),
+        ("execution_attempt_files", 5),
+        ("execution_run_files", 5),
+        ("execution_artifacts", 1),
+        ("reproduction_reports", 1),
+    ):
+        key = "experiment_id" if table == "generated_files" else "run_id"
+        value = harness.ids["experiment"] if table == "generated_files" else run["id"]
+        count = harness.db.execute(
+            sql.SQL("select count(*) as count from public.{} where {}=%s").format(
+                sql.Identifier(table), sql.Identifier(key)
+            ),
+            (value,),
+        ).fetchone()["count"]
+        assert count == expected, table
+    assert harness.db.execute(
+        "select count(*) as count from public.agent_traces where workflow_id=%s",
+        (harness.ids["workflow"],),
+    ).fetchone()["count"] > 0
 
 
 def test_service_role_api_denies_foreign_resource_matrix_and_guessed_evidence(

@@ -390,13 +390,11 @@ class TestFullClosedLoop:
                 f"/v1/runs/{run_id}/files",
                 f"/v1/runs/{run_id}/report",
                 f"/v1/runs/{run_id}/prediction-examples",
-                f"/v1/runs/{run_id}/evidence-index",
                 f"/v1/workflows/{workflow_id}",
                 f"/v1/workflows/{workflow_id}/traces",
                 f"/v1/runs/{guessed}/logs",
                 f"/v1/runs/{guessed}/artifacts",
                 f"/v1/runs/{guessed}/report",
-                f"/v1/runs/{guessed}/evidence-index",
                 f"/v1/workflows/{guessed}/traces",
             ]
             for path in foreign_get:

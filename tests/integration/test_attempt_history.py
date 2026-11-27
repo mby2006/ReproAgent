@@ -270,6 +270,52 @@ def _reject(db, error, statement, params=(), *, match=None):
         db.execute("release savepoint rejected_statement")
 
 
+def test_service_role_pin_projection_and_report_are_positive(db, run_context):
+    """Production role can seal/pin, replace the projection, and append a report."""
+    run_id = str(uuid4())
+    db.execute("savepoint service_role_positive")
+    try:
+        db.execute("set local role service_role")
+        role = db.execute(
+            "select current_user, rolsuper, rolbypassrls "
+            "from pg_roles where rolname=current_user"
+        ).fetchone()
+        assert role == {
+            "current_user": "service_role", "rolsuper": False, "rolbypassrls": True
+        }
+        db.execute(
+            "insert into public.execution_runs "
+            "(id,experiment_id,plan_id,code_version,plan_version,status,repair_attempt) "
+            "values (%s,%s,%s,1,1,'succeeded',0)",
+            (run_id, run_context["experiment_id"], run_context["plan_id"]),
+        )
+        files = _insert_files(db, run_context["experiment_id"], "service-role-positive")
+        _attempt(db, run_id, status="succeeded")
+        db.execute(
+            "select public.pin_attempt_files(%s, 1, %s::uuid[])", (run_id, files)
+        )
+        db.execute(
+            "select public.replace_run_projection(%s, 1, %s::uuid[])", (run_id, files)
+        )
+        report = db.execute(
+            "select version, attempt from public.append_report_version("
+            "%s::uuid, '{\"source\":\"service_role\"}'::jsonb, 'positive report', 1.5::numeric)",
+            (run_id,),
+        ).fetchone()
+        assert report == {"version": 1, "attempt": 1}
+        assert TestPinningRpc._state(db, run_id, 1) == (
+            {"files_pinned": True}, sorted(files)
+        )
+        db.execute(
+            "select generated_file_id from public.execution_run_files where run_id=%s",
+            (run_id,),
+        )
+        assert sorted(str(row["generated_file_id"]) for row in db.fetchall()) == sorted(files)
+    finally:
+        db.execute("rollback to savepoint service_role_positive")
+        db.execute("release savepoint service_role_positive")
+
+
 class TestSchemaContract:
     def test_execution_attempts_table_exists(self, db):
         db.execute(

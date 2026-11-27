@@ -44,10 +44,34 @@ def run_creation_fingerprint(experiment_id, plan_id, plan_version):
     return hashlib.sha256(raw.encode()).hexdigest()
 
 
+def assert_service_role(cur):
+    role = cur.execute(
+        "select current_user, rolsuper, rolbypassrls "
+        "from pg_roles where rolname = current_user"
+    ).fetchone()
+    assert role == {
+        "current_user": "service_role", "rolsuper": False, "rolbypassrls": True
+    }
+
+
+def insert_auth_user(cur, user_id, prefix):
+    """Auth-user scaffolding stays privileged; production SQL does not."""
+    if cur.execute("select current_user").fetchone()["current_user"] != "postgres":
+        cur.execute("set local role postgres")
+    try:
+        cur.execute(
+            "insert into auth.users (id, email) values (%s, %s) on conflict do nothing",
+            (str(user_id), f"{prefix}-{user_id}@example.com"),
+        )
+    finally:
+        cur.execute("set local role service_role")
+
+
 def call_rpc(
     cur, experiment_id, plan_id, plan_version, actor_id, idem_key, fingerprint
 ):
     """Call create_execution_run RPC; return (run_id, error_code)."""
+    assert_service_role(cur)
     try:
         cur.execute(
             "select public.create_execution_run(%s, %s, %s, %s, %s, %s)",
@@ -67,13 +91,10 @@ def call_rpc(
 
 @pytest.fixture
 def actor(db):
-    """Create a test user and return their id."""
+    """Create an auth user, then switch production SQL to service_role."""
     user_id = uuid4()
-    db.execute(
-        "insert into auth.users (id, email) values (%s, %s) "
-        "on conflict do nothing",
-        (str(user_id), f"test-{user_id}@example.com"),
-    )
+    insert_auth_user(db, user_id, "test")
+    assert_service_role(db)
     return str(user_id)
 
 
@@ -251,11 +272,7 @@ class TestAuthorization:
     def test_delegation_actor_mismatch(self, db, experiment, actor):
         """Delegated plan with wrong actor fails."""
         other_actor = str(uuid4())
-        db.execute(
-            "insert into auth.users (id, email) "
-            "values (%s, %s) on conflict do nothing",
-            (other_actor, f"other-{other_actor}@example.com"),
-        )
+        insert_auth_user(db, UUID(other_actor), "other")
         config = {
             **DELEGATED_CONFIG,
             "delegated_by": other_actor,
@@ -403,11 +420,7 @@ class TestForbidden:
     def test_non_owner_forbidden(self, db, experiment, actor, plan):
         """Actor who does not own the experiment gets FORBIDDEN."""
         fake_actor = str(uuid4())
-        db.execute(
-            "insert into auth.users (id, email) "
-            "values (%s, %s) on conflict do nothing",
-            (fake_actor, f"fake-{fake_actor}@example.com"),
-        )
+        insert_auth_user(db, UUID(fake_actor), "fake")
         fp = run_creation_fingerprint(experiment, plan, 1)
         _, err = call_rpc(
             db, experiment, plan, 1, fake_actor, "test-forbid-01", fp

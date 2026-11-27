@@ -602,25 +602,6 @@ async def async_persist_result(
     _upload(admin, stdout_path, result.stdout.encode("utf-8"))
     _upload(admin, stderr_path, result.stderr.encode("utf-8"))
 
-    existing = (
-        admin.table("execution_artifacts")
-        .select("id,metadata_json,storage_path,attempt")
-        .eq("run_id", run_id)
-        .execute()
-        .data
-    )
-    artifact_prefix = f"{prefix}/artifacts/"
-    # Only the current attempt's rows are ever replaced; other attempts keep
-    # their artifacts so a repair never erases a prior attempt's evidence.
-    replace_ids = [
-        row["id"]
-        for row in existing
-        if row.get("attempt") == history_attempt
-        or str((row.get("metadata_json") or {}).get("attempt")) == str(history_attempt)
-        or str(row.get("storage_path") or "").startswith(artifact_prefix)
-    ]
-    if replace_ids:
-        admin.table("execution_artifacts").delete().in_("id", replace_ids).execute()
     artifact_rows = []
     for name in result.artifacts:
         try:
@@ -631,40 +612,38 @@ async def async_persist_result(
         _upload(admin, storage_path, data)
         artifact_rows.append(
             {
-                "run_id": run_id,
                 "artifact_type": name,
                 "storage_path": storage_path,
-                "attempt": history_attempt,
                 "metadata_json": {
                     "attempt": history_attempt,
                     "code_hash": result.audit.code_hash if result.audit else None,
                 },
             }
         )
-    if artifact_rows:
-        admin.table("execution_artifacts").insert(artifact_rows).execute()
 
-    update = {
-        "exit_code": result.exit_code,
-        "metrics_json": result.metrics,
-        "runtime_json": {"execution_time": result.execution_time},
-        "audit_json": result.audit.model_dump(mode="json") if result.audit else {},
-        "stdout_path": stdout_path,
-        "stderr_path": stderr_path,
-    }
-    if result.error_category is not None:
-        update["error_category"] = result.error_category.value
-    if result.error is not None:
-        update["error"] = result.error
-    (
-        admin.table("execution_runs")
-        .update(update)
-        .eq("id", run_id)
-        .eq("repair_attempt", attempt)
-        .neq("status", RunStatus.CANCELLED.value)
-        .neq("status", RunStatus.SUCCEEDED.value)
-        .execute()
-    )
+    # No destructive database work happened before this call. The RPC takes the
+    # Run lock, rechecks the owning nonterminal attempt, replaces only that
+    # attempt's artifact rows, and applies the audit update atomically. A cancel
+    # or terminal seal during storage/Runner I/O therefore wins without losing
+    # existing evidence or overwriting terminal audit/error/path truth.
+    admin.rpc(
+        "persist_execution_result",
+        {
+            "p_run_id": run_id,
+            "p_repair_attempt": attempt,
+            "p_artifact_rows": artifact_rows,
+            "p_exit_code": result.exit_code,
+            "p_metrics_json": result.metrics,
+            "p_execution_time": result.execution_time,
+            "p_audit_json": result.audit.model_dump(mode="json") if result.audit else {},
+            "p_stdout_path": stdout_path,
+            "p_stderr_path": stderr_path,
+            "p_error_category": (
+                result.error_category.value if result.error_category is not None else None
+            ),
+            "p_error": result.error,
+        },
+    ).execute()
 
 
 def create_oom_plan(

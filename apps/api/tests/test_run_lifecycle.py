@@ -11,6 +11,7 @@ from reproagent_api.config import ApiSettings
 from reproagent_api.workflow import WorkflowContext
 from reproagent_schemas import (
     BudgetConfig,
+    ErrorCategory,
     RunAccepted,
     RunResult,
     RunStatus,
@@ -908,6 +909,7 @@ def test_async_persist_result_writes_attempt_on_artifacts():
     from reproagent_api.services.runs import async_persist_result
 
     admin, state, _, run_id, plan_id = _seed_attempt_run(attempt=0, status="running")
+    _seed_persistable_attempt(admin, state, run_id)
     runner_run_id = uuid4()
     admin.tables["execution_runs"][0]["runner_run_id"] = str(runner_run_id)
     result = RunResult(
@@ -941,6 +943,8 @@ def test_async_persist_result_never_erases_prior_attempt_artifacts():
     from reproagent_api.services.runs import async_persist_result
 
     admin, state, _, run_id, _ = _seed_attempt_run(attempt=1, status="running")
+    _seed_persistable_attempt(admin, state, run_id, attempt=0)
+    _seed_persistable_attempt(admin, state, run_id, attempt=1)
     # Pre-existing artifact from the first attempt (attempt=1 in history terms).
     admin.tables["execution_artifacts"].append({
         "id": str(uuid4()),
@@ -979,6 +983,109 @@ def test_async_persist_result_never_erases_prior_attempt_artifacts():
     assert [a["attempt"] for a in arts] == [1, 2]
     assert arts[0]["storage_path"] == f"{run_id}/attempt-1/artifacts/metrics.json"
     assert arts[1]["storage_path"] == f"{run_id}/attempt-2/artifacts/metrics.json"
+
+
+def _seed_persistable_attempt(admin, state, run_id, attempt=0):
+    from reproagent_api.services.runs import ensure_attempt_row
+
+    return ensure_attempt_row(admin, admin.tables["execution_runs"][0], attempt + 1)
+
+
+@pytest.mark.asyncio
+async def test_cancel_after_result_claim_before_artifact_replace():
+    """Cancellation after the persistence claim cannot delete or replace evidence."""
+    from reproagent_api.services.runs import async_persist_result
+
+    admin, state, _, run_id, _ = _seed_attempt_run(attempt=0, status="running")
+    _seed_persistable_attempt(admin, state, run_id)
+    run = admin.tables["execution_runs"][0]
+    run.update({
+        "metrics_json": {"protected": True},
+        "audit_json": {"seed": 42},
+        "stdout_path": "protected/stdout.txt",
+        "stderr_path": "protected/stderr.txt",
+        "error": "cancelled: workflow cancelled by user",
+    })
+    protected = {
+        "id": str(uuid4()),
+        "run_id": run_id,
+        "attempt": 1,
+        "artifact_type": "protected.json",
+        "storage_path": f"{run_id}/attempt-1/artifacts/protected.json",
+        "metadata_json": {"attempt": 1},
+    }
+    admin.tables["execution_artifacts"].append(protected)
+
+    class CancellingRunner:
+        async def get_artifact_bytes(self, runner_run_id, name):
+            # The result has been claimed; this is the pre-replacement race window.
+            assert run["status"] == "running"
+            run.update({"status": "cancelled", "error": "cancelled: workflow cancelled by user"})
+            return b"late artifact"
+
+    result = RunResult(
+        run_id=uuid4(), status=RunStatus.SUCCEEDED, metrics={"late": True},
+        artifacts=["late.json"], audit={"seed": 99},
+    )
+    await async_persist_result(admin, run_id, result.run_id, result, CancellingRunner(), 0)
+
+    assert admin.tables["execution_artifacts"] == [protected]
+    assert run["status"] == "cancelled"
+    assert run["error"] == "cancelled: workflow cancelled by user"
+    assert run["metrics_json"] == {"protected": True}
+    assert run["audit_json"] == {"seed": 42}
+    assert run["stdout_path"] == "protected/stdout.txt"
+    assert run["stderr_path"] == "protected/stderr.txt"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("terminal", ["failed", "timeout", "succeeded"])
+async def test_terminal_audit_survives_result_claim_before_artifact_replace(terminal):
+    """Every persisted terminal status seals audit/error/paths and current artifacts."""
+    from reproagent_api.services.runs import async_persist_result
+
+    admin, state, _, run_id, _ = _seed_attempt_run(attempt=0, status="running")
+    _seed_persistable_attempt(admin, state, run_id)
+    run = admin.tables["execution_runs"][0]
+    run.update({
+        "metrics_json": {"protected": True},
+        "audit_json": {"seed": 42},
+        "stdout_path": "protected/stdout.txt",
+        "stderr_path": "protected/stderr.txt",
+        "error_category": "TIMEOUT",
+        "error": "persisted terminal truth",
+    })
+    protected = {
+        "id": str(uuid4()),
+        "run_id": run_id,
+        "attempt": 1,
+        "artifact_type": "protected.json",
+        "storage_path": f"{run_id}/attempt-1/artifacts/protected.json",
+        "metadata_json": {"attempt": 1},
+    }
+    admin.tables["execution_artifacts"].append(protected)
+
+    class TerminalRunner:
+        async def get_artifact_bytes(self, runner_run_id, name):
+            assert run["status"] == "running"
+            run.update({"status": terminal, "error": "persisted terminal truth"})
+            return b"late artifact"
+
+    result = RunResult(
+        run_id=uuid4(), status=RunStatus.FAILED, error="late error",
+        error_category=ErrorCategory.UNKNOWN_ERROR,
+        metrics={"late": True}, artifacts=["late.json"], audit={"seed": 99},
+    )
+    await async_persist_result(admin, run_id, result.run_id, result, TerminalRunner(), 0)
+
+    assert admin.tables["execution_artifacts"] == [protected]
+    assert run["status"] == terminal
+    assert run["error"] == "persisted terminal truth"
+    assert run["error_category"] == "TIMEOUT"
+    assert run["metrics_json"] == {"protected": True}
+    assert run["audit_json"] == {"seed": 42}
+    assert run["stdout_path"] == "protected/stdout.txt"
+    assert run["stderr_path"] == "protected/stderr.txt"
 
 
 def test_terminal_attempt_history_cannot_be_reopened_by_stale_writer():

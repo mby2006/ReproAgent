@@ -515,6 +515,59 @@ class FakeAdmin:
                 for fid in params["p_file_ids"]
             )
             return FakeRPC(True)
+        if name == "persist_execution_result":
+            run = next(
+                (row for row in self.tables["execution_runs"]
+                 if row["id"] == params["p_run_id"]),
+                None,
+            )
+            if (
+                run is None
+                or run.get("repair_attempt", 0) != params["p_repair_attempt"]
+                or run["status"] not in ("queued", "dispatching", "running")
+            ):
+                return FakeRPC(False)
+            history_attempt = params["p_repair_attempt"] + 1
+            if not any(
+                row["run_id"] == params["p_run_id"] and row["attempt"] == history_attempt
+                for row in self.tables.get("execution_attempts", [])
+            ):
+                raise ValueError("RESULT_ATTEMPT_NOT_FOUND")
+            prefix = f"{params['p_run_id']}/attempt-{history_attempt}/artifacts/"
+            artifacts = self.tables.setdefault("execution_artifacts", [])
+            artifacts[:] = [
+                row for row in artifacts
+                if row["run_id"] != params["p_run_id"] or not (
+                    row.get("attempt") == history_attempt
+                    or str((row.get("metadata_json") or {}).get("attempt")) == str(history_attempt)
+                    or str(row.get("storage_path") or "").startswith(prefix)
+                )
+            ]
+            artifacts.extend(
+                {
+                    "id": str(uuid4()),
+                    "run_id": params["p_run_id"],
+                    "attempt": history_attempt,
+                    "created_at": "2026-01-01T00:00:00+00:00",
+                    "updated_at": "2026-01-01T00:00:00+00:00",
+                    **item,
+                }
+                for item in params["p_artifact_rows"]
+            )
+            run.update({
+                "exit_code": params["p_exit_code"],
+                "metrics_json": params["p_metrics_json"] or {},
+                "runtime_json": {"execution_time": params["p_execution_time"]},
+                "audit_json": params["p_audit_json"] or {},
+                "stdout_path": params["p_stdout_path"],
+                "stderr_path": params["p_stderr_path"],
+                "error_category": (
+                    params["p_error_category"]
+                    if params["p_error_category"] is not None else run.get("error_category")
+                ),
+                "error": params["p_error"] if params["p_error"] is not None else run.get("error"),
+            })
+            return FakeRPC(True)
         if name == "append_report_version":
             run_id = params["p_run_id"]
             attempts = [

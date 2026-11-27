@@ -66,6 +66,7 @@ class WorkflowState(TypedDict, total=False):
     status: str
     current_node: str
     error: str
+    error_code: str
     support_code: str
 
 

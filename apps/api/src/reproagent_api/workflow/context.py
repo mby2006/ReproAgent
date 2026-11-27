@@ -33,7 +33,9 @@ class WorkflowContext:
         """Persist an awaiting/phase status immediately (used before interrupt())."""
         self.admin.table("workflows").update(
             {"status": status.value, "current_node": node, "updated_at": _now()}
-        ).eq("id", state["workflow_id"]).execute()
+        ).eq("id", state["workflow_id"]).neq(
+            "status", WorkflowStatus.CANCELLED.value
+        ).execute()
         return {"status": status.value, "current_node": node}
 
     def persist_workflow(self, state: dict, updates: dict, node: str) -> None:
@@ -44,7 +46,11 @@ class WorkflowContext:
         row["updated_at"] = _now()
         if "budget" in updates:
             row["budget_json"] = updates["budget"].model_dump(mode="json")
-        self.admin.table("workflows").update(row).eq("id", state["workflow_id"]).execute()
+        # A cancellation persisted by the API outranks every in-flight node: an
+        # ongoing drive must never revive a cancelled workflow row.
+        self.admin.table("workflows").update(row).eq("id", state["workflow_id"]).neq(
+            "status", WorkflowStatus.CANCELLED.value
+        ).execute()
 
     def write_trace(
         self,

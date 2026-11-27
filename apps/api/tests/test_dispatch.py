@@ -401,27 +401,31 @@ def test_reconciler_does_not_requeue_workflow_created_after_snapshot(monkeypatch
     ]
 
 
-@pytest.mark.parametrize(("workflow_status", "expected_run_status", "error"), [
-    (WorkflowStatus.COMPLETED.value, "succeeded", None),
-    (WorkflowStatus.FAILED.value, "failed", "sandbox execution failed"),
+@pytest.mark.parametrize(("workflow_status", "error"), [
+    (WorkflowStatus.COMPLETED.value, None),
+    (WorkflowStatus.FAILED.value, "sandbox execution failed"),
 ])
-def test_reconciler_finalizes_run_from_terminal_workflow(
-    monkeypatch, workflow_status, expected_run_status, error
-):
+def test_reconciler_finalizes_run_from_terminal_workflow(monkeypatch, workflow_status, error):
+    """A terminal workflow closes an open run, but never as a fabricated success."""
     admin = _admin()
     run = _run(admin, status="running")
-    _workflow(admin, run, status=workflow_status, error=error)
+    workflow = _workflow(admin, run, status=workflow_status, error=error)
 
     asyncio.run(worker.reconcile_dispatch_task(_ctx(admin, monkeypatch)))
 
-    assert run["status"] == expected_run_status
+    expected_error = error or (
+        f"unknown: workflow {workflow['id']} finished without a recorded execution result"
+    )
+    assert run["status"] == "failed"
     assert run["finished_at"]
-    assert run.get("error") == error
-    assert admin.tables["experiments"][0]["status"] == expected_run_status
+    assert run.get("error") == expected_error
+    assert admin.tables["experiments"][0]["status"] == "failed"
     assert admin.rpc_calls == [("reconcile_execution_run", {
         "p_run_id": run["id"],
-        "p_status": expected_run_status,
-        "p_error": error,
+        "p_status": "failed",
+        "p_error": expected_error,
+        "p_repair_attempt": 0,
+        "p_require_latest": False,
     })]
 
 
@@ -482,6 +486,8 @@ def test_stale_terminal_workflow_does_not_overwrite_newer_run_experiment(
         "p_run_id": stale_run["id"],
         "p_status": "failed",
         "p_error": "sandbox execution failed",
+        "p_repair_attempt": 0,
+        "p_require_latest": False,
     })]
 
 
@@ -505,11 +511,9 @@ def test_reconciler_preserves_terminal_run_after_stale_snapshot(monkeypatch, ter
     assert run["status"] == terminal_status
     assert run["finished_at"] == finished_at
     assert admin.tables["experiments"][0]["status"] == "approved"
-    assert admin.rpc_calls == [("reconcile_execution_run", {
-        "p_run_id": run["id"],
-        "p_status": "succeeded",
-        "p_error": None,
-    })]
+    # a run whose row already holds a terminal outcome is never rewritten, not even
+    # by the recovery mirror: the recorded status IS the truth.
+    assert admin.rpc_calls == []
 
 
 def test_reconciler_fails_stale_running_run_without_workflow(monkeypatch):

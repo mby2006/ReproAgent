@@ -336,8 +336,10 @@ async def test_non_repairable_error_still_evaluates_and_reports():
     assert len(admin.tables["generated_files"]) == 5  # no repair version
     report = admin.tables["reproduction_reports"][0]["report_json"]
     assert report["final_status"] == "EXECUTION_FAILED"
-    # pipeline ran to completion (evaluated the failed run) -> workflow completed
-    assert _workflow(admin)["status"] == WorkflowStatus.COMPLETED.value
+    # the pipeline still evaluated the failed run, but a terminal Run failure is a
+    # terminal workflow failure: never completed, with a stable error code
+    assert _workflow(admin)["status"] == WorkflowStatus.FAILED.value
+    assert _workflow(admin)["error"].startswith("EXECUTION_FAILED:")
 
 
 @pytest.mark.asyncio

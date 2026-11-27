@@ -57,6 +57,21 @@ TERMINAL = {
 AWAITING = {
     s.value for s in (WorkflowStatus.AWAITING_SPEC_REVIEW, WorkflowStatus.AWAITING_PLAN_APPROVAL)
 }
+# Only an uncancelled, non-terminal workflow may be handed to a driver again.
+RESUMABLE = {
+    s.value
+    for s in WorkflowStatus
+    if s not in (WorkflowStatus.COMPLETED, WorkflowStatus.FAILED, WorkflowStatus.CANCELLED)
+}
+
+
+def resume_allowed(workflow: dict) -> bool:
+    """Whether a worker may (re-)drive this workflow.
+
+    Cancellation is persisted before the API returns, so a cancelled row outranks
+    any queued resume/recovery job: it must never be re-driven into completion.
+    """
+    return workflow.get("status") in RESUMABLE
 
 
 def _advisory_key(workflow_id: str) -> int:
@@ -143,7 +158,7 @@ async def resume_workflow_task(ctx: dict, workflow_id: str, stage: str) -> None:
         if stage == "spec"
         else WorkflowStatus.AWAITING_PLAN_APPROVAL.value
     )
-    if workflow["status"] != expected:
+    if workflow["status"] != expected or not resume_allowed(workflow):
         return
     with _drive_lock(settings, workflow_id) as acquired:
         if not acquired:
@@ -181,39 +196,40 @@ async def _enqueue_workflow_recovery(redis, workflow_id: str) -> None:
 
 
 async def _recover_existing_workflow(ctx: dict, admin, run: dict, workflow: dict) -> None:
-    """Recover the run's existing workflow instead of creating a duplicate."""
-    if workflow["status"] not in TERMINAL:
+    """Recover the run's existing workflow instead of creating a duplicate.
+
+    The Run row owns its own terminal outcome: whatever the database already
+    recorded (succeeded / failed / timeout / cancelled) is left untouched, and a
+    completed workflow is never read back as evidence that execution succeeded.
+    Only a workflow that genuinely reached a terminal state finalizes a still
+    open run, and then it records the truthful unknown/failed/cancelled result.
+    """
+    if resume_allowed(workflow):
         await _enqueue_workflow_recovery(ctx.get("redis"), workflow["id"])
         return
 
+    recorded = {
+        RunStatus.SUCCEEDED.value, RunStatus.FAILED.value,
+        RunStatus.TIMEOUT.value, RunStatus.CANCELLED.value,
+    }
+    if run.get("status") in recorded:
+        return
+
     if workflow["status"] == WorkflowStatus.CANCELLED.value:
-        run_status = RunStatus.CANCELLED.value
-        error = workflow.get("error")
-        finalized = finalize_execution_run(
-            admin,
-            run["id"],
-            RunStatus.CANCELLED,
-            error,
-            attempt=run.get("repair_attempt", 0),
-        )
+        run_status = RunStatus.CANCELLED
+        error = workflow.get("error") or "cancelled: workflow cancelled by user"
     else:
-        run_status = (
-            RunStatus.SUCCEEDED.value
-            if workflow["status"] == WorkflowStatus.COMPLETED.value
-            else RunStatus.FAILED.value
+        run_status = RunStatus.FAILED
+        error = workflow.get("error") or (
+            f"unknown: workflow {workflow['id']} finished without a recorded execution result"
         )
-        error = None
-        if run_status == RunStatus.FAILED.value:
-            error = workflow.get("error") or f"Workflow {workflow['id']} failed"
-        finalized = admin.rpc("reconcile_execution_run", {
-            "p_run_id": run["id"],
-            "p_status": run_status,
-            "p_error": error,
-        })
+    finalized = finalize_execution_run(
+        admin, run["id"], run_status, error, attempt=run.get("repair_attempt", 0)
+    )
     if finalized:
         logger.warning(
             "finalized run %s as %s from terminal workflow %s",
-            run["id"], run_status, workflow["id"],
+            run["id"], run_status.value, workflow["id"],
         )
 
 
@@ -343,7 +359,7 @@ async def recover_workflow_task(ctx: dict, workflow_id: str) -> None:
     if workflow is None:
         logger.error("workflow %s not found", workflow_id)
         raise RuntimeError(f"Workflow {workflow_id} not found")
-    if workflow["status"] in TERMINAL or workflow["status"] in AWAITING:
+    if not resume_allowed(workflow) or workflow["status"] in AWAITING:
         return
     with _drive_lock(settings, workflow_id) as acquired:
         if not acquired:
@@ -544,7 +560,7 @@ class WorkerSettings:
         await enqueue_pending_outbox(admin, redis)
         rows = admin.table("workflows").select("id,status").execute().data
         for row in rows:
-            if row["status"] not in TERMINAL and row["status"] not in AWAITING and redis:
+            if resume_allowed(row) and row["status"] not in AWAITING and redis:
                 await _enqueue_workflow_recovery(redis, row["id"])
         # Comparisons resume the same way: completed groups are skipped, so a
         # crash mid-pair only re-runs what is missing.

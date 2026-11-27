@@ -2,7 +2,7 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { IconPlay, IconStop } from "@/components/icons";
-import { apiFetch, apiGet } from "@/lib/api";
+import { apiFetch, apiGet, cancelWorkflow } from "@/lib/api";
 import { startVisiblePolling } from "@/lib/polling";
 import { PrivatePredictions } from "@/components/PredictionReader";
 import ReportPanel from "./ReportPanel";
@@ -110,11 +110,13 @@ export default function RunPanel({
   approved,
   workflowDriven = false,
   workflowStatus = null,
+  workflowId = null,
 }: {
   experimentId: string;
   approved: boolean;
   workflowDriven?: boolean;
   workflowStatus?: WorkflowStatus | null;
+  workflowId?: string | null;
 }) {
   const [runs, setRuns] = useState<RunSummary[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
@@ -293,7 +295,26 @@ export default function RunPanel({
     }
   }
 
+  // 取消入口在 Run 之外同样可用：workflow 尚处于非终态的任意阶段都能停止，
+  // 取消是独立终态，不会被前端折算成失败或成功。
+  async function stopWorkflow() {
+    if (!workflowId || cancelling) return;
+    setCancelling(true);
+    setError(null);
+    try {
+      await cancelWorkflow(workflowId);
+      await loadRuns();
+      if (selectedId) await loadDetail(selectedId);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "停止工作流失败");
+    } finally {
+      setCancelling(false);
+    }
+  }
+
   const running = detail != null && !RUN_TERMINAL.includes(detail.status);
+  const hasActiveRun = running || runs.some((r) => !RUN_TERMINAL.includes(r.status));
+  const canStopWorkflow = workflowId != null && !workflowTerminal && !hasActiveRun;
   const metrics = detail?.metrics_json ?? {};
   const audit = detail?.audit_json ?? {};
   const targetMetric = typeof metrics.target_metric === "string" ? metrics.target_metric : null;
@@ -330,6 +351,11 @@ export default function RunPanel({
         {running && (
           <button onClick={cancel} disabled={cancelling} aria-busy={cancelling} className="btn btn-danger btn-sm">
             <IconStop className="h-3.5 w-3.5" /> {cancelling ? "取消中…" : "取消运行"}
+          </button>
+        )}
+        {canStopWorkflow && (
+          <button onClick={stopWorkflow} disabled={cancelling} aria-busy={cancelling} className="btn btn-danger btn-sm">
+            <IconStop className="h-3.5 w-3.5" /> {cancelling ? "停止中…" : "停止工作流"}
           </button>
         )}
         {!workflowDriven && !approved && (

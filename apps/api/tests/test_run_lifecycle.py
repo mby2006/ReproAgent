@@ -8,7 +8,13 @@ from reproagent_agent.codegen import generate_code
 from reproagent_agent.planning import build_plan
 from reproagent_api.config import ApiSettings
 from reproagent_api.workflow import WorkflowContext
-from reproagent_schemas import BudgetConfig, RunAccepted, RunResult, RunStatus
+from reproagent_schemas import (
+    BudgetConfig,
+    RunAccepted,
+    RunResult,
+    RunStatus,
+    WorkflowStatus,
+)
 from test_runs import PROJECT_ID, USER_ID, FakeAdmin, make_card
 from test_workflow_graph import PAPER_ID, _state, seed_workflow
 
@@ -380,6 +386,153 @@ async def test_persist_results_treats_cancelled_execution_as_cancelled_workflow(
     assert updates["status"] == "cancelled"
     assert admin.tables["workflows"][0]["status"] == "cancelled"
     assert admin.tables["experiments"][0]["status"] == "cancelled"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("run_status", "code"), [
+    (RunStatus.FAILED, "EXECUTION_FAILED"),
+    (RunStatus.TIMEOUT, "TIMEOUT"),
+])
+async def test_persist_results_never_completes_failed_run(run_status, code):
+    from reproagent_api.workflow.nodes import persist_results
+
+    admin, state, _ = seed_execution(status=run_status.value)
+    state["execution_result"] = RunResult(
+        run_id=UUID(state["run_id"]), status=run_status, error="sandbox died"
+    )
+    updates = await persist_results(state, make_context(admin, StubRunner()))
+
+    # A terminal Run failure is a terminal workflow failure: never completed.
+    assert updates["status"] == WorkflowStatus.FAILED.value
+    assert updates["error_code"] == code
+    assert admin.tables["workflows"][0]["status"] == "failed"
+    assert admin.tables["workflows"][0]["error"].startswith(f"{code}:")
+    assert "sandbox died" in admin.tables["workflows"][0]["error"]
+    # The Run keeps its own terminal status: timeout never degrades to failed.
+    assert admin.tables["execution_runs"][0]["status"] == run_status.value
+
+
+@pytest.mark.asyncio
+async def test_persist_results_keeps_existing_pipeline_error_code():
+    from reproagent_api.workflow.nodes import persist_results
+
+    admin, state, _ = seed_execution(status=RunStatus.FAILED.value)
+    state["error"] = "OUT_OF_MEMORY: repair budget exhausted"
+    state["execution_result"] = RunResult(
+        run_id=UUID(state["run_id"]), status=RunStatus.FAILED, error="CUDA out of memory"
+    )
+    updates = await persist_results(state, make_context(admin, StubRunner()))
+
+    assert updates["status"] == WorkflowStatus.FAILED.value
+    assert updates["error_code"] == "OUT_OF_MEMORY"
+    assert admin.tables["workflows"][0]["error"] == "OUT_OF_MEMORY: repair budget exhausted"
+
+
+@pytest.mark.parametrize(("run_status", "code"), [
+    (RunStatus.FAILED, "EXECUTION_FAILED"),
+    (RunStatus.TIMEOUT, "TIMEOUT"),
+])
+def test_cancellation_race_keeps_run_terminal_truth_and_workflow_cancelled(
+    monkeypatch, run_status, code
+):
+    """Cancellation outranks the workflow write, the Run keeps its real outcome.
+
+    The Runner reached a real terminal state while a cancellation was being
+    persisted. The polling loop must not block past the cancellation, the workflow
+    row stays CANCELLED, and the Run row keeps FAILED/TIMEOUT instead of being
+    rewritten as cancelled or succeeded.
+    """
+    import asyncio
+    from contextlib import contextmanager
+
+    from reproagent_api import worker
+    from reproagent_api.workflow.nodes import execute_code, persist_results
+
+    @contextmanager
+    def _always_acquired(settings, workflow_id):
+        yield True
+
+    admin, state, _ = seed_execution(status="running")
+    runner_run_id = uuid4()
+    admin.tables["execution_runs"][0]["runner_run_id"] = str(runner_run_id)
+    workflow_id = admin.tables["workflows"][0]["id"]
+    admin.tables["workflows"][0]["status"] = WorkflowStatus.CANCELLED.value
+    admin.tables["workflows"][0]["run_id"] = state["run_id"]
+    runner = StubRunner(RunResult(run_id=runner_run_id, status=run_status, error="boom"))
+    ctx = make_context(admin, runner)
+
+    updates = asyncio.run(execute_code(state, ctx))
+    assert updates["execution_result"].status is run_status
+    assert admin.tables["execution_runs"][0]["status"] == run_status.value
+    assert runner.cancelled == [runner_run_id]
+
+    terminal = asyncio.run(persist_results(state, ctx))
+    assert terminal["status"] == WorkflowStatus.CANCELLED.value
+    assert admin.tables["workflows"][0]["status"] == "cancelled"
+    assert admin.tables["execution_runs"][0]["status"] == run_status.value
+
+    monkeypatch.setattr(worker, "make_service_client", lambda s: admin)
+    monkeypatch.setattr(worker, "_drive_lock", _always_acquired)
+    worker_ctx = {"settings": ctx.settings, "redis": None}
+    asyncio.run(worker.recover_workflow_task(worker_ctx, workflow_id))
+    run = admin.tables["execution_runs"][0]
+    assert run["status"] == run_status.value
+    assert admin.tables["workflows"][0]["status"] == "cancelled"
+    asyncio.run(worker._recover_existing_workflow(worker_ctx, admin, run, {
+        "id": workflow_id, "status": WorkflowStatus.CANCELLED.value, "error": "cancelled",
+    }))
+    assert admin.tables["execution_runs"][0]["status"] == run_status.value
+
+
+@pytest.mark.parametrize("workflow_status", ["completed", "failed", "cancelled"])
+def test_worker_recovery_never_infers_success_from_workflow(monkeypatch, workflow_status):
+    """Recovery reads the Run row's own terminal state; completed is not evidence."""
+    import asyncio
+    from contextlib import contextmanager
+
+    from reproagent_api import worker
+
+    @contextmanager
+    def _always_acquired(settings, workflow_id):
+        yield True
+
+    admin, state, _ = seed_execution(status="running", attempt=1)
+    workflow_id = admin.tables["workflows"][0]["id"]
+    admin.tables["workflows"][0]["status"] = workflow_status
+    admin.tables["workflows"][0]["run_id"] = state["run_id"]
+    admin.tables["workflows"][0]["error"] = "EXECUTION_FAILED: sandbox died"
+    monkeypatch.setattr(worker, "_drive_lock", _always_acquired)
+    ctx = {"settings": ApiSettings(supabase_service_role_key="s", _env_file=None), "redis": None}
+    run = admin.tables["execution_runs"][0]
+
+    asyncio.run(worker._recover_existing_workflow(ctx, admin, run, dict(admin.tables["workflows"][0])))
+
+    run = admin.tables["execution_runs"][0]
+    assert run["status"] != RunStatus.SUCCEEDED.value
+    assert run["status"] == (
+        RunStatus.CANCELLED.value if workflow_status == "cancelled" else RunStatus.FAILED.value
+    )
+    assert admin.tables["workflows"][0]["status"] == workflow_status
+
+
+@pytest.mark.asyncio
+async def test_worker_recovery_leaves_recorded_terminal_run_untouched():
+    from reproagent_api import worker
+
+    admin, state, _ = seed_execution(status=RunStatus.SUCCEEDED.value, attempt=1)
+    workflow_id = admin.tables["workflows"][0]["id"]
+    admin.tables["workflows"][0]["status"] = WorkflowStatus.COMPLETED.value
+    finished_at = "2026-01-01T00:00:00+00:00"
+    admin.tables["execution_runs"][0]["finished_at"] = finished_at
+    ctx = {"settings": ApiSettings(supabase_service_role_key="s", _env_file=None), "redis": None}
+
+    await worker._recover_existing_workflow(
+        ctx, admin, admin.tables["execution_runs"][0], dict(admin.tables["workflows"][0])
+    )
+
+    run = admin.tables["execution_runs"][0]
+    assert run["status"] == "succeeded"
+    assert run["finished_at"] == finished_at
 
 
 @pytest.mark.asyncio

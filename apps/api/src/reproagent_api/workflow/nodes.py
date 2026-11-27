@@ -35,6 +35,7 @@ from reproagent_schemas import (
 from ..services.review import validate_review_response
 from ..services.runs import (
     async_persist_result,
+    execution_request_id,
     build_run_request,
     create_oom_plan,
     finalize_execution_run,
@@ -53,6 +54,10 @@ from .harness import BudgetExceeded, ensure_llm_budget, record_usages, time_budg
 
 POLL_INTERVAL_SECONDS = 1.0
 TERMINAL_RUN = {RunStatus.SUCCEEDED, RunStatus.FAILED, RunStatus.TIMEOUT, RunStatus.CANCELLED}
+# Stable workflow error codes: the Run keeps its own terminal status while the
+# workflow row carries the code the UI/API branches on.
+EXECUTION_FAILED = "EXECUTION_FAILED"
+CANCELLED_MESSAGE = "cancelled: workflow cancelled by user"
 
 
 def _now() -> str:
@@ -65,14 +70,68 @@ def _finalize_run(
     finalize_execution_run(admin, run_id, RunStatus(status), error, attempt=attempt)
 
 
-async def _poll_run(runner, runner_run_id: UUID):
+def cancel_requested(state: dict, ctx: WorkflowContext) -> bool:
+    """Whether a cancellation was persisted for this workflow.
+
+    The database row -- not checkpoint state or an in-memory flag -- is the truth,
+    so a cancellation survives a Registry/worker restart and is observed by every
+    node boundary, router, and poll iteration.
+    """
+    workflow_id = state.get("workflow_id")
+    if not workflow_id:
+        return False
+    rows = (
+        ctx.admin.table("workflows")
+        .select("status")
+        .eq("id", workflow_id)
+        .execute()
+        .data
+    )
+    return bool(rows) and rows[0]["status"] == WorkflowStatus.CANCELLED.value
+
+
+def _error_code(error: str | None) -> str | None:
+    """Extract the stable ``CODE:`` prefix of a workflow error message."""
+    if not error:
+        return None
+    prefix = error.split(":", 1)[0].strip()
+    if prefix and prefix.replace("_", "").isalpha() and prefix.isupper():
+        return prefix
+    return None
+
+
+async def _poll_run(ctx: WorkflowContext, state: dict, runner_run_id: UUID):
+    """Poll with short waits so a persisted cancellation is never missed.
+
+    On cancellation the Runner is cancelled immediately; the run row's already
+    recorded terminal outcome stays authoritative, and a still-running attempt is
+    finalized as cancelled instead of being polled out to a synthetic timeout.
+    """
+    terminal_statuses = {status.value for status in TERMINAL_RUN}
+    run_id = state.get("run_id")
     for _ in range(700):
-        result = await runner.get_run(runner_run_id)
+        if run_id and cancel_requested(state, ctx):
+            await _cancel_runner(ctx.runner, runner_run_id)
+            # One last non-blocking read: a real terminal outcome the Runner
+            # already recorded outranks the cancellation at the Run layer.
+            try:
+                final = await ctx.runner.get_run(runner_run_id)
+            except Exception:
+                final = None
+            if final is not None and final.status in TERMINAL_RUN:
+                return final
+            row = load_run_row(ctx.admin, run_id)
+            if row is not None and row["status"] in terminal_statuses:
+                return terminal_result_from_row(row)
+            return RunResult(
+                run_id=UUID(run_id), status=RunStatus.CANCELLED, error=CANCELLED_MESSAGE
+            )
+        result = await ctx.runner.get_run(runner_run_id)
         if result.status in TERMINAL_RUN:
             return result
         await asyncio.sleep(POLL_INTERVAL_SECONDS)
     try:
-        await runner.cancel_run(runner_run_id)
+        await ctx.runner.cancel_run(runner_run_id)
     except Exception:
         pass
     return RunResult(
@@ -509,6 +568,17 @@ async def execute_code(state: dict, ctx: WorkflowContext) -> dict:
             current = load_run_row(ctx.admin, run_id)
             if current["status"] == RunStatus.CANCELLED.value:
                 return {**updates, "execution_result": terminal_result_from_row(current)}
+            if cancel_requested(state, ctx):
+                # Never create a container for a workflow the user already stopped.
+                await _cancel_runner(ctx.runner, request.request_id)
+                _finalize_run(
+                    ctx.admin, run_id, RunStatus.CANCELLED.value, CANCELLED_MESSAGE,
+                    attempt=attempt,
+                )
+                return {
+                    **updates,
+                    "execution_result": terminal_result_from_row(load_run_row(ctx.admin, run_id)),
+                }
             accepted = await ctx.runner.start_run(request)
             runner_run_id = accepted.run_id
             if not persist_runner_run_id(ctx.admin, run_id, runner_run_id, attempt):
@@ -517,7 +587,7 @@ async def execute_code(state: dict, ctx: WorkflowContext) -> dict:
                     await _cancel_runner(ctx.runner, runner_run_id)
                 return {**updates, "execution_result": terminal_result_from_row(current)}
 
-        result = await _poll_run(ctx.runner, runner_run_id)
+        result = await _poll_run(ctx, state, runner_run_id)
         await async_persist_result(ctx.admin, run_id, runner_run_id, result, ctx.runner, attempt)
         _finalize_run(ctx.admin, run_id, result.status.value, result.error, attempt=attempt)
     except asyncio.CancelledError:
@@ -647,6 +717,9 @@ async def evaluate_result(state: dict, ctx: WorkflowContext) -> dict:
 
 
 async def generate_report(state: dict, ctx: WorkflowContext) -> dict:
+    if cancel_requested(state, ctx):
+        # A cancelled workflow keeps its prior results but produces no report.
+        return {}
     row = {
         "run_id": state["run_id"],
         "report_json": state["report"].model_dump(mode="json"),
@@ -666,26 +739,83 @@ async def generate_report(state: dict, ctx: WorkflowContext) -> dict:
     return {}
 
 
-async def persist_results(state: dict, ctx: WorkflowContext) -> dict:
-    pipeline_failed = bool(state.get("error")) or state.get("validation_ok") is False
-    result = state.get("execution_result")
-    if result is not None and result.status is RunStatus.CANCELLED and not pipeline_failed:
-        status = WorkflowStatus.CANCELLED
-    else:
-        status = WorkflowStatus.FAILED if pipeline_failed else WorkflowStatus.COMPLETED
-    if state.get("validation_ok") is False and state.get("run_id"):
-        run_row = load_run_row(ctx.admin, state["run_id"])
+async def cancel_workflow(state: dict, ctx: WorkflowContext) -> dict:
+    """Terminal node: honour a persisted cancellation without inventing an outcome.
+
+    The Runner is asked to stop whenever an execution identity is known, the run
+    row keeps whatever terminal outcome it already recorded, and the workflow row
+    becomes cancelled. Already-persisted results (card, plan, code, reports) are
+    left untouched and no report is generated here.
+    """
+    run_id = state.get("run_id")
+    row = load_run_row(ctx.admin, run_id) if run_id else None
+    runner_run_id = state.get("runner_run_id") or (row or {}).get("runner_run_id")
+    if runner_run_id:
+        await _cancel_runner(ctx.runner, UUID(str(runner_run_id)))
+    elif run_id and row is not None and row["status"] in (
+        RunStatus.DISPATCHING.value, RunStatus.RUNNING.value
+    ):
+        # The acceptance identity exists even before the Runner echoes one back.
+        await _cancel_runner(ctx.runner, execution_request_id(UUID(run_id), row.get("repair_attempt", 0)))
+    if row is not None and row["status"] not in {status.value for status in TERMINAL_RUN}:
         _finalize_run(
-            ctx.admin, state["run_id"], RunStatus.FAILED.value, state.get("error"),
-            attempt=run_row.get("repair_attempt", 0) if run_row else 0,
+            ctx.admin, run_id, RunStatus.CANCELLED.value, CANCELLED_MESSAGE,
+            attempt=row.get("repair_attempt", 0),
         )
-    elif result is not None and result.status is RunStatus.CANCELLED and state.get("run_id"):
-        run_row = load_run_row(ctx.admin, state["run_id"])
+    ctx.finalize_workflow(state, WorkflowStatus.CANCELLED, CANCELLED_MESSAGE)
+    return {"status": WorkflowStatus.CANCELLED.value, "current_node": "cancel_workflow"}
+
+
+async def persist_results(state: dict, ctx: WorkflowContext) -> dict:
+    result = state.get("execution_result")
+    run_id = state.get("run_id")
+    # 1. Cancellation is its own terminal outcome: never a failure, never a success.
+    if cancel_requested(state, ctx) or (
+        result is not None and result.status is RunStatus.CANCELLED
+    ):
+        if run_id:
+            run_row = load_run_row(ctx.admin, run_id)
+            _finalize_run(
+                ctx.admin, run_id, RunStatus.CANCELLED.value, CANCELLED_MESSAGE,
+                attempt=run_row.get("repair_attempt", 0) if run_row else 0,
+            )
+        ctx.finalize_workflow(state, WorkflowStatus.CANCELLED, CANCELLED_MESSAGE)
+        return {"status": WorkflowStatus.CANCELLED.value, "current_node": "persist_results"}
+
+    # 2. A terminal Run outcome is the truth of the workflow: a failed or timed-out
+    #    execution can never be persisted as a completed workflow.
+    pipeline_failed = bool(state.get("error")) or state.get("validation_ok") is False
+    code = None
+    if result is not None and result.status in (RunStatus.FAILED, RunStatus.TIMEOUT):
+        status = WorkflowStatus.FAILED
+        code = _error_code(state.get("error")) or (
+            ErrorCategory.TIMEOUT.value
+            if result.status is RunStatus.TIMEOUT
+            else EXECUTION_FAILED
+        )
+    elif pipeline_failed:
+        status = WorkflowStatus.FAILED
+        code = _error_code(state.get("error")) or EXECUTION_FAILED
+    else:
+        status = WorkflowStatus.COMPLETED
+
+    error = state.get("error")
+    if status is WorkflowStatus.FAILED:
+        if not error:
+            error = f"{code}: {(result.error if result else None) or '执行失败'}"
+        elif _error_code(error) is None:
+            error = f"{code}: {error}"
+    if state.get("validation_ok") is False and run_id:
+        run_row = load_run_row(ctx.admin, run_id)
         _finalize_run(
-            ctx.admin, state["run_id"], RunStatus.CANCELLED.value, result.error,
+            ctx.admin, run_id, RunStatus.FAILED.value, error,
             attempt=run_row.get("repair_attempt", 0) if run_row else 0,
         )
     # Execution reconciliation already mirrors the status to the experiment with
     # a latest-run guard. Do not overwrite a newer run here.
-    ctx.finalize_workflow(state, status, state.get("error"))
-    return {"status": status.value, "current_node": "persist_results"}
+    ctx.finalize_workflow(state, status, error)
+    updates = {"status": status.value, "current_node": "persist_results"}
+    if status is WorkflowStatus.FAILED:
+        updates["error"] = error
+        updates["error_code"] = code
+    return updates

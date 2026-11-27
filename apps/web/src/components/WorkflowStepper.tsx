@@ -16,7 +16,10 @@ const ORDER: WorkflowStatus[] = [
   "evaluating",
   "completed",
   "failed",
+  // cancelled is its own terminal outcome: not a variant of failed or completed.
+  "cancelled",
 ];
+const HIDDEN_UNLESS_ACTIVE: WorkflowStatus[] = ["failed", "cancelled", "repairing"];
 
 // Internal graph node names are developer vocabulary; show what the step is
 // actually doing and keep the raw name in the tooltip.
@@ -36,6 +39,7 @@ const NODE_LABELS: Record<string, string> = {
   classify_error: "分析运行错误",
   generate_report: "生成实验报告",
   persist_results: "保存结果",
+  cancel_workflow: "停止工作流",
 };
 
 const STAGES: Record<string, WorkflowStatus> = {
@@ -62,14 +66,15 @@ export default function WorkflowStepper({
   retrying?: boolean;
 }) {
   const visited = new Set(traces.filter(t => !t.error).map(t => STAGES[t.node_name]));
-  const steps = ORDER.filter(key => (key !== "failed" && key !== "repairing") || key === status || visited.has(key));
+  const steps = ORDER.filter(key => !HIDDEN_UNLESS_ACTIVE.includes(key) || key === status || visited.has(key));
   return (
     <div className="card rise space-y-2.5 p-3">
       <div className="flex items-center overflow-x-auto pb-1">
         {steps.map((key, i) => {
           const meta = WF_META[key];
           const active = key === status;
-          const done = !active && visited.has(key) && !(status === "failed" && currentNode && STAGES[currentNode] === key);
+          const stoppedHere = (status === "failed" || status === "cancelled") && !!currentNode && STAGES[currentNode] === key;
+          const done = !active && visited.has(key) && !stoppedHere;
           return (
             <Fragment key={key}>
               {i > 0 && (
@@ -102,7 +107,7 @@ export default function WorkflowStepper({
       </div>
       {currentNode && (
         <p className="text-[12.5px] text-fg-3">
-          {status === "failed" ? "停止于：" : status === "completed" ? "最终步骤：" : "正在做："}<span className="text-fg-2">{NODE_LABELS[currentNode] ?? currentNode}</span>
+          {status === "failed" ? "停止于：" : status === "cancelled" ? "已取消于：" : status === "completed" ? "最终步骤：" : "正在做："}<span className="text-fg-2">{NODE_LABELS[currentNode] ?? currentNode}</span>
           <span className="ml-1.5 font-mono text-[11px] text-fg-3" title={currentNode}>
             ({currentNode})
           </span>
@@ -119,6 +124,11 @@ export default function WorkflowStepper({
       {status === "failed" && error && (
         <p className={`rounded-lg border border-bad/40 bg-bad/10 px-3 py-1.5 text-xs ${TONE_TEXT.bad}`}>
           {error}
+        </p>
+      )}
+      {status === "cancelled" && (
+        <p className="rounded-lg border border-line bg-ink-900 px-3 py-1.5 text-xs text-fg-2">
+          工作流已被手动停止：取消是独立终态，既不是失败也没有产出成功结果。
         </p>
       )}
     </div>

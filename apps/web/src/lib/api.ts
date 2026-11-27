@@ -1,6 +1,6 @@
 import { supabase } from "./supabase";
 import { readOnce } from "./polling";
-import type { CardVersion, ExplainResponse, NodeTrace, PlanVersion, RecommendResponse, OrdinaryReviewMode, RiskTier, WorkflowDetail } from "./types";
+import type { CardVersion, ExplainResponse, NodeTrace, PlanVersion, RecommendResponse, OrdinaryReviewMode, RiskTier, WorkflowCancelResponse, WorkflowDetail } from "./types";
 import type { CandidateResponse, ComparisonDetail, ComparisonPlanDetail } from "./comparison";
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
@@ -12,6 +12,43 @@ const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
  */
 export const apiHref = (path: string) => `${API_URL}${path}`;
 
+/**
+ * API 错误的结构化表示：HTTP 状态码与业务错误码分开保存。
+ * 控制流只读 `code`（稳定英文标识符），`message` 仅用于展示，
+ * 中文文案变化不影响分支逻辑。
+ */
+export class ApiError extends Error {
+  readonly status: number;
+  readonly code: string;
+  constructor(message: string, status: number, code: string) {
+    super(message);
+    this.name = "ApiError";
+    this.status = status;
+    this.code = code;
+  }
+}
+
+/** 把非 2xx 响应解析成 ApiError：{detail:{code,message}} 是稳定契约，
+ * 字符串 detail 与无法解析的 body 一律映射为 UNKNOWN_ERROR。 */
+async function apiErrorFrom(response: Response): Promise<ApiError> {
+  let message = response.statusText || `${response.status}`;
+  let code = "UNKNOWN_ERROR";
+  try {
+    const body: unknown = await response.json();
+    const detail = (body as { detail?: unknown } | null)?.detail;
+    if (typeof detail === "string") {
+      message = detail;
+    } else if (detail && typeof detail === "object") {
+      const { code: c, message: m } = detail as { code?: unknown; message?: unknown };
+      if (typeof c === "string") code = c;
+      message = typeof m === "string" ? m : message;
+    }
+  } catch {
+    /* keep status text -- body was absent or not JSON */
+  }
+  return new ApiError(message, response.status, code);
+}
+
 export async function apiFetch<T>(path: string, init?: RequestInit): Promise<T> {
   const {
     data: { session },
@@ -20,16 +57,7 @@ export async function apiFetch<T>(path: string, init?: RequestInit): Promise<T> 
   const headers = new Headers(init?.headers);
   headers.set("Authorization", `Bearer ${session.access_token}`);
   const response = await fetch(`${API_URL}${path}`, { ...init, headers });
-  if (!response.ok) {
-    let detail = `${response.status}`;
-    try {
-      const body = await response.json();
-      detail = typeof body.detail === "string" ? body.detail : JSON.stringify(body.detail);
-    } catch {
-      /* keep status code */
-    }
-    throw new Error(detail);
-  }
+  if (!response.ok) throw await apiErrorFrom(response);
   return (await response.json()) as T;
 }
 
@@ -88,6 +116,13 @@ export function retryWorkflow(workflowId: string) {
   );
 }
 
+export function cancelWorkflow(workflowId: string) {
+  return apiFetch<WorkflowCancelResponse>(
+    `/v1/workflows/${workflowId}/cancel`,
+    { method: "POST" },
+  );
+}
+
 export function confirmCard(paperId: string, reviewMode?: OrdinaryReviewMode) {
   return apiFetch<CardVersion>(`/v1/papers/${paperId}/card/confirm`, {
     method: "POST",
@@ -107,16 +142,7 @@ export async function fetchCardMarkdown(paperId: string, version?: number): Prom
   const response = await fetch(`${API_URL}/v1/papers/${paperId}/card.md${query}`, {
     headers: { Authorization: `Bearer ${session.access_token}` },
   });
-  if (!response.ok) {
-    let detail = `${response.status}`;
-    try {
-      const body = await response.json();
-      detail = typeof body.detail === "string" ? body.detail : JSON.stringify(body.detail);
-    } catch {
-      /* keep status code */
-    }
-    throw new Error(detail);
-  }
+  if (!response.ok) throw await apiErrorFrom(response);
   return response.text();
 }
 
@@ -275,7 +301,7 @@ async function authedFetch(path: string): Promise<Response> {
   const response = await fetch(`${API_URL}${path}`, {
     headers: { Authorization: `Bearer ${session.access_token}` },
   });
-  if (!response.ok) throw new Error(`${response.status}`);
+  if (!response.ok) throw await apiErrorFrom(response);
   return response;
 }
 

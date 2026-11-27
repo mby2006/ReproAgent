@@ -21,6 +21,8 @@ from .context import WorkflowContext
 from .harness import BudgetExceeded, redact, trace_input, trace_output
 from .nodes import (
     build_reproduction_spec,
+    cancel_requested,
+    cancel_workflow,
     classify_error,
     evaluate_result,
     execute_code,
@@ -56,11 +58,17 @@ NODE_ORDER = [
     ("evaluate_result", evaluate_result),
     ("generate_report", generate_report),
     ("persist_results", persist_results),
+    ("cancel_workflow", cancel_workflow),
 ]
 
 
 def _traced(name: str, ctx: WorkflowContext, fn):
     async def wrapped(state: WorkflowState) -> dict:
+        if name != "cancel_workflow" and cancel_requested(state, ctx):
+            # The cancellation landed while this node was pending (typically at a
+            # human gate that a restarted worker re-enters): neither the node's
+            # work nor its status write may run; the outgoing edge diverts.
+            return {"current_node": name}
         ctx.admin.table("workflows").update({"current_node": name}).eq(
             "id", state["workflow_id"]
         ).execute()
@@ -158,60 +166,100 @@ def route_after_spec(state: WorkflowState) -> str:
     return "validate_evidence"
 
 
+def _cancel_aware(ctx: WorkflowContext, router):
+    """Prepend the persisted-cancellation check to an existing branch router."""
+
+    def route(state: WorkflowState) -> str:
+        if cancel_requested(state, ctx):
+            return "cancel_workflow"
+        return router(state)
+
+    return route
+
+
+def _cancel_edge(ctx: WorkflowContext, target: str):
+    """Turn a straight node transition into a cancellable one."""
+
+    def route(state: WorkflowState) -> str:
+        return "cancel_workflow" if cancel_requested(state, ctx) else target
+
+    return route
+
+
 def build_workflow_graph(ctx: WorkflowContext, checkpointer):
     graph = StateGraph(WorkflowState)
     for name, fn in NODE_ORDER:
         graph.add_node(name, _traced(name, ctx, fn))
+
+    def to(source: str, target: str) -> None:
+        """A straight transition that a persisted cancellation can interrupt."""
+        graph.add_conditional_edges(
+            source, _cancel_edge(ctx, target),
+            {target: target, "cancel_workflow": "cancel_workflow"},
+        )
+
     graph.add_edge(START, "ingest_paper")
-    graph.add_edge("ingest_paper", "extract_paper")
+    for source, target in (
+        ("ingest_paper", "extract_paper"),
+        ("validate_evidence", "human_review"),
+        ("human_review", "plan_experiment"),
+        ("plan_experiment", "human_approve_plan"),
+        ("human_approve_plan", "generate_code"),
+        ("generate_code", "validate_code"),
+        ("repair_code", "validate_code"),
+        ("evaluate_result", "generate_report"),
+        ("generate_report", "persist_results"),
+    ):
+        to(source, target)
     graph.add_conditional_edges(
         "extract_paper",
-        route_after_extract,
+        _cancel_aware(ctx, route_after_extract),
         {
             "build_reproduction_spec": "build_reproduction_spec",
             "persist_results": "persist_results",
+            "cancel_workflow": "cancel_workflow",
         },
     )
     graph.add_conditional_edges(
         "build_reproduction_spec",
-        route_after_spec,
+        _cancel_aware(ctx, route_after_spec),
         {
             "validate_evidence": "validate_evidence",
             "persist_results": "persist_results",
+            "cancel_workflow": "cancel_workflow",
         },
     )
-    graph.add_edge("validate_evidence", "human_review")
-    graph.add_edge("human_review", "plan_experiment")
-    graph.add_edge("plan_experiment", "human_approve_plan")
-    graph.add_edge("human_approve_plan", "generate_code")
-    graph.add_edge("generate_code", "validate_code")
     graph.add_conditional_edges(
         "validate_code",
-        route_after_validate,
+        _cancel_aware(ctx, route_after_validate),
         {
             "execute_code": "execute_code",
             "repair_code": "repair_code",
             "persist_results": "persist_results",
+            "cancel_workflow": "cancel_workflow",
         },
     )
     graph.add_conditional_edges(
         "execute_code",
-        route_after_execute,
+        _cancel_aware(ctx, route_after_execute),
         {
             "evaluate_result": "evaluate_result",
             "classify_error": "classify_error",
             "persist_results": "persist_results",
+            "cancel_workflow": "cancel_workflow",
         },
     )
     graph.add_conditional_edges(
         "classify_error",
-        route_after_classify,
-        {"repair_code": "repair_code", "evaluate_result": "evaluate_result"},
+        _cancel_aware(ctx, route_after_classify),
+        {
+            "repair_code": "repair_code",
+            "evaluate_result": "evaluate_result",
+            "cancel_workflow": "cancel_workflow",
+        },
     )
-    graph.add_edge("repair_code", "validate_code")
-    graph.add_edge("evaluate_result", "generate_report")
-    graph.add_edge("generate_report", "persist_results")
     graph.add_edge("persist_results", END)
+    graph.add_edge("cancel_workflow", END)
     return graph.compile(checkpointer=checkpointer)
 
 

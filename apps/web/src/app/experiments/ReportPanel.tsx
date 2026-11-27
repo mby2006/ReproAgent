@@ -4,14 +4,15 @@ import ParameterTable from "@/components/ParameterTable";
 import { useCallback, useEffect, useState } from "react";
 import MetricChart from "@/components/MetricChart";
 import { IconDownload, IconRefresh, IconWarn } from "@/components/icons";
-import { apiFetch, apiHref } from "@/lib/api";
+import { apiFetch, apiHref, ApiError } from "@/lib/api";
 import type {
   CheckStatus,
   EvaluationReport,
+  ReportErrorCode,
   ReviewDecision,
   RunReport,
 } from "@/lib/types";
-import { CHECK_META, FINAL_META, TONE_BADGE, fmtNum } from "@/lib/ui";
+import { CHECK_META, FINAL_META, TONE_BADGE, fmtDate, fmtNum } from "@/lib/ui";
 import { fieldLabel, missingGloss, shortValue } from "@/lib/fieldLabels";
 
 const METHOD_ITEM_LABEL: Record<string, string> = {
@@ -219,11 +220,17 @@ export function FinalSummary({ data }: { data: EvaluationReport }) {
   );
 }
 
+const REPORT_ERROR_LABEL: Record<ReportErrorCode, string> = {
+  REPORT_UNAVAILABLE: "报告尚未生成",
+  REPORT_NOT_READY: "运行尚未结束，无法生成报告",
+  REPORT_GENERATION_FAILED: "报告生成失败，可稍后重试",
+};
+
 export default function ReportPanel({ runId, onFile }: { runId: string; onFile: (path: string) => void }) {
   const [report, setReport] = useState<RunReport | null>(null);
   const [missing, setMissing] = useState(false);
   const [busy, setBusy] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  const [error, setError] = useState<{ code: string; message: string } | null>(null);
   const [showMarkdown, setShowMarkdown] = useState(false);
 
   const load = useCallback(async () => {
@@ -232,12 +239,13 @@ export default function ReportPanel({ runId, onFile }: { runId: string; onFile: 
       setReport(r);
       setMissing(false);
     } catch (err) {
-      const message = err instanceof Error ? err.message : "";
-      if (message.includes("尚未生成")) {
+      // 控制流只看稳定错误码；中文 message 仅用于展示。
+      const code = err instanceof ApiError ? err.code : "UNKNOWN_ERROR";
+      if (code === "REPORT_UNAVAILABLE") {
         setMissing(true);
         setReport(null);
       } else {
-        setError(message || "加载报告失败");
+        setError({ code, message: err instanceof Error ? err.message : "加载报告失败" });
       }
     }
   }, [runId]);
@@ -257,7 +265,13 @@ export default function ReportPanel({ runId, onFile }: { runId: string; onFile: 
       setReport(r);
       setMissing(false);
     } catch (err) {
-      setError(err instanceof Error ? err.message : "生成报告失败");
+      const code = err instanceof ApiError ? err.code : "UNKNOWN_ERROR";
+      if (code === "REPORT_UNAVAILABLE") {
+        setMissing(true);
+        setReport(null);
+      } else {
+        setError({ code, message: err instanceof Error ? err.message : "生成报告失败" });
+      }
     } finally {
       setBusy(false);
     }
@@ -296,6 +310,11 @@ export default function ReportPanel({ runId, onFile }: { runId: string; onFile: 
             {data.final_status} · {finalMeta.label}
           </span>
         )}
+        {report && (
+          <span className="chip font-mono" title="报告生成时间：重新生成会得到新版本">
+            报告版本 · {fmtDate(report.created_at)}
+          </span>
+        )}
         <div className="ml-auto flex flex-wrap gap-2">
           {report && (
             <>
@@ -316,9 +335,15 @@ export default function ReportPanel({ runId, onFile }: { runId: string; onFile: 
       </div>
 
       {error && (
-        <p className="flex items-start gap-2 rounded-lg border border-bad/30 bg-bad/8 px-4 py-2 text-sm text-bad">
+        <p role="alert" className="flex items-start gap-2 rounded-lg border border-bad/30 bg-bad/8 px-4 py-2 text-sm text-bad">
           <IconWarn className="mt-0.5 h-4 w-4 shrink-0" />
-          {error}
+          <span>
+            {/* 展示按稳定码选型，不解析 message 文本 */}
+            {REPORT_ERROR_LABEL[error.code as ReportErrorCode] ?? `报告请求失败（${error.code}）`}
+            {error.message && error.message !== REPORT_ERROR_LABEL[error.code as ReportErrorCode] && (
+              <span className="ml-1 text-fg-3">— {error.message}</span>
+            )}
+          </span>
         </p>
       )}
       {missing && !error && (

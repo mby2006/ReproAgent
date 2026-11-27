@@ -117,6 +117,22 @@ export type WorkflowStatus =
   | "failed"
   | "cancelled";
 
+/** 与后端 WorkflowStatus 一致：terminal 三态互不推断，cancelled 既非失败也非成功。 */
+export const WORKFLOW_TERMINAL_STATUSES: readonly WorkflowStatus[] = [
+  "completed", "failed", "cancelled",
+];
+/** POST /v1/workflows/{id}/cancel 幂等返回当前（可能已是终态的）状态。 */
+export interface WorkflowCancelResponse {
+  workflow_id: string;
+  status: WorkflowStatus;
+}
+
+/** 报告接口的稳定错误码；UI 只按 code 分支，不解析中文 message。 */
+export type ReportErrorCode =
+  | "REPORT_UNAVAILABLE"
+  | "REPORT_NOT_READY"
+  | "REPORT_GENERATION_FAILED";
+
 export interface WorkflowDetail {
   id: string;
   thread_id: string;

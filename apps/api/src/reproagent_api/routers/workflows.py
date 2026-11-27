@@ -71,6 +71,19 @@ class RetryResponse(SchemaModel):
     status: str = "queued"
 
 
+class CancelResponse(SchemaModel):
+    workflow_id: UUID
+    status: str
+
+
+OPEN_WORKFLOW_STATUSES = [
+    status.value
+    for status in WorkflowStatus
+    if status not in (WorkflowStatus.COMPLETED, WorkflowStatus.FAILED, WorkflowStatus.CANCELLED)
+]
+CANCEL_MESSAGE = "cancelled: workflow cancelled by user"
+
+
 def _clean(row: dict) -> dict:
     row.pop("projects", None)
     return row
@@ -298,3 +311,42 @@ async def retry_workflow(
             status.HTTP_503_SERVICE_UNAVAILABLE, f"Failed to enqueue job: {exc}"
         ) from exc
     return RetryResponse(workflow_id=workflow_id)
+
+
+@router.post("/workflows/{workflow_id}/cancel", response_model=CancelResponse)
+async def cancel_workflow(
+    request: Request,
+    workflow_id: UUID,
+    user_id: Annotated[UUID, Depends(get_current_user_id)],
+) -> CancelResponse:
+    """Stop a workflow from any non-terminal phase and persist that intent.
+
+    Cancellation is its own terminal outcome: it never becomes completed or
+    failed, and an already terminal workflow is returned unchanged. The row is
+    flipped atomically before the response so a worker restart cannot lose the
+    request, and the in-flight drive diverts at its next node boundary.
+    """
+    admin = _admin(request)
+    workflow = _get_workflow(admin, workflow_id, user_id)
+    if workflow["status"] not in OPEN_WORKFLOW_STATUSES:
+        return CancelResponse(workflow_id=workflow_id, status=workflow["status"])
+    claimed = (
+        admin.table("workflows")
+        .update({"status": WorkflowStatus.CANCELLED.value, "error": CANCEL_MESSAGE})
+        .eq("id", str(workflow_id))
+        .in_("status", OPEN_WORKFLOW_STATUSES)
+        .execute()
+        .data
+    )
+    if not claimed:
+        # A concurrent terminal write won: report the persisted truth unchanged.
+        current = _get_workflow(admin, workflow_id, user_id)
+        return CancelResponse(workflow_id=workflow_id, status=current["status"])
+    run_id = workflow.get("run_id")
+    if run_id:
+        from .runs import cancel_run_intent
+
+        await cancel_run_intent(
+            request, admin, UUID(run_id), user_id, error=CANCEL_MESSAGE
+        )
+    return CancelResponse(workflow_id=workflow_id, status=WorkflowStatus.CANCELLED.value)

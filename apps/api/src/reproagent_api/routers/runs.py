@@ -394,7 +394,7 @@ async def get_report(
     request: Request, run_id: UUID, user_id: Annotated[UUID, Depends(get_current_user_id)]
 ) -> RunReport:
     admin = _admin(request)
-    _get_run(admin, run_id, user_id)
+    run = _get_run(admin, run_id, user_id)
     rows = (
         admin.table("reproduction_reports")
         .select("run_id,report_json,markdown,created_at")
@@ -403,7 +403,16 @@ async def get_report(
         .data
     )
     if not rows:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "报告尚未生成")
+        # Stable code: the client branches on this, never on the message text.
+        raise HTTPException(
+            status.HTTP_404_NOT_FOUND,
+            {
+                "code": "REPORT_UNAVAILABLE",
+                "message": "报告尚未生成"
+                if run["status"] in TERMINAL_STATUSES
+                else "运行尚未结束，暂无报告",
+            },
+        )
     return RunReport.model_validate(rows[0])
 
 
@@ -414,13 +423,23 @@ async def regenerate_report(
     admin = _admin(request)
     run = _get_run(admin, run_id, user_id)
     if run["status"] not in TERMINAL_STATUSES:
-        raise HTTPException(status.HTTP_409_CONFLICT, "运行尚未结束，无法生成报告")
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            {"code": "REPORT_NOT_READY", "message": "运行尚未结束，无法生成报告"},
+        )
     agent = AgentClient(
         request.app.state.settings,
         transport=getattr(request.app.state, "agent_transport", None),
     )
     try:
         await generate_and_store_report(admin, agent, str(run_id))
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(
+            status.HTTP_502_BAD_GATEWAY,
+            {"code": "REPORT_GENERATION_FAILED", "message": f"报告生成失败: {exc}"},
+        ) from exc
     finally:
         await agent.aclose()
     rows = (
@@ -438,9 +457,20 @@ async def cancel_run(
     request: Request, run_id: UUID, user_id: Annotated[UUID, Depends(get_current_user_id)]
 ) -> RunDetail:
     admin = _admin(request)
+    return RunDetail.model_validate(await cancel_run_intent(request, admin, run_id, user_id))
+
+
+async def cancel_run_intent(
+    request: Request, admin, run_id: UUID, user_id: UUID, *, error: str | None = None
+) -> dict:
+    """Persist cancellation for one run and stop its container; return the run row.
+
+    Shared by the run and workflow cancel endpoints so both layers record the same
+    intent with the same latest-attempt guard.
+    """
     run = _get_run(admin, run_id, user_id)
     if run["status"] in TERMINAL_STATUSES:
-        return RunDetail.model_validate(run)
+        return run
 
     # Dispatch can persist a Runner id while cancellation is awaiting the Runner.
     # Re-read after every await and cancel whichever identity is currently known;
@@ -449,7 +479,7 @@ async def cancel_run(
     while True:
         current = _get_run(admin, run_id, user_id)
         if current["status"] in TERMINAL_STATUSES:
-            return RunDetail.model_validate(current)
+            return current
         known_id = current.get("runner_run_id")
         identity = UUID(known_id) if known_id else None
         if identity is None and current["status"] in (
@@ -465,11 +495,11 @@ async def cancel_run(
                 admin,
                 str(run_id),
                 RunStatus.CANCELLED,
-                None,
+                error,
                 attempt=current.get("repair_attempt", 0),
                 require_latest=True,
             )
-            return RunDetail.model_validate(_get_run(admin, run_id, user_id))
+            return _get_run(admin, run_id, user_id)
 
         runner = RunnerClient(
             request.app.state.settings,

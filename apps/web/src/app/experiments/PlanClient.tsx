@@ -1213,6 +1213,7 @@ function PlanInner({ experimentId }: { experimentId: string }) {
           approved={approved}
           workflowDriven={workflowDriven}
           workflowStatus={wfStatus}
+          workflowId={workflowId ?? null}
         />
       )}
     </main>

@@ -592,6 +592,16 @@ async def execute_code(state: dict, ctx: WorkflowContext) -> dict:
         result = await _poll_run(ctx, state, runner_run_id)
         await async_persist_result(ctx.admin, run_id, runner_run_id, result, ctx.runner, attempt)
         _finalize_run(ctx.admin, run_id, result.status.value, result.error, attempt=attempt)
+        # Persistence/finalization refuse to overwrite a concurrently protected
+        # terminal Run. Reconcile the in-memory result so workflow routing cannot
+        # repair a cancelled Run or replace its terminal truth with Runner output.
+        current = load_run_row(ctx.admin, run_id)
+        if (
+            current is not None
+            and current["status"] in {status.value for status in TERMINAL_RUN}
+            and current["status"] != result.status.value
+        ):
+            result = terminal_result_from_row(current)
     except asyncio.CancelledError:
         await _cancel_runner(ctx.runner, runner_run_id or request.request_id)
         raise
@@ -603,7 +613,9 @@ async def execute_code(state: dict, ctx: WorkflowContext) -> dict:
             # deterministic identity even though no accepted id was received.
             await _cancel_runner(ctx.runner, request.request_id)
         current = load_run_row(ctx.admin, run_id)
-        if current["status"] in (RunStatus.CANCELLED.value, RunStatus.SUCCEEDED.value):
+        if current is not None and current["status"] in {
+            status.value for status in TERMINAL_RUN
+        }:
             result = terminal_result_from_row(current)
         elif result is not None and result.status in TERMINAL_RUN:
             # The Runner's real terminal outcome remains authoritative even if

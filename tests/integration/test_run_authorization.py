@@ -1,7 +1,8 @@
 """Integration: atomic run authorization via 6-arg create_execution_run RPC.
 
-Requires a running Postgres with the project migrations applied. These tests
-verify the database-level contract:
+Requires a disposable Postgres database cloned from the configured template. The
+shared ``db`` fixture applies every repository migration, rolls back each test,
+and force-drops the database at session end. These tests verify:
   - STALE_PLAN_APPROVAL, PLAN_NOT_APPROVED, PLAN_NOT_READY,
     DELEGATION_ACTOR_MISMATCH
   - ACTIVE_RUN_EXISTS
@@ -15,18 +16,11 @@ Run:  uv run pytest tests/integration/test_run_authorization.py -m integration -
 
 import hashlib
 import json
-import os
 from datetime import UTC, datetime
 from uuid import UUID, uuid4
 
+import psycopg
 import pytest
-
-pytest.importorskip(
-    "psycopg2",
-    reason="Integration test requires psycopg2 and a running database",
-)
-import psycopg2
-import psycopg2.extras
 from reproagent_schemas import (
     Assumption,
     AssumptionKind,
@@ -38,22 +32,11 @@ from reproagent_schemas import (
 
 pytestmark = pytest.mark.integration
 
-DSN = os.environ.get(
-    "REPRO_TEST_DATABASE_URL",
-    "postgresql://postgres:postgres@localhost:54322/postgres",
-)
-
 INSERT_PLAN_SQL = (
     "insert into public.experiment_plans "
     "(id, experiment_id, version, config_json, approved_at) "
     "values (%s, %s, %s, %s::jsonb, %s)"
 )
-
-
-def conn():
-    c = psycopg2.connect(DSN)
-    c.autocommit = False
-    return c
 
 
 def run_creation_fingerprint(experiment_id, plan_id, plan_version):
@@ -70,26 +53,16 @@ def call_rpc(
             "select public.create_execution_run(%s, %s, %s, %s, %s, %s)",
             (experiment_id, plan_id, plan_version, actor_id, idem_key, fingerprint),
         )
-        return cur.fetchone()[0], None
-    except psycopg2.errors.RaiseException as e:
+        row = cur.fetchone()
+        return next(iter(row.values())), None
+    except (psycopg.errors.RaiseException, psycopg.errors.InsufficientPrivilege) as e:
         msg = str(e).strip()
         return None, msg
 
 
 # ============================================================
-# Fixtures
+# Actor Fixture
 # ============================================================
-
-
-@pytest.fixture
-def db():
-    """Provide a connection with a rolled-back transaction per test."""
-    c = conn()
-    cur = c.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-    cur.execute("BEGIN")
-    yield cur
-    c.rollback()
-    c.close()
 
 
 @pytest.fixture
@@ -117,13 +90,14 @@ def experiment(db, actor):
         (str(project_id), actor, "test project"),
     )
     db.execute(
-        "insert into public.papers (id, project_id, title) values (%s, %s, %s)",
-        (str(paper_id), str(project_id), "Test Paper"),
+        "insert into public.papers (id, project_id, title, pdf_path) "
+        "values (%s, %s, %s, %s)",
+        (str(paper_id), str(project_id), "Test Paper", "test/paper.pdf"),
     )
     db.execute(
         "insert into public.reproduction_specs "
-        "(id, paper_id, version, spec_json, status) "
-        "values (%s, %s, 1, '{}'::jsonb, 'confirmed')",
+        "(id, paper_id, version, spec_json, status, origin) "
+        "values (%s, %s, 1, '{}'::jsonb, 'confirmed', 'extraction')",
         (str(spec_id), str(paper_id)),
     )
     db.execute(

@@ -1,5 +1,6 @@
 """Offline regressions for execution cancellation, recovery, and terminal races."""
 
+import asyncio
 from datetime import UTC, datetime
 from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
@@ -98,7 +99,9 @@ class StubRunner:
     async def get_run(self, run_id):
         self.polls += 1
         if self.on_get is not None:
-            self.on_get()
+            outcome = self.on_get()
+            if asyncio.iscoroutine(outcome):
+                await outcome
         return self.result.model_copy(update={"run_id": run_id})
 
     async def cancel_run(self, run_id):
@@ -203,6 +206,37 @@ async def test_cancellation_after_runner_acceptance_cancels_untracked_container(
     run = admin.tables["execution_runs"][0]
     assert run["status"] == "cancelled"
     assert run.get("runner_run_id") is None
+
+
+@pytest.mark.asyncio
+async def test_cancellation_before_result_persistence_cancels_runner_and_seals_cancel():
+    """Cancel after Runner accepted and returned, but before audit/artifact persistence."""
+    from reproagent_api.workflow.nodes import execute_code
+
+    admin, state, _ = seed_execution()
+    workflow_id = admin.tables["workflows"][0]["id"]
+    runner = StubRunner(RunResult(run_id=uuid4(), status=RunStatus.SUCCEEDED))
+
+    async def cancel_before_persistence():
+        # This is the persisted state written by the workflow cancellation endpoint
+        # while execute_code is between Runner's terminal response and storage I/O.
+        admin.table("workflows").update({
+            "status": "cancelled", "error": "cancelled: workflow cancelled by user",
+        }).eq("id", workflow_id).execute()
+        admin.table("execution_runs").update({
+            "status": "cancelled", "error": "cancelled: workflow cancelled by user",
+        }).eq("id", state["run_id"]).execute()
+        await runner.cancel_run(runner.result.run_id)
+
+    runner.on_get = cancel_before_persistence
+    updates = await execute_code(state, make_context(admin, runner))
+
+    assert updates["execution_result"].status is RunStatus.CANCELLED
+    assert runner.cancelled == [runner.result.run_id]
+    run = admin.tables["execution_runs"][0]
+    assert run["status"] == "cancelled"
+    assert run.get("metrics_json", {}) == {}
+    assert admin.tables["workflows"][0]["status"] == "cancelled"
 
 
 def pin_stored_code(admin, state, bundle):

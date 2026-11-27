@@ -64,7 +64,9 @@ def classify_error(request: ClassifyRequest) -> ErrorClassification:
         return ErrorClassification(
             category=ErrorCategory.TIMEOUT,
             reason="run exceeded its hard time budget and was killed",
-            repairable=True,
+            # A hard timeout is a terminal resource outcome, not a code defect.
+            # Retrying it would replace TIMEOUT with a later repair's result.
+            repairable=False,
         )
     if request.exit_code in (137, -9):
         return ErrorClassification(

@@ -174,3 +174,7 @@ All commands were run from `C:/Users/demon/Desktop/ReproAgent`.
 | `git diff --check` | Clean; only normal Git LF/CRLF informational warnings |
 
 The first negative-matrix rerun failed because `reproagent_task8_template` had no service-role Storage grants: inspection showed both Storage tables were owned by `postgres`, not `supabase_storage_admin`, with no ACL entries. This confirmed the template does not reproduce production Storage ownership. Bootstrapping the template with the same required Storage privileges Supabase provides, without changing repository files, allowed the unchanged matrix to pass. Storage is platform-managed; the real-Supabase E2E proves the required privileges and actual upload/upsert path, not exact Storage ACLs.
+
+## Completion
+
+Final scoped independent re-review: **APPROVED**, no Important/Critical defects. Task 9 is complete through commit `d9ab60e`. The evidence-index endpoint's foreign-owner and guessed-UUID denial tests remain an explicit Task 12 acceptance dependency; Task 9 does not claim that evidence.

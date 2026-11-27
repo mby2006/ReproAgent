@@ -6,9 +6,11 @@ import { apiFetch, apiGet, cancelWorkflow } from "@/lib/api";
 import { startVisiblePolling } from "@/lib/polling";
 import { PrivatePredictions } from "@/components/PredictionReader";
 import ReportPanel from "./ReportPanel";
+import EvidenceIndex from "./EvidenceIndex";
 import type {
   ArtifactRecord,
   CodeFileRecord,
+  EvidenceIndex as EvidenceIndexData,
   RunAccepted,
   RunDetail,
   RunLogs,
@@ -124,6 +126,7 @@ export default function RunPanel({
   const [logs, setLogs] = useState<RunLogs | null>(null);
   const [artifacts, setArtifacts] = useState<ArtifactRecord[]>([]);
   const [files, setFiles] = useState<CodeFileRecord[]>([]);
+  const [evidenceIndex, setEvidenceIndex] = useState<EvidenceIndexData | null>(null);
   const [tab, setTab] = useState<"stdout" | "stderr" | "files">("stdout");
   const [openFile, setOpenFile] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -135,6 +138,7 @@ export default function RunPanel({
   const filesVersion = useRef(0);
   const artifactsVersion = useRef(0);
   const listVersion = useRef(0);
+  const evidenceVersion = useRef(0);
   const detailInFlight = useRef<string | null>(null);
   const listInFlight = useRef<string | null>(null);
   const knownRunIds = useRef<Set<string> | null>(null);
@@ -210,11 +214,24 @@ export default function RunPanel({
     setLogs(null);
     setArtifacts([]);
     setFiles([]);
+    setEvidenceIndex(null);
     setFilesLoadedFor(null);
     setOpenFile(null);
     artifactsLoadedFor.current = null;
     if (selectedId) void loadDetail(selectedId);
   }, [selectedId, loadDetail]);
+
+  useEffect(() => {
+    if (!selectedId) return;
+    const version = ++evidenceVersion.current;
+    void apiGet<EvidenceIndexData>(`/v1/runs/${selectedId}/evidence-index`)
+      .then((index) => {
+        if (index && version === evidenceVersion.current) setEvidenceIndex(index);
+      })
+      .catch((err) => {
+        if (version === evidenceVersion.current) setError(err instanceof Error ? err.message : "无法读取证据索引");
+      });
+  }, [selectedId, detail?.status]);
 
   const workflowTerminal = workflowStatus != null && isWorkflowTerminal(workflowStatus);
   const hasDetail = detail != null;
@@ -540,6 +557,8 @@ export default function RunPanel({
               </div>
             </div>
           )}
+
+          <EvidenceIndex index={evidenceIndex} />
 
           {detail.status === "succeeded" && <section className="space-y-3">
             <h2 className="display text-xl font-semibold">这次实验认对了多少张？</h2>

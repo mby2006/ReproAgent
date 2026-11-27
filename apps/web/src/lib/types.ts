@@ -423,6 +423,23 @@ export interface RunLogs {
   stderr: string;
 }
 
+export type EvidenceCategory = "paper" | "plan" | "code" | "execution" | "review_report";
+
+export interface EvidenceIndexItem {
+  id: string;
+  category: EvidenceCategory;
+  target_type: string;
+  target_id: string;
+  locator: Record<string, string | number>;
+  hash: string | null;
+  unavailable_reason: string | null;
+}
+
+export interface EvidenceIndex {
+  run_id: string;
+  items: EvidenceIndexItem[];
+}
+
 export interface ArtifactRecord {
   id: string;
   artifact_type: string;

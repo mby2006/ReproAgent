@@ -814,7 +814,7 @@ function PlanInner({ experimentId }: { experimentId: string }) {
               ? `还有 ${criticalPending.length} 项要你决定`
               : "设置已确认，可以开始",
           },
-          { key: "run", no: "2", title: "训练与结果", hint: "跑完看结论和报告" },
+          { key: "run", no: "2", title: "训练与结果", hint: "看结果、报告与五类证据索引" },
           { key: "versions", no: "3", title: "修改记录", hint: `共 ${versions.length} 个版本` },
         ] as const).map((item) => {
           const active = view === item.key;

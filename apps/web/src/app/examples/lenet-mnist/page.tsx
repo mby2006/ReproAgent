@@ -2,8 +2,10 @@ import SiteLink from "@/components/SiteLink";
 import { PredictionReader } from "@/components/PredictionReader";
 import PublicHeader from "@/components/PublicHeader";
 import ParameterTable, { ConditionSummary } from "@/components/ParameterTable";
+import EvidenceIndex from "@/app/experiments/EvidenceIndex";
 import { isStaticSite } from "@/lib/site";
 import { selectConditionSummary } from "@/lib/conditions.mjs";
+import { buildPublicEvidenceIndex } from "@/lib/evidence-index.mjs";
 import metrics from "../../../../public/examples/lenet/metrics.json";
 import predictions from "../../../../public/examples/lenet/prediction_examples.json";
 import conditions from "../../../../public/examples/lenet/conditions.json";
@@ -13,6 +15,12 @@ const pdf = "https://princetonuniversity.github.io/NEU-PSY-502/_static/pdf/Class
 const assets = "/examples/lenet";
 const number = (n: number) => n.toLocaleString("zh-CN");
 const conditionSummary = selectConditionSummary(conditions);
+const evidenceIndex = buildPublicEvidenceIndex({
+  manifest,
+  conditions,
+  report: { file: "report.md" },
+  pdfUrl: pdf,
+});
 
 export const metadata = {title:"电脑怎样认出手写数字？一次 LeNet-5 小实验 · ReproAgent"};
 
@@ -72,6 +80,7 @@ export default function LeNetExample() {
     </div>
     <details id="evidence" className="space-y-4">
       <summary className="cursor-pointer py-2 text-lg font-semibold">查看原文依据与运行记录</summary>
+      <EvidenceIndex index={evidenceIndex} pdfUrl={pdf} fileBaseUrl={assets} />
       <ParameterTable rows={conditions} pdfUrl={pdf} fileHref={path => assets+"/"+path+(path.endsWith(".py")?".txt":"")}/>
     </details>
     <footer className="space-y-4 border-t border-line pt-5 text-sm">

@@ -9,9 +9,10 @@ The API process never executes generated code.
 import re
 from datetime import datetime
 from typing import Annotated, Literal
+from urllib.parse import quote
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, Response, status
 from httpx import HTTPStatusError
 from postgrest.exceptions import APIError as PostgrestAPIError
 from pydantic import Field, ValidationError
@@ -35,6 +36,7 @@ from ..services import (
 )
 from ..services import get_report as load_report
 from ..services.dispatch import enqueue_pending_outbox
+from ..services.evidence_index import EvidenceIndex, build_evidence_index
 from ..services.runs import (
     execution_request_id,
     finalize_execution_run,
@@ -302,6 +304,57 @@ async def get_artifacts(
     return [ArtifactRecord.model_validate(row) for row in rows]
 
 
+@router.get("/runs/{run_id}/evidence-index", response_model=EvidenceIndex)
+async def get_evidence_index(
+    request: Request, run_id: UUID, user_id: Annotated[UUID, Depends(get_current_user_id)]
+) -> EvidenceIndex:
+    try:
+        return build_evidence_index(_admin(request), run_id, user_id)
+    except PermissionError:
+        raise HTTPException(
+            status.HTTP_404_NOT_FOUND,
+            {"code": "RUN_NOT_FOUND", "message": "Run not found"},
+        ) from None
+
+
+@router.get("/runs/{run_id}/artifacts/{artifact_id}")
+async def download_artifact(
+    request: Request,
+    run_id: UUID,
+    artifact_id: UUID,
+    user_id: Annotated[UUID, Depends(get_current_user_id)],
+) -> Response:
+    admin = _admin(request)
+    _get_run(admin, run_id, user_id)
+    rows = (
+        admin.table("execution_artifacts")
+        .select("id,artifact_type,storage_path")
+        .eq("run_id", str(run_id))
+        .eq("id", str(artifact_id))
+        .limit(1)
+        .execute()
+        .data
+    )
+    if not rows:
+        raise HTTPException(404, "Artifact not found")
+    artifact = rows[0]
+    try:
+        data = admin.storage.from_("runs").download(artifact["storage_path"])
+    except Exception:
+        raise HTTPException(404, "Artifact not found") from None
+    # Never reflect a storage path or untrusted path separators into headers.
+    name = str(artifact.get("artifact_type") or artifact_id).replace("\\", "/").rsplit("/", 1)[-1]
+    name = (
+        "".join(char for char in name if char.isprintable() and char not in '\r\n"') or "artifact"
+    )
+    content_disposition = f"attachment; filename=\"{name}\"; filename*=UTF-8''{quote(name)}"
+    return Response(
+        content=data,
+        media_type="application/octet-stream",
+        headers={"Content-Disposition": content_disposition},
+    )
+
+
 class PredictionExample(SchemaModel):
     index: int = Field(ge=0)
     pixels: str = Field(pattern=r"^[0-9a-f]{1568}$")
@@ -358,17 +411,30 @@ async def get_prediction_examples(
 
 @router.get("/runs/{run_id}/files", response_model=list[CodeFileRecord])
 async def get_files(
-    request: Request, run_id: UUID, user_id: Annotated[UUID, Depends(get_current_user_id)]
+    request: Request,
+    run_id: UUID,
+    user_id: Annotated[UUID, Depends(get_current_user_id)],
+    attempt: Annotated[int | None, Query(ge=1)] = None,
 ) -> list[CodeFileRecord]:
     admin = _admin(request)
     _get_run(admin, run_id, user_id)
-    pins = (
-        admin.table("execution_run_files")
-        .select("generated_file_id")
-        .eq("run_id", str(run_id))
-        .execute()
-        .data
-    )
+    if attempt is not None:
+        pins = (
+            admin.table("execution_attempt_files")
+            .select("generated_file_id")
+            .eq("run_id", str(run_id))
+            .eq("attempt", attempt)
+            .execute()
+            .data
+        )
+    else:
+        pins = (
+            admin.table("execution_run_files")
+            .select("generated_file_id")
+            .eq("run_id", str(run_id))
+            .execute()
+            .data
+        )
     if not pins:
         return []
     file_ids = [p["generated_file_id"] for p in pins]

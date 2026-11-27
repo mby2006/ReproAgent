@@ -7,6 +7,7 @@ import React from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import ts from "typescript";
 import { selectConditionSummary } from "../../../lib/conditions.mjs";
+import { buildPublicEvidenceIndex } from "../../../lib/evidence-index.mjs";
 
 const require = createRequire(import.meta.url);
 const source = readFileSync(new URL("./page.tsx", import.meta.url), "utf8");
@@ -27,6 +28,8 @@ const mockedRequire = (name) => {
   if (name === "@/components/PublicHeader") return { __esModule: true, default: () => null };
   if (name === "@/components/ParameterTable") return parameterTableModule.exports;
   if (name === "@/lib/conditions.mjs") return { selectConditionSummary };
+  if (name === "@/lib/evidence-index.mjs") return { buildPublicEvidenceIndex, groupEvidenceItems: (items) => Object.groupBy(items, (item) => item.category) };
+  if (name === "@/app/experiments/EvidenceIndex") return { __esModule: true, default: () => null };
   if (name === "@/lib/site") return { isStaticSite: true };
   if (name.endsWith("metrics.json")) return { __esModule: true, default: json("metrics") };
   if (name.endsWith("prediction_examples.json")) return { __esModule: true, default: json("prediction_examples") };
@@ -57,4 +60,10 @@ test("public archive shows the condition summary before the collapsed full table
   assert.ok(detailsIndex > summaryIndex, "summary appears before the evidence disclosure");
   assert.ok(fullTableIndex > detailsIndex, "full five-column table remains in the disclosure");
   for (const text of ["LeNet-5", "sgd", "11.23%"]) assert.ok(html.includes(text), text);
+});
+
+test("public archive source builds a local five-category evidence index", () => {
+  assert.match(source, /buildPublicEvidenceIndex/);
+  assert.match(source, /EvidenceIndex/);
+  assert.doesNotMatch(source, /apiFetch|supabase|fetch\(/);
 });

@@ -30,6 +30,7 @@ const mockedRequire = (name) => {
   if (name === "@/lib/api") return { apiFetch: () => { throw new Error("render must not fetch"); } };
   if (name === "@/components/PredictionReader") return { PrivatePredictions: () => null };
   if (name === "./ReportPanel") return { default: () => null };
+  if (name === "./EvidenceIndex") return { default: () => null };
   if (name.includes("icons")) return { IconPlay: () => null, IconStop: () => null };
   if (name === "@/lib/ui") return {
     ERROR_LABEL: {}, RUN_META: { running: { tone: "info", label: "运行中" } },
@@ -59,7 +60,7 @@ const run = {
 };
 
 test("run output tabs expose tablist, selected, controls, and tabpanel semantics", () => {
-  states = [[run], "run-1", run, { stdout: "hello", stderr: "" }, [], [], "stdout", null, null, false, false, null];
+  states = [[run], "run-1", run, { stdout: "hello", stderr: "" }, [], [], null, "stdout", null, null, false, false, null];
   const html = renderToStaticMarkup(React.createElement(RunPanel, {
     experimentId: "experiment-1", approved: true,
   }));
@@ -81,7 +82,7 @@ test("empty run history remains lazy and announces loading state", () => {
 });
 
 test("run failures and an in-flight cancellation are announced accessibly", () => {
-  states = [[run], "run-1", run, { stdout: "", stderr: "failed" }, [], [], "stderr", null, "启动失败", false, true, null];
+  states = [[run], "run-1", run, { stdout: "", stderr: "failed" }, [], [], null, "stderr", null, "启动失败", false, true, null];
   const html = renderToStaticMarkup(React.createElement(RunPanel, {
     experimentId: "experiment-1", approved: true,
   }));

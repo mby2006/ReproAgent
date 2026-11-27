@@ -61,6 +61,24 @@ export async function apiFetch<T>(path: string, init?: RequestInit): Promise<T> 
   return (await response.json()) as T;
 }
 
+export async function apiDownload(path: string, fallbackName = "artifact") {
+  const {
+    data: { session },
+  } = await supabase.auth.getSession();
+  if (!session) throw new Error("未登录");
+  const response = await fetch(`${API_URL}${path}`, {
+    headers: { Authorization: `Bearer ${session.access_token}` },
+  });
+  if (!response.ok) throw await apiErrorFrom(response);
+  const blob = await response.blob();
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = fallbackName;
+  link.click();
+  setTimeout(() => URL.revokeObjectURL(url), 0);
+}
+
 export async function apiGet<T>(path: string, init?: RequestInit): Promise<T | null> {
   const {
     data: { session },

@@ -224,19 +224,34 @@ const REPORT_ERROR_LABEL: Record<ReportErrorCode, string> = {
   REPORT_UNAVAILABLE: "报告尚未生成",
   REPORT_NOT_READY: "运行尚未结束，无法生成报告",
   REPORT_GENERATION_FAILED: "报告生成失败，可稍后重试",
+  INVALID_REPORT_VERSION: "报告版本必须为正整数",
+  REPORT_VERSION_NOT_FOUND: "所选报告版本不存在",
 };
+
+type ReportSelection = "latest" | number;
+
+export function reportDownloadName(runId: string, version: number) {
+  return `report-run-${runId}-v${version}.md`;
+}
 
 export default function ReportPanel({ runId, onFile }: { runId: string; onFile: (path: string) => void }) {
   const [report, setReport] = useState<RunReport | null>(null);
+  const [selection, setSelection] = useState<ReportSelection>("latest");
+  const [latestVersion, setLatestVersion] = useState<number | null>(null);
+  const [versionBusy, setVersionBusy] = useState(false);
   const [missing, setMissing] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<{ code: string; message: string } | null>(null);
   const [showMarkdown, setShowMarkdown] = useState(false);
 
-  const load = useCallback(async () => {
+  const load = useCallback(async (selected: ReportSelection = "latest") => {
+    setError(null);
     try {
-      const r = await apiFetch<RunReport>(`/v1/runs/${runId}/report`);
+      const suffix = selected === "latest" ? "" : `?version=${selected}`;
+      const r = await apiFetch<RunReport>(`/v1/runs/${runId}/report${suffix}`);
       setReport(r);
+      setSelection(selected);
+      setLatestVersion((current) => Math.max(current ?? 0, r.version));
       setMissing(false);
     } catch (err) {
       // 控制流只看稳定错误码；中文 message 仅用于展示。
@@ -244,6 +259,8 @@ export default function ReportPanel({ runId, onFile }: { runId: string; onFile: 
       if (code === "REPORT_UNAVAILABLE") {
         setMissing(true);
         setReport(null);
+        setSelection("latest");
+        setLatestVersion(null);
       } else {
         setError({ code, message: err instanceof Error ? err.message : "加载报告失败" });
       }
@@ -252,9 +269,11 @@ export default function ReportPanel({ runId, onFile }: { runId: string; onFile: 
 
   useEffect(() => {
     setReport(null);
+    setSelection("latest");
+    setLatestVersion(null);
     setMissing(false);
     setError(null);
-    load();
+    void load();
   }, [load]);
 
   async function regenerate() {
@@ -263,6 +282,8 @@ export default function ReportPanel({ runId, onFile }: { runId: string; onFile: 
     try {
       const r = await apiFetch<RunReport>(`/v1/runs/${runId}/report`, { method: "POST" });
       setReport(r);
+      setSelection("latest");
+      setLatestVersion((current) => Math.max(current ?? 0, r.version));
       setMissing(false);
     } catch (err) {
       const code = err instanceof ApiError ? err.code : "UNKNOWN_ERROR";
@@ -283,7 +304,7 @@ export default function ReportPanel({ runId, onFile }: { runId: string; onFile: 
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
     a.href = url;
-    a.download = `reproduction-report-${runId.slice(0, 8)}.md`;
+    a.download = reportDownloadName(report.run_id, report.version);
     a.click();
     URL.revokeObjectURL(url);
   }
@@ -311,9 +332,28 @@ export default function ReportPanel({ runId, onFile }: { runId: string; onFile: 
           </span>
         )}
         {report && (
-          <span className="chip font-mono" title="报告生成时间：重新生成会得到新版本">
-            报告版本 · {fmtDate(report.created_at)}
+          <span className="chip font-mono" title={`报告生成时间：${fmtDate(report.generated_at)}`}>
+            报告 v{report.version} · 执行尝试 {report.execution_attempt ?? "未创建"}
           </span>
+        )}
+        {report && (
+          <select
+            aria-label="选择报告版本"
+            className="input py-1.5 text-sm"
+            value={selection}
+            disabled={versionBusy || busy}
+            onChange={(event) => {
+              const value = event.target.value === "latest" ? "latest" : Number(event.target.value);
+              setVersionBusy(true);
+              void load(value).finally(() => setVersionBusy(false));
+            }}
+          >
+            <option value="latest">最新版本{latestVersion ? ` (v${latestVersion})` : ""}</option>
+            {Array.from({ length: latestVersion ?? report.version }, (_, index) => index + 1)
+              .reverse().map((version) => (
+                <option key={version} value={version}>v{version}</option>
+              ))}
+          </select>
         )}
         <div className="ml-auto flex flex-wrap gap-2">
           {report && (
@@ -573,6 +613,11 @@ export default function ReportPanel({ runId, onFile }: { runId: string; onFile: 
                 ["Code 版本", `v${data.references.code_version}`],
                 ["Code Hash", data.references.code_hash ?? "—"],
                 ["Run ID", data.references.run_id],
+                ["Workflow ID", data.references.workflow_id ?? "—"],
+                ["执行尝试", data.references.execution_attempt ?? "未创建"],
+                ["Runner Request ID", data.references.execution_request_id ?? "—"],
+                ["Runner Run ID", data.references.runner_run_id ?? "—"],
+                ["报告生成耗时", report?.generation_ms == null ? "—" : `${report.generation_ms} ms`],
                 ["固定代码文件", `${data.references.generated_file_ids.length} 个`],
               ].map(([label, value]) => (
                 <div key={label} className="rounded-lg border border-line bg-ink-900 px-3 py-2">
@@ -600,7 +645,7 @@ export default function ReportPanel({ runId, onFile }: { runId: string; onFile: 
             <span className="terminal-dot bg-bad/70" />
             <span className="terminal-dot bg-warn/70" />
             <span className="terminal-dot bg-ok/70" />
-            <span className="font-mono text-[12px] text-fg-3">reproduction-report-{runId.slice(0, 8)}.md</span>
+            <span className="font-mono text-[12px] text-fg-3">{reportDownloadName(report.run_id, report.version)}</span>
           </div>
           <pre className="max-h-[32rem] overflow-auto px-4 py-3 text-xs leading-relaxed text-fg-2">
             {report.markdown}

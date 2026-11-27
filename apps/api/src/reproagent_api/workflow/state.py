@@ -59,6 +59,7 @@ class WorkflowState(TypedDict, total=False):
 
     report: EvaluationReport
     markdown: str
+    report_generation_seconds: float
 
     budget_config: BudgetConfig
     budget: BudgetState

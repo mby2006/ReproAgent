@@ -313,7 +313,7 @@ def test_restore_restarts_application_after_pg_restore_failure(tmp_path, monkeyp
 
 def test_repository_migrations_have_no_transaction_control():
     migrations = load_migrations(Path(__file__).resolve().parents[2] / "infra/supabase/migrations")
-    assert len(migrations) == 13
+    assert len(migrations) == 14
     for item in migrations:
         assert build_migration_sql(item).startswith("BEGIN;")
 

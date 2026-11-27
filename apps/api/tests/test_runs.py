@@ -5,6 +5,7 @@ the Agent side, so the contract + orchestration are exercised without Docker or
 an LLM. Ownership flows runs -> experiments -> projects.user_id.
 """
 
+import hashlib
 import json
 from contextlib import contextmanager
 from datetime import UTC, datetime
@@ -497,6 +498,43 @@ class FakeAdmin:
                 for fid in params["p_file_ids"]
             )
             return True
+        if name == "append_report_version":
+            run_id = params["p_run_id"]
+            attempts = [
+                row["attempt"] for row in self.tables.get("execution_attempts", [])
+                if row["run_id"] == run_id
+            ]
+            attempt = max(attempts) if attempts else None
+            # PostgreSQL jsonb::text is canonical, not Python's compact wire JSON.
+            content = json.dumps(
+                params["p_report_json"], sort_keys=True, separators=(", ", ": "),
+                ensure_ascii=False,
+            ) + params["p_markdown"]
+            digest = hashlib.sha256(content.encode()).hexdigest()
+            rows = self.tables.setdefault("reproduction_reports", [])
+            existing = next((
+                row for row in rows
+                if row["run_id"] == run_id and row.get("attempt") == attempt
+                and row["content_sha256"] == digest
+            ), None)
+            if existing is not None:
+                return {key: existing[key] for key in ("id", "version", "attempt", "generation_ms")}
+            row = {
+                "id": str(uuid4()),
+                "run_id": run_id,
+                "report_json": params["p_report_json"],
+                "markdown": params["p_markdown"],
+                "created_at": "2026-01-01T00:00:00+00:00",
+                "version": max(
+                    (item["version"] for item in rows if item["run_id"] == run_id),
+                    default=0,
+                ) + 1,
+                "attempt": attempt,
+                "generation_ms": params.get("p_generation_ms"),
+                "content_sha256": digest,
+            }
+            rows.append(row)
+            return {key: row[key] for key in ("id", "version", "attempt", "generation_ms")}
         if name != "create_execution_run":
             raise AssertionError(f"unexpected rpc: {name}")
         experiment = next(
@@ -670,6 +708,10 @@ def runner_transport(results: list[RunResult]) -> httpx.MockTransport:
                 return httpx.Response(404, json={"detail": "run not found"})
             return httpx.Response(200, json={"stdout": result.stdout, "stderr": result.stderr})
         if request.method == "GET" and path.startswith("/runs/") and "/artifacts/" in path:
+            run_id = path.split("/")[2]
+            result = assigned[run_id]
+            if path.endswith("/metrics.json"):
+                return httpx.Response(200, content=json.dumps(result.metrics).encode())
             return httpx.Response(200, content=b"artifact-bytes")
         if request.method == "GET" and path.startswith("/runs/") and path.endswith("/artifacts"):
             run_id = path.split("/")[2]
@@ -739,6 +781,7 @@ def seed_tables(*, approved=True, with_spec=True):
         "generated_files": [],
         "execution_run_files": [],
         "execution_artifacts": [],
+        "reproduction_reports": [],
     }
 
 
@@ -1274,6 +1317,16 @@ def test_worker_oom_creates_new_plan_version(monkeypatch):
     # base plan version untouched
     assert plans[0]["config_json"]["training_config"]["batch_size"]["value"] == base_batch
     assert run["plan_version"] == 2
+    version = admin.tables["reproduction_reports"][0]
+    refs = version["report_json"]["references"]
+    assert version["attempt"] == 2
+    assert refs["execution_attempt"] == 2
+    assert refs["plan_id"] == v2["id"] and refs["plan_version"] == 2
+    assert refs["code_version"] == 2
+    final_files = {f["id"] for f in admin.tables["generated_files"] if f["version"] == 2}
+    assert set(refs["generated_file_ids"]) == final_files
+    first_files = {f["id"] for f in admin.tables["generated_files"] if f["version"] == 1}
+    assert final_files.isdisjoint(first_files)
 
 
 def test_worker_static_validation_failure_repairs_then_fails(monkeypatch):
@@ -1414,7 +1467,7 @@ def test_get_report_missing_is_404(env):
     assert response.status_code == 404
 
 
-def test_regenerate_report_upserts_and_is_traceable(env):
+def test_regenerate_report_appends_idempotently_and_is_traceable(env):
     client, admin, app = env
     app.state.agent_transport = agent_transport()
     run_id = _seed_run(admin)
@@ -1432,7 +1485,7 @@ def test_regenerate_report_upserts_and_is_traceable(env):
     assert len(report["experiment_checks"]) == 9
     assert "Full Reproduction" in report["summary"]
     assert body["markdown"].startswith("# 复现报告")
-    # regenerate again -> upsert, still exactly one row
+    # Regenerating identical content is idempotent, still exactly one version.
     again = client.post(f"/v1/runs/{run_id}/report", headers=AUTH)
     assert again.status_code == 200
     assert len(admin.tables["reproduction_reports"]) == 1

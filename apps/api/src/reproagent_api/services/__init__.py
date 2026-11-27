@@ -1,7 +1,15 @@
 from .card_edits import EditError, apply_edits, delegate_card
 from .card_markdown import render_card_markdown
 from .plan_edits import PlanEditError, apply_delegated_review, apply_plan_edits, apply_tier_override
-from .reports import build_evaluate_request, generate_and_store_report
+from .reports import (
+    ReportError,
+    ReportNotFound,
+    ReportVersionNotFound,
+    append_report_version,
+    build_evaluate_request,
+    generate_and_store_report,
+    get_report,
+)
 from .runs import (
     async_persist_result,
     build_run_request,
@@ -17,6 +25,10 @@ from .versions import insert_versioned
 __all__ = [
     "EditError",
     "PlanEditError",
+    "ReportError",
+    "ReportNotFound",
+    "ReportVersionNotFound",
+    "append_report_version",
     "apply_delegated_review",
     "apply_edits",
     "delegate_card",
@@ -28,6 +40,7 @@ __all__ = [
     "create_oom_plan",
     "ensure_attempt_row",
     "generate_and_store_report",
+    "get_report",
     "insert_code_version",
     "insert_versioned",
     "list_attempts",

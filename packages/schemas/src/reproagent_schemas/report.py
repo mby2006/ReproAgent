@@ -12,7 +12,7 @@ from enum import StrEnum
 from typing import Any
 from uuid import UUID
 
-from pydantic import Field, model_validator
+from pydantic import AliasChoices, Field, computed_field, model_validator
 
 from .card import ReproductionCard
 from .common import ReviewDecision, ReviewMode, SchemaModel
@@ -131,8 +131,35 @@ class ReportReferences(SchemaModel):
     code_version: int = Field(ge=1)
     code_hash: str | None = None
     run_id: UUID
+    workflow_id: UUID | None = None
+    execution_attempt: int | None = Field(default=None, ge=1)
+    execution_request_id: UUID | None = None
+    runner_run_id: str | None = None
     generated_file_ids: list[UUID] = Field(default_factory=list)
     review_trace_ids: list[UUID] = Field(default_factory=list)
+
+
+class ReportVersion(SchemaModel):
+    """One immutable report generation bound to a run's final real attempt."""
+
+    id: UUID
+    run_id: UUID
+    version: int = Field(ge=1)
+    execution_attempt: int | None = Field(
+        default=None,
+        ge=1,
+        validation_alias=AliasChoices("execution_attempt", "attempt"),
+    )
+    generation_ms: float | None = Field(default=None, ge=0)
+    content_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    report_json: dict[str, Any]
+    markdown: str
+    created_at: datetime
+
+    @computed_field
+    @property
+    def generated_at(self) -> datetime:
+        return self.created_at
 
 
 class ParameterComparison(SchemaModel):

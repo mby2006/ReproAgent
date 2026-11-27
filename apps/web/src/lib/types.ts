@@ -131,7 +131,9 @@ export interface WorkflowCancelResponse {
 export type ReportErrorCode =
   | "REPORT_UNAVAILABLE"
   | "REPORT_NOT_READY"
-  | "REPORT_GENERATION_FAILED";
+  | "REPORT_GENERATION_FAILED"
+  | "INVALID_REPORT_VERSION"
+  | "REPORT_VERSION_NOT_FOUND";
 
 export interface WorkflowDetail {
   id: string;
@@ -499,6 +501,10 @@ export interface ReportReferences {
   code_version: number;
   code_hash: string | null;
   run_id: string;
+  workflow_id: string | null;
+  execution_attempt: number | null;
+  execution_request_id: string | null;
+  runner_run_id: string | null;
   generated_file_ids: string[];
   review_trace_ids?: string[];
 }
@@ -537,8 +543,14 @@ export interface EvaluationReport {
 }
 
 export interface RunReport {
+  id: string;
   run_id: string;
+  version: number;
+  execution_attempt: number | null;
+  generation_ms: number | null;
+  content_sha256: string;
   report_json: EvaluationReport;
   markdown: string;
+  generated_at: string;
   created_at: string;
 }

@@ -17,6 +17,7 @@ from postgrest.exceptions import APIError as PostgrestAPIError
 from pydantic import Field, ValidationError
 from reproagent_schemas import (
     ErrorCategory,
+    ReportVersion,
     RunAccepted,
     RunLogs,
     RunStatus,
@@ -27,7 +28,12 @@ from ..auth import get_current_user_id
 from ..clients.agent import AgentClient
 from ..clients.runner import RunnerClient
 from ..clients.supabase import make_service_client
-from ..services import generate_and_store_report
+from ..services import (
+    ReportError,
+    ReportNotFound,
+    generate_and_store_report,
+)
+from ..services import get_report as load_report
 from ..services.dispatch import enqueue_pending_outbox
 from ..services.runs import (
     execution_request_id,
@@ -101,11 +107,8 @@ class CodeFileRecord(SchemaModel):
     related_error: str | None = None
 
 
-class RunReport(SchemaModel):
-    run_id: UUID
-    report_json: dict
-    markdown: str
-    created_at: datetime
+class RunReport(ReportVersion):
+    """API representation of one immutable report version."""
 
 
 def _admin(request: Request):
@@ -413,19 +416,42 @@ async def get_logs(
 
 @router.get("/runs/{run_id}/report", response_model=RunReport)
 async def get_report(
-    request: Request, run_id: UUID, user_id: Annotated[UUID, Depends(get_current_user_id)]
+    request: Request,
+    run_id: UUID,
+    user_id: Annotated[UUID, Depends(get_current_user_id)],
+    version: str | None = None,
 ) -> RunReport:
     admin = _admin(request)
     run = _get_run(admin, run_id, user_id)
-    rows = (
-        admin.table("reproduction_reports")
-        .select("run_id,report_json,markdown,created_at")
-        .eq("run_id", str(run_id))
-        .execute()
-        .data
-    )
-    if not rows:
-        # Stable code: the client branches on this, never on the message text.
+    selected_version = None
+    if version is not None:
+        if not re.fullmatch(r"[0-9]+", version) or int(version) <= 0:
+            raise HTTPException(
+                status.HTTP_400_BAD_REQUEST,
+                {"code": "INVALID_REPORT_VERSION", "message": "报告版本必须为正整数"},
+            )
+        selected_version = int(version)
+    try:
+        report = load_report(admin, str(run_id), version=selected_version)
+    except ReportNotFound as exc:
+        # A persisted version remains readable even if a later generation failed.
+        # Only an absent report can represent a confirmed workflow failure.
+        workflows = (
+            admin.table("workflows")
+            .select("status,current_node")
+            .eq("run_id", str(run_id))
+            .execute()
+            .data
+        )
+        if any(
+            row.get("status") == "failed"
+            and row.get("current_node") in {"evaluate_result", "generate_report"}
+            for row in workflows
+        ):
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                {"code": "REPORT_GENERATION_FAILED", "message": "报告生成失败"},
+            ) from exc
         raise HTTPException(
             status.HTTP_404_NOT_FOUND,
             {
@@ -434,8 +460,13 @@ async def get_report(
                 if run["status"] in TERMINAL_STATUSES
                 else "运行尚未结束，暂无报告",
             },
-        )
-    return RunReport.model_validate(rows[0])
+        ) from exc
+    except ReportError as exc:
+        raise HTTPException(
+            status.HTTP_404_NOT_FOUND,
+            {"code": exc.code, "message": str(exc)},
+        ) from exc
+    return RunReport.model_validate(report, from_attributes=True)
 
 
 @router.post("/runs/{run_id}/report", response_model=RunReport)
@@ -454,7 +485,7 @@ async def regenerate_report(
         transport=getattr(request.app.state, "agent_transport", None),
     )
     try:
-        await generate_and_store_report(admin, agent, str(run_id))
+        report = await generate_and_store_report(admin, agent, str(run_id))
     except HTTPException:
         raise
     except Exception as exc:
@@ -464,14 +495,7 @@ async def regenerate_report(
         ) from exc
     finally:
         await agent.aclose()
-    rows = (
-        admin.table("reproduction_reports")
-        .select("run_id,report_json,markdown,created_at")
-        .eq("run_id", str(run_id))
-        .execute()
-        .data
-    )
-    return RunReport.model_validate(rows[0])
+    return RunReport.model_validate(report, from_attributes=True)
 
 
 @router.post("/runs/{run_id}/cancel", response_model=RunDetail)

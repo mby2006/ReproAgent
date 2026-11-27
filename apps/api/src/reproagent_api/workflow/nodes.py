@@ -7,6 +7,7 @@ finalizes the workflow as failed with the checkpointed state intact.
 
 import asyncio
 import base64
+import time
 from datetime import UTC, datetime
 from uuid import UUID, uuid4
 
@@ -712,31 +713,36 @@ async def evaluate_result(state: dict, ctx: WorkflowContext) -> dict:
     from ..services.reports import build_evaluate_request
 
     updates = ctx.set_status(state, WorkflowStatus.EVALUATING, "evaluate_result")
-    request = build_evaluate_request(ctx.admin, state["run_id"])
+    request = build_evaluate_request(
+        ctx.admin, state["run_id"], workflow_id=state.get("workflow_id")
+    )
+    started = time.perf_counter()
     response = await ctx.agent.evaluate(request)
-    return {**updates, "report": response.report, "markdown": response.markdown}
+    elapsed = time.perf_counter() - started
+    return {
+        **updates,
+        "report": response.report,
+        "markdown": response.markdown,
+        "report_generation_seconds": elapsed,
+    }
 
 
 async def generate_report(state: dict, ctx: WorkflowContext) -> dict:
     if cancel_requested(state, ctx):
         # A cancelled workflow keeps its prior results but produces no report.
         return {}
-    row = {
-        "run_id": state["run_id"],
-        "report_json": state["report"].model_dump(mode="json"),
-        "markdown": state["markdown"],
-    }
-    existing = (
-        ctx.admin.table("reproduction_reports")
-        .select("id")
-        .eq("run_id", state["run_id"])
-        .execute()
-        .data
+    from ..services.reports import append_report_version
+
+    elapsed = state.get("report_generation_seconds")
+    if elapsed is None or elapsed < 0:
+        raise ValueError("Report generation elapsed time is unavailable")
+    append_report_version(
+        ctx.admin,
+        state["run_id"],
+        state["report"].model_dump(mode="json"),
+        state["markdown"],
+        elapsed * 1000,
     )
-    if existing:
-        ctx.admin.table("reproduction_reports").update(row).eq("run_id", state["run_id"]).execute()
-    else:
-        ctx.admin.table("reproduction_reports").insert(row).execute()
     return {}
 
 
@@ -757,7 +763,9 @@ async def cancel_workflow(state: dict, ctx: WorkflowContext) -> dict:
         RunStatus.DISPATCHING.value, RunStatus.RUNNING.value
     ):
         # The acceptance identity exists even before the Runner echoes one back.
-        await _cancel_runner(ctx.runner, execution_request_id(UUID(run_id), row.get("repair_attempt", 0)))
+        await _cancel_runner(
+            ctx.runner, execution_request_id(UUID(run_id), row.get("repair_attempt", 0))
+        )
     if row is not None and row["status"] not in {status.value for status in TERMINAL_RUN}:
         _finalize_run(
             ctx.admin, run_id, RunStatus.CANCELLED.value, CANCELLED_MESSAGE,

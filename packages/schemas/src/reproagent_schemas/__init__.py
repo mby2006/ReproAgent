@@ -134,6 +134,7 @@ from .report import (
     MethodItem,
     MetricComparison,
     ReportReferences,
+    ReportVersion,
 )
 from .reproduction import ReproductionRequest
 from .review import (
@@ -292,6 +293,7 @@ __all__ = [
     "ReproductionRequest",
     "ReproductionSpec",
     "ReportReferences",
+    "ReportVersion",
     "ReportedResult",
     "RepairRequest",
     "RepairResponse",

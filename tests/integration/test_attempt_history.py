@@ -7,7 +7,9 @@ copied into this test. The databases are dropped after the session.
 
 Set REPRO_TEST_DATABASE_URL to a throwaway Supabase/Postgres server (the default
 is the local Supabase port). The connecting role must be able to create/drop
-databases. Run: uv run pytest tests/integration/test_attempt_history.py -m integration -v
+databases. REPRO_TEST_DATABASE_TEMPLATE optionally selects a prebootstrapped
+Supabase-compatible template; it defaults to template1. Run:
+uv run pytest tests/integration/test_attempt_history.py -m integration -v
 """
 
 import hashlib
@@ -29,6 +31,7 @@ DSN = os.environ.get(
     "REPRO_TEST_DATABASE_URL",
     "postgresql://postgres:postgres@localhost:54322/postgres",
 )
+DATABASE_TEMPLATE = os.environ.get("REPRO_TEST_DATABASE_TEMPLATE", "template1")
 ROOT = Path(__file__).resolve().parents[2]
 MIGRATIONS = sorted((ROOT / "infra/supabase/migrations").glob("*.sql"))
 ATTEMPT_MIGRATION = next(
@@ -129,7 +132,11 @@ def migrated_database():
     """Apply all real migrations around a seeded legacy database, then drop it."""
     name = f"reproagent_attempt_history_{uuid4().hex}"
     with psycopg.connect(DSN, autocommit=True, row_factory=dict_row, connect_timeout=5) as admin:
-        admin.execute(sql.SQL("create database {}").format(sql.Identifier(name)))
+        admin.execute(
+            sql.SQL("create database {} template {}").format(
+                sql.Identifier(name), sql.Identifier(DATABASE_TEMPLATE)
+            )
+        )
         try:
             with psycopg.connect(
                 DSN, dbname=name, autocommit=True, row_factory=dict_row, connect_timeout=5
@@ -138,6 +145,13 @@ def migrated_database():
                 context = _seed_legacy(connection)
                 # This is the production migration under test, not equivalent SQL.
                 _apply_migrations(connection, [ATTEMPT_MIGRATION])
+                # Task 8 must backfill a report that already exists in the legacy
+                # single-report table rather than inventing a fresh v1.
+                connection.execute(
+                    "insert into public.reproduction_reports "
+                    "(run_id, report_json, markdown) values (%s, %s::jsonb, %s)",
+                    (context["run_ids"][0], json.dumps({"legacy": True}), "legacy report"),
+                )
                 _apply_migrations(connection, MIGRATIONS[ATTEMPT_INDEX + 1:])
                 connection.autocommit = False
                 yield connection, context
@@ -184,6 +198,36 @@ def committed_pin_context(migrated_database):
         raise
     try:
         yield connection.info.dbname, run_id, file_sets
+    finally:
+        connection.rollback()
+        connection.execute("delete from public.execution_runs where id = %s", (run_id,))
+        connection.commit()
+
+
+@pytest.fixture
+def committed_report_context(migrated_database):
+    """Expose one fresh run to independent report-append connections."""
+    connection, context = migrated_database
+    run_id = str(uuid4())
+    connection.execute(
+        "insert into public.execution_runs "
+        "(id, experiment_id, plan_id, code_version, plan_version, status, repair_attempt) "
+        "values (%s, %s, %s, 1, 1, 'succeeded', 0)",
+        (run_id, context["experiment_id"], context["plan_id"]),
+    )
+    connection.execute(
+        "insert into public.execution_attempts "
+        "(run_id, attempt, plan_id, plan_version, code_version, status, runner_request_id) "
+        "values (%s, 1, %s, 1, 1, 'succeeded', %s)",
+        (run_id, context["plan_id"], uuid4()),
+    )
+    try:
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+    try:
+        yield connection.info.dbname, run_id
     finally:
         connection.rollback()
         connection.execute("delete from public.execution_runs where id = %s", (run_id,))
@@ -855,3 +899,218 @@ class TestProjectionRpc:
             "'public.replace_run_projection(uuid,integer,uuid[])', 'execute') as service_role"
         )
         assert db.fetchone() == {"authenticated": False, "service_role": True}
+
+
+class TestReportVersions:
+    @staticmethod
+    def _append(db, run_id, report, markdown, generation_ms=12.5):
+        db.execute(
+            "select id, version, attempt, generation_ms "
+            "from public.append_report_version(%s::uuid, %s::jsonb, %s::text, %s::numeric)",
+            (run_id, json.dumps(report), markdown, generation_ms),
+        )
+        return db.fetchone()
+
+    def test_legacy_report_is_backfilled_with_exact_content_hash(self, db, run_context):
+        run_id = run_context["run_ids"][0]
+        db.execute(
+            "select report_json::text || markdown as content, report_json, markdown "
+            "from public.reproduction_reports where run_id = %s",
+            (run_id,),
+        )
+        legacy = db.fetchone()
+        content = legacy["content"]
+        assert legacy["report_json"] == {"legacy": True}
+        assert legacy["markdown"] == "legacy report"
+        db.execute(
+            "select version, attempt, generation_ms, content_sha256 "
+            "from public.reproduction_reports where run_id = %s",
+            (run_id,),
+        )
+        assert db.fetchall() == [{
+            "version": 1,
+            "attempt": 2,
+            "generation_ms": None,
+            "content_sha256": hashlib.sha256(content.encode()).hexdigest(),
+        }]
+
+    def test_report_versions_append_and_identical_content_is_idempotent(
+        self, db, run_context
+    ):
+        run_id = run_context["run_ids"][1]
+        first = self._append(db, run_id, {"revision": 1}, "first")
+        duplicate = self._append(db, run_id, {"revision": 1}, "first", generation_ms=99)
+        second = self._append(db, run_id, {"revision": 2}, "second", generation_ms=25.125)
+
+        assert first["version"] == 1 and first["attempt"] == 2
+        assert duplicate == first
+        assert second["version"] == 2 and second["attempt"] == 2
+        assert second["generation_ms"] == pytest.approx(25.125)
+        db.execute(
+            "select version, markdown from public.reproduction_reports "
+            "where run_id = %s order by version",
+            (run_id,),
+        )
+        assert db.fetchall() == [
+            {"version": 1, "markdown": "first"},
+            {"version": 2, "markdown": "second"},
+        ]
+
+    def test_report_without_an_attempt_stays_legacy_and_idempotent(self, db, run_context):
+        run_id = str(uuid4())
+        db.execute(
+            "insert into public.execution_runs "
+            "(id, experiment_id, plan_id, code_version, plan_version, status) "
+            "values (%s, %s, %s, 1, 1, 'failed')",
+            (run_id, run_context["experiment_id"], run_context["plan_id"]),
+        )
+        first = self._append(db, run_id, {"legacy": True}, "before attempt")
+        duplicate = self._append(db, run_id, {"legacy": True}, "before attempt")
+
+        assert first["version"] == 1 and first["attempt"] is None
+        assert duplicate == first
+        db.execute(
+            "select count(*) as count from public.reproduction_reports "
+            "where run_id = %s",
+            (run_id,),
+        )
+        assert db.fetchone()["count"] == 1
+
+    def test_report_content_hash_is_required(self, db, run_context):
+        _reject(
+            db,
+            psycopg.errors.NotNullViolation,
+            "insert into public.reproduction_reports "
+            "(run_id, version, attempt, report_json, markdown) "
+            "values (%s, 1, 2, '{}'::jsonb, 'missing hash')",
+            (run_context["run_ids"][1],),
+        )
+
+    @pytest.mark.parametrize("statement", [
+        "update public.reproduction_reports set markdown = 'tampered' "
+        "where run_id = %s and version = 1",
+        "delete from public.reproduction_reports where run_id = %s and version = 1",
+    ])
+    def test_report_versions_are_immutable(self, db, run_context, statement):
+        run_id = run_context["run_ids"][1]
+        self._append(db, run_id, {"revision": 1}, "first")
+
+        _reject(db, psycopg.errors.RaiseException, statement, (run_id,))
+
+        db.execute(
+            "select markdown from public.reproduction_reports "
+            "where run_id = %s and version = 1",
+            (run_id,),
+        )
+        assert db.fetchone()["markdown"] == "first"
+
+    def test_app_roles_cannot_update_or_delete_reports(self, db):
+        for role in ("anon", "authenticated"):
+            db.execute(
+                "select has_table_privilege(%s, "
+                "'public.reproduction_reports', 'select') as can_select, "
+                "has_table_privilege(%s, "
+                "'public.reproduction_reports', 'insert') as can_insert, "
+                "has_table_privilege(%s, "
+                "'public.reproduction_reports', 'update') as can_update, "
+                "has_table_privilege(%s, "
+                "'public.reproduction_reports', 'delete') as can_delete, "
+                "has_function_privilege(%s, "
+                "'public.append_report_version(uuid,jsonb,text,numeric)', 'execute') as can_append",
+                (role, role, role, role, role),
+            )
+            assert db.fetchone() == {
+                "can_select": True, "can_insert": True,
+                "can_update": False, "can_delete": False, "can_append": False,
+            }
+
+    def test_attempt_content_idempotency_index_is_partial_and_unique(self, db):
+        db.execute(
+            "select indexdef from pg_indexes "
+            "where schemaname = 'public' "
+            "and indexname = 'reproduction_reports_content_idempotent'"
+        )
+        definition = db.fetchone()["indexdef"]
+        assert "UNIQUE INDEX" in definition
+        assert "(run_id, attempt, content_sha256)" in definition
+        assert "WHERE (attempt IS NOT NULL)" in definition
+
+    def test_run_delete_cascades_report_history(self, db, run_context):
+        run_id = run_context["run_ids"][1]
+        self._append(db, run_id, {"revision": 1}, "first")
+        db.execute("delete from public.execution_runs where id = %s", (run_id,))
+        db.execute("set constraints all immediate")
+        db.execute(
+            "select count(*) as count from public.reproduction_reports "
+            "where run_id = %s",
+            (run_id,),
+        )
+        assert db.fetchone()["count"] == 0
+
+    def test_concurrent_appends_receive_distinct_versions(self, committed_report_context):
+        dbname, run_id = committed_report_context
+        barrier = threading.Barrier(2)
+        outcomes = []
+
+        def append(revision):
+            try:
+                with psycopg.connect(
+                    DSN, dbname=dbname, autocommit=False, row_factory=dict_row
+                ) as connection:
+                    connection.execute("set local statement_timeout = '10s'")
+                    barrier.wait(timeout=5)
+                    row = connection.execute(
+                        "select version from public.append_report_version(%s, %s::jsonb, %s)",
+                        (run_id, json.dumps({"revision": revision}), f"report {revision}"),
+                    ).fetchone()
+                outcomes.append((revision, row["version"], None))
+            except Exception as exc:
+                outcomes.append((revision, None, exc))
+
+        threads = [threading.Thread(target=append, args=(n,), daemon=True) for n in (1, 2)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=15)
+        assert all(not thread.is_alive() for thread in threads)
+        assert len(outcomes) == 2
+        assert all(error is None for _, _, error in outcomes), outcomes
+        assert {version for _, version, _ in outcomes} == {1, 2}
+
+    def test_concurrent_identical_appends_return_one_version(self, committed_report_context):
+        dbname, run_id = committed_report_context
+        barrier = threading.Barrier(2)
+        outcomes = []
+
+        def append():
+            try:
+                with psycopg.connect(
+                    DSN, dbname=dbname, autocommit=False, row_factory=dict_row
+                ) as connection:
+                    connection.execute("set local statement_timeout = '10s'")
+                    barrier.wait(timeout=5)
+                    row = connection.execute(
+                        "select id, version from public.append_report_version(%s, %s::jsonb, %s)",
+                        (run_id, json.dumps({"same": True}), "same report"),
+                    ).fetchone()
+                outcomes.append(row)
+            except Exception as exc:
+                outcomes.append(exc)
+
+        threads = [threading.Thread(target=append, daemon=True) for _ in range(2)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=15)
+        assert all(not thread.is_alive() for thread in threads)
+        assert len(outcomes) == 2 and all(isinstance(row, dict) for row in outcomes), outcomes
+        assert outcomes[0] == outcomes[1]
+        with psycopg.connect(
+            DSN, dbname=dbname, autocommit=True, row_factory=dict_row
+        ) as connection:
+            count = connection.execute(
+                "select count(*) as count from public.reproduction_reports "
+                "where run_id = %s",
+                (run_id,),
+            ).fetchone()["count"]
+        assert count == 1

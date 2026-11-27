@@ -652,6 +652,36 @@ def test_evaluate_method_validated_end_to_end():
     assert acc.paper_value == pytest.approx(0.99)
 
 
+def test_evaluate_preserves_exact_final_attempt_references_and_evidence():
+    request = make_request()
+    final_file_id = uuid4()
+    request.references = ReportReferences.model_validate({
+        **request.references.model_dump(mode="json"),
+        "workflow_id": str(uuid4()),
+        "execution_attempt": 2,
+        "execution_request_id": str(uuid4()),
+        "runner_run_id": "runner-final-attempt",
+        "generated_file_ids": [str(final_file_id)],
+        "code_hash": "final-code-hash",
+    })
+    request.code_files = [CodeFile(path="train.py", content="# final attempt only")]
+    request.artifacts = ["final/model.pt"]
+    request.metrics = {"metric_value": 0.90}
+
+    response = evaluate_run(request)
+
+    assert response.report.references == request.references
+    assert response.report.references.generated_file_ids == [final_file_id]
+    assert response.report.references.execution_attempt == 2
+    assert (
+        response.report.references.execution_request_id
+        == request.references.execution_request_id
+    )
+    assert response.report.references.runner_run_id == "runner-final-attempt"
+    assert "final/model.pt" in response.markdown
+    assert "first/model.pt" not in response.markdown
+
+
 def test_evaluate_failed_run_execution_failed():
     request = make_request(
         run_status=RunStatus.FAILED,

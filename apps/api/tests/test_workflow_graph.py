@@ -227,10 +227,26 @@ async def test_happy_path_completes_with_traceable_report():
     run = admin.tables["execution_runs"][0]
     assert run["status"] == "succeeded"
     assert admin.tables["experiments"][0]["status"] == "succeeded"
-    report = admin.tables["reproduction_reports"][0]["report_json"]
+    versions = admin.tables["reproduction_reports"]
+    assert len(versions) == 1
+    assert versions[0]["version"] == 1 and versions[0]["attempt"] == 1
+    assert versions[0]["generation_ms"] >= 0
+    report = versions[0]["report_json"]
     assert report["references"]["run_id"] == run["id"]
     assert report["references"]["paper_id"] == str(PAPER_ID)
+    assert report["references"]["workflow_id"] == str(WORKFLOW_ID)
+    assert report["references"]["execution_attempt"] == 1
     assert len(report["references"]["generated_file_ids"]) == 5
+    snapshot = saver.get({"configurable": {"thread_id": THREAD_ID}})
+    checkpoint_state = snapshot["channel_values"]
+    assert checkpoint_state["report_generation_seconds"] >= 0
+
+    # Replaying report persistence for the same workflow/content is a no-op.
+    from reproagent_api.workflow import nodes as workflow_nodes
+
+    await workflow_nodes.generate_report(checkpoint_state, ctx)
+    await workflow_nodes.generate_report(checkpoint_state, ctx)
+    assert len(admin.tables["reproduction_reports"]) == 1
     # every node on the success path traced once (classify/repair only on failure),
     # with no credentials or raw PDF in traces
     traced = {t["node_name"] for t in admin.tables["agent_traces"]}

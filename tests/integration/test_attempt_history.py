@@ -13,9 +13,10 @@ databases. Run: uv run pytest tests/integration/test_attempt_history.py -m integ
 import hashlib
 import json
 import os
+import threading
 from datetime import UTC, datetime
 from pathlib import Path
-from uuid import uuid4
+from uuid import NAMESPACE_URL, uuid4, uuid5
 
 import psycopg
 import pytest
@@ -114,7 +115,10 @@ def _seed_legacy(db):
     return {
         "user_id": str(user_id),
         "project_id": str(project_id),
+        "paper_id": str(paper_id),
+        "spec_id": str(spec_id),
         "experiment_id": str(experiment_id),
+        "plan_id": str(plan_id),
         "run_ids": [str(run_id) for run_id in run_ids],
         "file_ids": file_ids,
     }
@@ -156,6 +160,36 @@ def run_context(migrated_database):
     return migrated_database[1]
 
 
+@pytest.fixture
+def committed_pin_context(migrated_database):
+    """Expose one fresh run to independent connections for real lock races."""
+    connection, context = migrated_database
+    run_id = str(uuid4())
+    connection.execute(
+        "insert into public.execution_runs "
+        "(id, experiment_id, plan_id, code_version, plan_version, status, repair_attempt) "
+        "values (%s, %s, %s, 1, 1, 'running', 0)",
+        (run_id, context["experiment_id"], context["plan_id"]),
+    )
+    try:
+        file_sets = [
+            _insert_files(
+                connection, context["experiment_id"], f"race-{run_id}-{index}", count=1
+            )
+            for index in range(2)
+        ]
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+    try:
+        yield connection.info.dbname, run_id, file_sets
+    finally:
+        connection.rollback()
+        connection.execute("delete from public.execution_runs where id = %s", (run_id,))
+        connection.commit()
+
+
 def _insert_files(db, experiment_id, prefix, count=2, version=1):
     ids = []
     for index in range(count):
@@ -163,7 +197,7 @@ def _insert_files(db, experiment_id, prefix, count=2, version=1):
         db.execute(
             "insert into public.generated_files "
             "(id, experiment_id, version, path, content, sha256, change_reason) "
-            "values (%s, %s, %s, 'x', %s, 'seed')",
+            "values (%s, %s, %s, %s, 'x', %s, 'seed')",
             (str(fid), experiment_id, version, f"{prefix}/file_{index}.py",
              hashlib.sha256(f"{prefix}-{index}".encode()).hexdigest()),
         )
@@ -181,11 +215,11 @@ def _attempt(db, run_id, attempt=1, status="running"):
     )
 
 
-def _reject(db, error, statement, params=()):
+def _reject(db, error, statement, params=(), *, match=None):
     """Assert a statement fails and roll back only its savepoint."""
     db.execute("savepoint rejected_statement")
     try:
-        with pytest.raises(error):
+        with pytest.raises(error, match=match):
             db.execute(statement, params)
     finally:
         db.execute("rollback to savepoint rejected_statement")
@@ -203,8 +237,16 @@ class TestSchemaContract:
             "id", "run_id", "attempt", "plan_id", "plan_version", "code_version",
             "status", "runner_request_id", "runner_run_id", "dispatch_started_at",
             "runner_accepted_at", "finished_at", "timing_json", "error_code",
-            "error_message", "created_at",
+            "error_message", "created_at", "files_pinned",
         }.issubset(columns)
+        db.execute(
+            "select data_type, is_nullable, column_default from information_schema.columns "
+            "where table_schema='public' and table_name='execution_attempts' "
+            "and column_name='files_pinned'"
+        )
+        assert db.fetchone() == {
+            "data_type": "boolean", "is_nullable": "NO", "column_default": "false",
+        }
 
     def test_execution_attempt_files_table_exists(self, db):
         db.execute(
@@ -256,6 +298,17 @@ class TestSchemaContract:
 
 
 class TestLegacyBackfill:
+    def test_existing_file_bindings_are_backfilled_as_sealed(self, db, run_context):
+        db.execute(
+            "select attempt, files_pinned from public.execution_attempts "
+            "where run_id = %s order by attempt",
+            (run_context["run_ids"][0],),
+        )
+        assert db.fetchall() == [
+            {"attempt": 1, "files_pinned": True},
+            {"attempt": 2, "files_pinned": False},
+        ]
+
     def test_every_distinct_artifact_attempt_has_a_parent(self, db, run_context):
         db.execute(
             "select a.run_id, a.attempt, count(*) as artifacts "
@@ -269,7 +322,7 @@ class TestLegacyBackfill:
         db.execute(
             "select run_id, attempt from public.execution_attempts order by run_id, attempt"
         )
-        assert {(row["run_id"], row["attempt"]) for row in db.fetchall()} == {
+        assert {(str(row["run_id"]), row["attempt"]) for row in db.fetchall()} == {
             (run_id, attempt)
             for run_id in run_context["run_ids"] for attempt in (1, 2)
         }
@@ -283,9 +336,9 @@ class TestLegacyBackfill:
         )
         rows = db.fetchall()
         assert [(row["attempt"], row["storage_path"]) for row in rows] == [
+            (1, f"{run_id}/attempt-0/artifacts/metrics.json"),
+            (1, f"{run_id}/attempt-0/artifacts/metrics.json"),
             (2, f"{run_id}/attempt-1/artifacts/metrics.json"),
-            (1, f"{run_id}/attempt-0/artifacts/metrics.json"),
-            (1, f"{run_id}/attempt-0/artifacts/metrics.json"),
         ]
 
     def test_artifact_insert_rejects_missing_parent(self, db, run_context):
@@ -323,8 +376,12 @@ class TestAppendOnlySemantics:
             (run_id,),
         )
         rows = db.fetchall()
-        assert {row["generated_file_id"] for row in rows if row["attempt"] == 3} == set(first_ids)
-        assert {row["generated_file_id"] for row in rows if row["attempt"] == 4} == set(second_ids)
+        assert {
+            str(row["generated_file_id"]) for row in rows if row["attempt"] == 3
+        } == set(first_ids)
+        assert {
+            str(row["generated_file_id"]) for row in rows if row["attempt"] == 4
+        } == set(second_ids)
 
     def test_artifact_query_is_scoped_to_attempt(self, db, run_context):
         run_id = run_context["run_ids"][0]
@@ -350,6 +407,7 @@ class TestAppendOnlySemantics:
     def test_run_delete_cascade_still_removes_history(self, db, run_context):
         run_id = run_context["run_ids"][0]
         db.execute("delete from public.execution_runs where id = %s", (run_id,))
+        db.execute("set constraints all immediate")
         db.execute(
             "select count(*) as count from public.execution_attempts where run_id = %s",
             (run_id,),
@@ -476,6 +534,256 @@ class TestAppendOnlySemantics:
         )
 
 
+class TestPinningRpc:
+    @staticmethod
+    def _pin(db, run_id, attempt, file_ids):
+        db.execute(
+            "select public.pin_attempt_files(%s, %s, %s::uuid[])",
+            (run_id, attempt, file_ids),
+        )
+
+    @staticmethod
+    def _state(db, run_id, attempt):
+        sealed = db.execute(
+            "select files_pinned from public.execution_attempts "
+            "where run_id = %s and attempt = %s",
+            (run_id, attempt),
+        ).fetchone()
+        rows = db.execute(
+            "select generated_file_id from public.execution_attempt_files "
+            "where run_id = %s and attempt = %s order by generated_file_id",
+            (run_id, attempt),
+        ).fetchall()
+        return sealed, sorted(str(row["generated_file_id"]) for row in rows)
+
+    def test_empty_pin_is_sealed_and_repeating_it_is_idempotent(self, db, run_context):
+        run_id = run_context["run_ids"][0]
+        self._pin(db, run_id, 3, [])
+        before = self._state(db, run_id, 3)
+        assert before == ({"files_pinned": True}, [])
+
+        self._pin(db, run_id, 3, [])
+
+        assert self._state(db, run_id, 3) == before
+
+    def test_nonempty_pin_conflicts_after_explicit_empty_pin(self, db, run_context):
+        run_id = run_context["run_ids"][0]
+        files = _insert_files(db, run_context["experiment_id"], "empty-conflict", version=3)
+        self._pin(db, run_id, 3, [])
+
+        _reject(
+            db, psycopg.errors.RaiseException,
+            "select public.pin_attempt_files(%s, 3, %s::uuid[])",
+            (run_id, files), match="ATTEMPT_FILES_CONFLICT",
+        )
+
+        assert self._state(db, run_id, 3) == ({"files_pinned": True}, [])
+
+    def test_different_nonempty_pin_conflicts_without_union(self, db, run_context):
+        run_id = run_context["run_ids"][0]
+        original = _insert_files(db, run_context["experiment_id"], "pin-original", version=3)
+        replacement = _insert_files(
+            db, run_context["experiment_id"], "pin-replacement", count=1, version=3
+        )
+        self._pin(db, run_id, 3, original)
+
+        _reject(
+            db, psycopg.errors.RaiseException,
+            "select public.pin_attempt_files(%s, 3, %s::uuid[])",
+            (run_id, replacement), match="ATTEMPT_FILES_CONFLICT",
+        )
+
+        assert self._state(db, run_id, 3) == ({"files_pinned": True}, sorted(original))
+
+    def test_same_set_in_different_order_is_idempotent(self, db, run_context):
+        run_id = run_context["run_ids"][0]
+        files = _insert_files(db, run_context["experiment_id"], "pin-repeat", version=3)
+        self._pin(db, run_id, 3, files)
+        before = self._state(db, run_id, 3)
+
+        self._pin(db, run_id, 3, list(reversed(files)))
+
+        assert self._state(db, run_id, 3) == before
+
+    def test_new_attempt_keeps_zero_based_request_identity(self, db, run_context):
+        run_id = run_context["run_ids"][0]
+        self._pin(db, run_id, 3, [])
+
+        db.execute(
+            "select attempt, runner_request_id from public.execution_attempts "
+            "where run_id = %s and attempt = 3",
+            (run_id,),
+        )
+        assert db.fetchone() == {
+            "attempt": 3,
+            "runner_request_id": uuid5(
+                NAMESPACE_URL, f"reproagent:execution:{run_id}:attempt:2"
+            ),
+        }
+
+    def test_terminal_legacy_attempt_can_receive_its_first_seal(self, db, run_context):
+        run_id = run_context["run_ids"][0]
+        self._pin(db, run_id, 2, [])
+
+        assert self._state(db, run_id, 2) == ({"files_pinned": True}, [])
+
+    def test_new_terminal_attempt_can_receive_its_first_seal(self, db, run_context):
+        run_id = str(uuid4())
+        db.execute(
+            "insert into public.execution_runs "
+            "(id, experiment_id, plan_id, code_version, plan_version, status, repair_attempt) "
+            "values (%s, %s, %s, 1, 1, 'failed', 0)",
+            (run_id, run_context["experiment_id"], run_context["plan_id"]),
+        )
+
+        self._pin(db, run_id, 1, [])
+
+        assert self._state(db, run_id, 1) == ({"files_pinned": True}, [])
+
+    def test_duplicate_input_ids_are_rejected_without_sealing(self, db, run_context):
+        run_id = run_context["run_ids"][0]
+        files = _insert_files(db, run_context["experiment_id"], "pin-duplicate", version=3)
+
+        _reject(
+            db, psycopg.errors.RaiseException,
+            "select public.pin_attempt_files(%s, 3, %s::uuid[])",
+            (run_id, [files[0], files[0]]), match="ATTEMPT_FILES_DUPLICATE",
+        )
+
+        assert self._state(db, run_id, 3) == (None, [])
+
+    def test_file_from_another_experiment_is_rejected_without_sealing(self, db, run_context):
+        run_id = run_context["run_ids"][0]
+        foreign_experiment = str(uuid4())
+        db.execute(
+            "insert into public.experiments "
+            "(id, project_id, paper_id, spec_id, name, status) "
+            "values (%s, %s, %s, %s, 'foreign-code', 'planning')",
+            (foreign_experiment, run_context["project_id"],
+             run_context["paper_id"], run_context["spec_id"]),
+        )
+        foreign_file = _insert_files(
+            db, foreign_experiment, "foreign-code", count=1, version=3
+        )
+
+        _reject(
+            db, psycopg.errors.ForeignKeyViolation,
+            "select public.pin_attempt_files(%s, 3, %s::uuid[])",
+            (run_id, foreign_file),
+        )
+
+        assert self._state(db, run_id, 3) == (None, [])
+
+    def test_unknown_run_is_rejected(self, db):
+        _reject(
+            db, psycopg.errors.RaiseException,
+            "select public.pin_attempt_files(%s, 1, array[]::uuid[])",
+            (uuid4(),), match="ATTEMPT_RUN_NOT_FOUND",
+        )
+
+    def test_sealed_flag_cannot_be_cleared(self, db, run_context):
+        run_id = run_context["run_ids"][0]
+        self._pin(db, run_id, 3, [])
+
+        _reject(
+            db, psycopg.errors.RaiseException,
+            "update public.execution_attempts set files_pinned = false "
+            "where run_id = %s and attempt = 3",
+            (run_id,), match="files_pinned",
+        )
+
+    def test_rpc_locks_the_attempt_row(self, committed_pin_context):
+        dbname, run_id, files = committed_pin_context
+        with psycopg.connect(
+            DSN, dbname=dbname, autocommit=False, row_factory=dict_row
+        ) as holder:
+            plan_id = holder.execute(
+                "select plan_id from public.execution_runs where id = %s", (run_id,)
+            ).fetchone()["plan_id"]
+            holder.execute(
+                "insert into public.execution_attempts "
+                "(run_id, attempt, plan_id, plan_version, code_version, status) "
+                "values (%s, 1, %s, 1, 1, 'running')",
+                (run_id, plan_id),
+            )
+            # Release the parent-row KEY SHARE lock taken by the FK check so the
+            # waiter can only block on the RPC's explicit attempt-row lock.
+            holder.commit()
+            holder.execute(
+                "select 1 from public.execution_attempts where run_id = %s and attempt = 1 "
+                "for update",
+                (run_id,),
+            )
+            with psycopg.connect(
+                DSN, dbname=dbname, autocommit=False, row_factory=dict_row
+            ) as waiter:
+                waiter.execute("set local lock_timeout = '300ms'")
+                with pytest.raises(psycopg.errors.LockNotAvailable):
+                    waiter.execute(
+                        "select public.pin_attempt_files(%s, 1, %s::uuid[])",
+                        (run_id, files[0]),
+                    )
+            holder.rollback()
+
+    def test_concurrent_different_pins_conflict_instead_of_union(
+        self, committed_pin_context
+    ):
+        dbname, run_id, file_sets = committed_pin_context
+        barrier = threading.Barrier(2)
+        outcomes = []
+
+        def pin(file_ids):
+            try:
+                with psycopg.connect(
+                    DSN, dbname=dbname, autocommit=False, row_factory=dict_row
+                ) as connection:
+                    connection.execute("set local statement_timeout = '10s'")
+                    barrier.wait(timeout=5)
+                    connection.execute(
+                        "select public.pin_attempt_files(%s, 1, %s::uuid[])",
+                        (run_id, file_ids),
+                    )
+                outcomes.append((file_ids, None))
+            except Exception as exc:  # surfaced with its SQLSTATE in the main thread
+                outcomes.append((file_ids, exc))
+
+        threads = [
+            threading.Thread(target=pin, args=(file_ids,), daemon=True)
+            for file_ids in file_sets
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=15)
+        assert all(not thread.is_alive() for thread in threads)
+        assert len(outcomes) == 2
+        assert sum(error is None for _, error in outcomes) == 1
+        conflict = next(error for _, error in outcomes if error is not None)
+        assert isinstance(conflict, psycopg.errors.RaiseException)
+        assert "ATTEMPT_FILES_CONFLICT" in str(conflict)
+        winner = next(file_ids for file_ids, error in outcomes if error is None)
+
+        with psycopg.connect(
+            DSN, dbname=dbname, autocommit=True, row_factory=dict_row
+        ) as connection:
+            sealed, pinned = TestPinningRpc._state(connection, run_id, 1)
+        assert sealed == {"files_pinned": True}
+        assert pinned == sorted(winner)
+
+    def test_rpc_execute_is_limited_to_service_role(self, db):
+        db.execute(
+            "select has_function_privilege('anon', "
+            "'public.pin_attempt_files(uuid,integer,uuid[])', 'execute') as anon, "
+            "has_function_privilege('authenticated', "
+            "'public.pin_attempt_files(uuid,integer,uuid[])', 'execute') as authenticated, "
+            "has_function_privilege('service_role', "
+            "'public.pin_attempt_files(uuid,integer,uuid[])', 'execute') as service_role"
+        )
+        assert db.fetchone() == {
+            "anon": False, "authenticated": False, "service_role": True,
+        }
+
+
 class TestProjectionRpc:
     def test_rpc_replaces_projection_without_changing_history(self, db, run_context):
         run_id = run_context["run_ids"][0]
@@ -501,7 +809,7 @@ class TestProjectionRpc:
             "where run_id = %s order by generated_file_id",
             (run_id,),
         )
-        assert [row["generated_file_id"] for row in db.fetchall()] == sorted(files)
+        assert [str(row["generated_file_id"]) for row in db.fetchall()] == sorted(files)
         db.execute(
             "select * from public.execution_attempts where run_id = %s order by attempt",
             (run_id,),

@@ -27,9 +27,14 @@ create table public.execution_attempts (
   run_id uuid not null references public.execution_runs(id) on delete cascade,
   attempt integer not null check (attempt > 0),
   -- Legacy failed runs may lack a plan_id; new runs always populate it.
-  plan_id uuid references public.experiment_plans(id),
+  -- Deferred NO ACTION permits Project cleanup regardless of cascade order,
+  -- while still preventing a plan from being deleted out from under history.
+  plan_id uuid references public.experiment_plans(id)
+    deferrable initially deferred,
   plan_version integer not null default 1 check (plan_version > 0),
   code_version integer not null default 0 check (code_version >= 0),
+  -- Distinguishes an explicitly sealed empty file set from an unpinned attempt.
+  files_pinned boolean not null default false,
   status text not null default 'queued'
     check (status in ('queued', 'dispatching', 'running', 'succeeded',
                       'failed', 'timeout', 'cancelled')),
@@ -70,7 +75,10 @@ create trigger execution_attempts_set_updated_at
 create table public.execution_attempt_files (
   run_id uuid not null references public.execution_runs(id) on delete cascade,
   attempt integer not null,
-  generated_file_id uuid not null references public.generated_files(id),
+  -- Deferred NO ACTION allows Experiment/Project cleanup to remove runs and
+  -- history first, without letting direct code deletion cascade history away.
+  generated_file_id uuid not null references public.generated_files(id)
+    deferrable initially deferred,
   primary key (run_id, attempt, generated_file_id),
   foreign key (run_id, attempt)
     references public.execution_attempts (run_id, attempt) on delete cascade
@@ -129,6 +137,16 @@ where exists (
 )
 on conflict (run_id, attempt, generated_file_id) do nothing;
 
+-- Existing non-empty projections were already explicitly pinned. Empty legacy
+-- projections remain unpinned so a queued run can still receive its first pin.
+update public.execution_attempts ea
+set files_pinned = true
+where ea.attempt = 1
+  and exists (
+    select 1 from public.execution_run_files p
+    where p.run_id = ea.run_id
+  );
+
 -- Legacy artifact rows (attempt IS NULL) belong to attempt=1. Their on-disk
 -- storage_path stays at ``{run_id}/attempt-0/...``; readers must use
 -- ``storage_path`` verbatim and never re-name the underlying objects.
@@ -179,6 +197,9 @@ alter table public.execution_artifacts
   foreign key (run_id, attempt)
   references public.execution_attempts (run_id, attempt);
 
+-- Validate and clear deferred FK events before later ALTER TABLE statements.
+set constraints all immediate;
+
 -- ============================================================
 -- 5. Append-only enforcement for attempt history.
 --    Direct DELETE is blocked, while FK cascades from Run/Project cleanup are
@@ -220,9 +241,18 @@ declare
   v_old_rank integer;
   v_new_rank integer;
 begin
+  -- A file set is write-once, including an explicitly empty set.
+  if OLD.files_pinned and not NEW.files_pinned then
+    raise exception 'execution attempt files_pinned cannot be unsealed';
+  end if;
+
   -- The updated_at trigger is housekeeping and may touch even a sealed row.
+  -- The one permitted mutation on a terminal row is its initial file-set seal;
+  -- this lets late/legacy pinning distinguish [] from an unpinned attempt.
   if OLD.status in ('succeeded', 'failed', 'timeout', 'cancelled') then
-    if (to_jsonb(NEW) - 'updated_at') is distinct from (to_jsonb(OLD) - 'updated_at') then
+    if (to_jsonb(NEW) - 'updated_at' - 'files_pinned')
+        is distinct from
+       (to_jsonb(OLD) - 'updated_at' - 'files_pinned') then
       raise exception 'terminal execution attempt is sealed and cannot be rewritten';
     end if;
     return NEW;
@@ -304,7 +334,155 @@ create trigger execution_attempt_files_immutable
   for each row execute function public.execution_attempt_files_immutable();
 
 -- ============================================================
--- 6. Atomic final-attempt projection replacement.
+-- 6. Atomic exact file-set pinning.
+--    The run lock serializes first-time attempt creation; the attempt row lock
+--    serializes sealing and comparison. An empty array is a real pinned set.
+-- ============================================================
+-- Python's uuid5(NAMESPACE_URL, f"reproagent:execution:{run_id}:attempt:{n}")
+-- is the unchanged 0-based Runner request identity. Keep SQL-created attempts
+-- on that same identity without adding a fourth RPC argument.
+create or replace function public.execution_attempt_request_id(
+  p_run_id uuid,
+  p_repair_attempt integer
+)
+returns uuid
+language sql
+immutable strict parallel safe
+set search_path = public, pg_temp
+as $$
+  select (
+    substr(v.hash, 1, 8) || '-' ||
+    substr(v.hash, 9, 4) || '-5' || substr(v.hash, 14, 3) || '-' ||
+    substr('89ab', mod(
+      strpos('0123456789abcdef', substr(v.hash, 17, 1)) - 1, 4
+    ) + 1, 1) ||
+    substr(v.hash, 18, 3) || '-' || substr(v.hash, 21, 12)
+  )::uuid
+  from (
+    select encode(digest(
+      decode('6ba7b8119dad11d180b400c04fd430c8', 'hex') ||
+      convert_to(
+        'reproagent:execution:' || p_run_id::text || ':attempt:' || p_repair_attempt::text,
+        'UTF8'
+      ),
+      'sha1'
+    ), 'hex') as hash
+  ) v;
+$$;
+
+revoke all on function public.execution_attempt_request_id(uuid, integer)
+  from public, anon, authenticated;
+grant execute on function public.execution_attempt_request_id(uuid, integer)
+  to service_role;
+
+create or replace function public.pin_attempt_files(
+  p_run_id uuid,
+  p_attempt integer,
+  p_file_ids uuid[]
+)
+returns void
+language plpgsql
+security invoker
+set search_path = public, pg_temp
+as $$
+declare
+  v_run public.execution_runs%rowtype;
+  v_attempt public.execution_attempts%rowtype;
+begin
+  if p_attempt is null or p_attempt < 1 then
+    raise exception 'ATTEMPT_MUST_BE_POSITIVE';
+  end if;
+  if p_file_ids is null then
+    raise exception 'ATTEMPT_FILES_REQUIRED';
+  end if;
+
+  -- Validate ownership of the run and serialize concurrent creation of the
+  -- same missing attempt row. Existing attempt identity is never overwritten.
+  select * into v_run from public.execution_runs where id = p_run_id for update;
+  if not found then
+    raise exception 'ATTEMPT_RUN_NOT_FOUND';
+  end if;
+
+  insert into public.execution_attempts (
+    run_id, attempt, plan_id, plan_version, code_version, status,
+    runner_request_id, runner_run_id
+  )
+  values (
+    v_run.id, p_attempt, v_run.plan_id, coalesce(v_run.plan_version, 1),
+    v_run.code_version,
+    case when p_attempt = coalesce(v_run.repair_attempt, 0) + 1
+      then v_run.status else 'queued' end,
+    public.execution_attempt_request_id(v_run.id, p_attempt - 1),
+    case when p_attempt = coalesce(v_run.repair_attempt, 0) + 1
+      then v_run.runner_run_id::text end
+  )
+  on conflict (run_id, attempt) do nothing;
+
+  -- This is the authoritative serialization point for both first pins and
+  -- repeats. A competing RPC cannot observe an unsealed row after this lock.
+  select * into v_attempt
+  from public.execution_attempts
+  where run_id = p_run_id and attempt = p_attempt
+  for update;
+  if not found then
+    raise exception 'ATTEMPT_NOT_FOUND';
+  end if;
+
+  if exists (
+    select 1 from unnest(p_file_ids) as pending(fid)
+    group by pending.fid having count(*) > 1
+  ) then
+    raise exception 'ATTEMPT_FILES_DUPLICATE';
+  end if;
+
+  -- Generated code is scoped by the run's experiment. A plan pinned on an
+  -- existing attempt must belong to that same context; legacy NULL plans are
+  -- retained for failed pre-plan runs.
+  if v_attempt.plan_id is not null and not exists (
+    select 1 from public.experiment_plans p
+    where p.id = v_attempt.plan_id and p.experiment_id = v_run.experiment_id
+  ) then
+    raise exception 'ATTEMPT_PLAN_CONTEXT_MISMATCH' using errcode = '23503';
+  end if;
+  if exists (
+    select 1 from unnest(p_file_ids) as pending(fid)
+    left join public.generated_files gf
+      on gf.id = pending.fid and gf.experiment_id = v_run.experiment_id
+    where gf.id is null
+  ) then
+    raise exception 'ATTEMPT_FILE_CONTEXT_MISMATCH' using errcode = '23503';
+  end if;
+
+  if v_attempt.files_pinned then
+    if (
+      select coalesce(array_agg(fid order by fid), array[]::uuid[])
+      from unnest(p_file_ids) as pending(fid)
+    ) is distinct from (
+      select coalesce(array_agg(generated_file_id order by generated_file_id), array[]::uuid[])
+      from public.execution_attempt_files
+      where run_id = p_run_id and attempt = p_attempt
+    ) then
+      raise exception 'ATTEMPT_FILES_CONFLICT' using errcode = 'P0001';
+    end if;
+    return;
+  end if;
+
+  insert into public.execution_attempt_files (run_id, attempt, generated_file_id)
+  select p_run_id, p_attempt, pending.fid
+  from unnest(p_file_ids) as pending(fid);
+
+  -- Seal even when the INSERT selected zero rows.
+  update public.execution_attempts set files_pinned = true where id = v_attempt.id;
+end;
+$$;
+
+revoke all on function public.pin_attempt_files(uuid, integer, uuid[])
+  from public, anon, authenticated;
+grant execute on function public.pin_attempt_files(uuid, integer, uuid[])
+  to service_role;
+
+-- ============================================================
+-- 7. Atomic final-attempt projection replacement.
 --    History is not touched. The run lock serializes competing replacements;
 --    any missing attempt/file aborts the whole transaction, including DELETE.
 -- ============================================================
@@ -354,7 +532,7 @@ grant execute on function public.replace_run_projection(uuid, integer, uuid[])
   to service_role;
 
 -- ============================================================
--- 7. Row Level Security: history is readable by the run's owner. All writes
+-- 8. Row Level Security: history is readable by the run's owner. All writes
 --    use the service-role API; unlike RLS alone, the triggers above also block
 --    direct service-role deletes and terminal/identity rewrites.
 -- ============================================================
@@ -368,7 +546,7 @@ create policy attempt_files_owner_select on public.execution_attempt_files
   for select using (public.owns_run(run_id));
 
 -- ============================================================
--- 8. Service-role hardening. authenticated has read-only history access; the
+-- 9. Service-role hardening. authenticated has read-only history access; the
 --    service role is the only application writer. Cascades remain available to
 --    database administrators and Run/Project cleanup paths.
 -- ============================================================

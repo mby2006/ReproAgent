@@ -412,6 +412,68 @@ class FakeAdmin:
                     "failed" if params["p_status"] == "timeout" else params["p_status"]
                 )
             return True
+        if name == "pin_attempt_files":
+            run = next(
+                (row for row in self.tables["execution_runs"]
+                 if row["id"] == params["p_run_id"]),
+                None,
+            )
+            if run is None:
+                raise _rpc_error("ATTEMPT_RUN_NOT_FOUND")
+            file_ids = params["p_file_ids"]
+            if len(file_ids) != len(set(file_ids)):
+                raise _rpc_error("ATTEMPT_FILES_DUPLICATE")
+            known_ids = {
+                row["id"] for row in self.tables["generated_files"]
+                if row["experiment_id"] == run["experiment_id"]
+            }
+            if not set(file_ids) <= known_ids:
+                raise _rpc_error("ATTEMPT_FILE_CONTEXT_MISMATCH", "23503")
+            attempt_rows = self.tables.setdefault("execution_attempts", [])
+            attempt = next(
+                (row for row in attempt_rows
+                 if row["run_id"] == params["p_run_id"]
+                 and row["attempt"] == params["p_attempt"]),
+                None,
+            )
+            if attempt is None:
+                current_attempt = run.get("repair_attempt", 0) + 1
+                attempt = {
+                    "run_id": run["id"],
+                    "attempt": params["p_attempt"],
+                    "plan_id": run.get("plan_id"),
+                    "plan_version": run.get("plan_version") or 1,
+                    "code_version": run.get("code_version") or 0,
+                    "status": (
+                        run.get("status")
+                        if params["p_attempt"] == current_attempt else "queued"
+                    ),
+                    "runner_request_id": str(execution_request_id(
+                        UUID(run["id"]), params["p_attempt"] - 1
+                    )),
+                    "runner_run_id": (
+                        run.get("runner_run_id")
+                        if params["p_attempt"] == current_attempt else None
+                    ),
+                    "files_pinned": False,
+                }
+                attempt_rows.append(attempt)
+            bindings = self.tables.setdefault("execution_attempt_files", [])
+            existing = {
+                row["generated_file_id"] for row in bindings
+                if row["run_id"] == params["p_run_id"] and row["attempt"] == params["p_attempt"]
+            }
+            if attempt.get("files_pinned", False):
+                if existing != set(file_ids):
+                    raise _rpc_error("ATTEMPT_FILES_CONFLICT")
+                return True
+            bindings.extend(
+                {"run_id": params["p_run_id"], "attempt": params["p_attempt"],
+                 "generated_file_id": fid}
+                for fid in file_ids
+            )
+            attempt["files_pinned"] = True
+            return True
         if name == "replace_run_projection":
             attempt = next(
                 (row for row in self.tables["execution_attempts"]

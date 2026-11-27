@@ -661,6 +661,22 @@ def test_pin_attempt_files_is_idempotent_for_same_attempt_and_files():
     assert len(file_rows) == 3  # not duplicated
 
 
+def test_pin_attempt_files_rejects_nonempty_after_an_explicit_empty_pin():
+    from reproagent_api.services.runs import pin_attempt_files
+
+    admin, state, _, run_id, _ = _seed_attempt_run(attempt=0)
+    replacement = _insert_generated_files(admin, state["experiment_id"], "v1", count=1)
+    pin_attempt_files(admin, run_id, 1, [])
+
+    with pytest.raises(ValueError, match="already pinned a different file set"):
+        pin_attempt_files(admin, run_id, 1, replacement)
+
+    assert [
+        row for row in admin.tables["execution_attempt_files"]
+        if row["run_id"] == run_id and row["attempt"] == 1
+    ] == []
+
+
 def test_pin_attempt_files_rejects_a_different_file_set_without_union():
     from reproagent_api.services.runs import pin_attempt_files
 
@@ -687,9 +703,22 @@ def test_pin_attempt_files_same_set_in_different_order_is_a_noop():
     pin_attempt_files(admin, run_id, 1, ids)
     before = [dict(row) for row in admin.tables["execution_attempt_files"]]
 
-    pin_attempt_files(admin, run_id, 1, list(reversed(ids)) + [ids[0]])
+    pin_attempt_files(admin, run_id, 1, list(reversed(ids)))
 
     assert admin.tables["execution_attempt_files"] == before
+
+
+def test_pin_attempt_files_rejects_duplicate_input_ids():
+    from reproagent_api.services.runs import pin_attempt_files
+
+    admin, state, _, run_id, _ = _seed_attempt_run(attempt=0)
+    ids = _insert_generated_files(admin, state["experiment_id"], "v1", count=1)
+
+    with pytest.raises(ValueError, match="must not contain duplicates"):
+        pin_attempt_files(admin, run_id, 1, ids + ids)
+
+    assert admin.tables["execution_attempts"] == []
+    assert admin.tables["execution_attempt_files"] == []
 
 
 def test_pin_run_files_replaces_projection_with_one_rpc():

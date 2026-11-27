@@ -12,6 +12,7 @@ import hashlib
 from datetime import UTC, datetime
 from uuid import NAMESPACE_URL, UUID, uuid5
 
+from postgrest.exceptions import APIError
 from reproagent_schemas import (
     Assumption,
     AssumptionKind,
@@ -190,40 +191,37 @@ def _attempt_row_from_run(run_row: dict, attempt: int, *, status: str | None = N
 
 
 def pin_attempt_files(admin, run_id: str, attempt: int, file_ids: list[str]) -> None:
-    """Pin one exact file set to an attempt, append-only.
+    """Atomically seal one exact file set through the database RPC.
 
-    Repeating the same set (independent of order or duplicates) is a no-op. A
-    different set is a conflict: bindings are never unioned or rewritten.
+    The RPC creates or locks the attempt, validates the run's code context, and
+    seals the set (including ``[]``). Repeating an identical set is a no-op;
+    changing it raises a conflict. No read/check/write sequence occurs in Python.
     """
     if attempt < 1:
         raise ValueError(f"attempt must be 1-based, got {attempt}")
-    run_rows = admin.table("execution_runs").select("*").eq("id", run_id).execute().data
-    if not run_rows:
-        raise ValueError("Attempt pinning requires an existing execution run")
-    ensure_attempt_row(admin, run_rows[0], attempt)
-    existing_rows = (
-        admin.table("execution_attempt_files")
-        .select("generated_file_id")
-        .eq("run_id", run_id)
-        .eq("attempt", attempt)
-        .execute()
-        .data
-    )
-    existing = {row["generated_file_id"] for row in existing_rows}
-    requested = set(file_ids)
-    if existing and existing != requested:
-        raise ValueError(
-            f"Attempt {attempt} already pinned a different file set; "
-            "create a new attempt instead of changing history"
-        )
-    if existing:
-        return
-    if not requested:
-        return
-    admin.table("execution_attempt_files").insert(
-        [{"run_id": run_id, "attempt": attempt, "generated_file_id": fid}
-         for fid in dict.fromkeys(file_ids)]
-    ).execute()
+    try:
+        admin.rpc("pin_attempt_files", {
+            "p_run_id": run_id,
+            "p_attempt": attempt,
+            "p_file_ids": file_ids,
+        })
+    except APIError as exc:
+        if exc.message == "ATTEMPT_FILES_CONFLICT":
+            raise ValueError(
+                f"Attempt {attempt} already pinned a different file set; "
+                "create a new attempt instead of changing history"
+            ) from exc
+        if exc.message == "ATTEMPT_FILE_CONTEXT_MISMATCH":
+            raise ValueError(
+                "generated file does not exist or belongs to another experiment"
+            ) from exc
+        if exc.message == "ATTEMPT_PLAN_CONTEXT_MISMATCH":
+            raise ValueError("attempt plan belongs to another experiment") from exc
+        if exc.message == "ATTEMPT_FILES_DUPLICATE":
+            raise ValueError("attempt file ids must not contain duplicates") from exc
+        if exc.message == "ATTEMPT_RUN_NOT_FOUND":
+            raise ValueError("Attempt pinning requires an existing execution run") from exc
+        raise
 
 
 def ensure_attempt_row(admin, run_row: dict, attempt: int, *, status: str | None = None) -> dict:

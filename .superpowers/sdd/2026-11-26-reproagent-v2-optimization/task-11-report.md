@@ -2,7 +2,7 @@
 
 ## Status
 
-DONE_WITH_CONCERNS
+DONE
 
 - Branch: `chore/p0-p1-p2-hardening`
 - Base: `ccd1bc94af3cfa2888910d8ff6eb4a611dcae1e7`
@@ -241,3 +241,11 @@ git diff --check
 - This fix round added deterministic API-boundary regression tests but did not repeat the prior real-browser acceptance or execute a new scientific training run.
 - No acceptance evidence artifacts, production accounts, or secrets were created or used.
 - Existing unrelated untracked paths `apps/web/report-v2.md`, `docs/superpowers/`, and `report-v2.md` were left untouched.
+
+## Independent re-review
+
+- Verdict: APPROVED; no findings.
+- All three prior Important findings are resolved: paper provenance is gated to `paper_explicit`, load/generation failures no longer render `尚未执行`, and report selection walks Runs newest-to-oldest while requiring the current immutable Plan version.
+- The reviewer confirmed the fixed eight-item order, `无可用证据` copy, five-column detailed table, responsive summary, and regression coverage remain intact.
+- Reviewer independently ran 78/78 Web tests, lint, and TypeScript checks.
+- Scoped review package: `review-e74e5d0..0a1598f.diff`.

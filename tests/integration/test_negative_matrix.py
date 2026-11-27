@@ -1078,8 +1078,6 @@ def test_service_role_grants_are_scoped_to_production_writes(harness):
         "agent_traces": {"select", "insert"},
         "job_outbox": {"select", "insert", "update"},
         "execution_run_idempotency": {"select", "insert"},
-        "storage.objects": {"select", "insert", "delete"},
-        "storage.buckets": {"select", "insert"},
     }
     privileges = ("select", "insert", "update", "delete", "truncate", "references", "trigger")
     for table, allowed in expected.items():

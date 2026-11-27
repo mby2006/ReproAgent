@@ -139,10 +139,5 @@ revoke all on public.execution_run_idempotency from service_role;
 grant select, insert, update on public.job_outbox to service_role;
 grant select, insert on public.execution_run_idempotency to service_role;
 
--- Private paper/run storage is used by the same service-role API for upload,
--- download and owner-authorized cleanup. No object UPDATE is required. RLS stays
--- enabled and continues to protect authenticated/anon access.
-revoke all on storage.objects from service_role;
-revoke all on storage.buckets from service_role;
-grant select, insert, delete on storage.objects to service_role;
-grant select, insert on storage.buckets to service_role;
+-- Storage ACLs are platform-managed by Supabase; the real-Supabase E2E
+-- validates the service-role privileges required by upload/upsert/download.

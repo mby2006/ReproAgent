@@ -24,9 +24,11 @@ from pathlib import Path
 from uuid import uuid4
 
 import httpx
+import psycopg
 import pytest
 import pytest_asyncio
 from fastapi.testclient import TestClient
+from psycopg.rows import dict_row
 from reproagent_agent.codegen import (
     classify_error,
     generate_from_plan,
@@ -274,6 +276,37 @@ async def completed_workflow(settings, alice_client, runner):
 
 
 class TestFullClosedLoop:
+    def test_service_role_has_required_storage_privileges(self, settings):
+        """Prove required platform Storage ACLs, not an exact application-owned matrix."""
+        with psycopg.connect(
+            settings.supabase_db_url, connect_timeout=5, row_factory=dict_row
+        ) as connection:
+            privileges = connection.execute(
+                "select "
+                "has_table_privilege('service_role', 'storage.objects', 'SELECT') "
+                "as object_select, "
+                "has_table_privilege('service_role', 'storage.objects', 'INSERT') "
+                "as object_insert, "
+                "has_table_privilege('service_role', 'storage.objects', 'UPDATE') "
+                "as object_update, "
+                "has_table_privilege('service_role', 'storage.objects', 'DELETE') "
+                "as object_delete, "
+                "has_table_privilege('service_role', 'storage.buckets', 'SELECT') "
+                "as bucket_select, "
+                "has_table_privilege('service_role', 'storage.buckets', 'INSERT') "
+                "as bucket_insert"
+            ).fetchone()
+        # Supabase may grant additional platform-managed privileges. The closed
+        # loop below exercises the actual service-role upload/upsert/download path.
+        assert privileges == {
+            "object_select": True,
+            "object_insert": True,
+            "object_update": True,
+            "object_delete": True,
+            "bucket_select": True,
+            "bucket_insert": True,
+        }
+
     async def test_upload_to_report_with_real_training(self, alice_client, completed_workflow):
         workflow_id = completed_workflow["workflow_id"]
         experiment_id = completed_workflow["experiment_id"]

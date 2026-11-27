@@ -86,43 +86,17 @@ create index execution_attempt_files_file_idx
 alter table public.execution_artifacts
   add column attempt integer;
 
--- Enforce that attempt aligns with an existing execution_attempts row when set;
--- NULL remains allowed for legacy rows whose attempt has not yet been backfilled.
--- Postgres CHECK cannot reference another table, so a BEFORE INSERT/UPDATE trigger
--- enforces (run_id, attempt) exists in execution_attempts when attempt IS NOT NULL.
-create or replace function public.execution_artifacts_attempt_fk()
-returns trigger
-language plpgsql
-security invoker
-set search_path = public, pg_temp
-as $$
-begin
-  if NEW.attempt is not null and not exists (
-    select 1 from public.execution_attempts ea
-    where ea.run_id = NEW.run_id and ea.attempt = NEW.attempt
-  ) then
-    -- Allow artifacts written before their parent attempt row (persist path may
-    -- write an artifact row and then create the attempt row). Missing attempts
-    -- are silently accepted here; the API's pin_attempt_files always creates the
-    -- attempt row first, so this trigger only defends against manual writers.
-    null;
-  end if;
-  return NEW;
-end;
-$$;
-
-create trigger execution_artifacts_attempt_fk_trigger
-  before insert or update on public.execution_artifacts
-  for each row execute function public.execution_artifacts_attempt_fk();
+-- Null remains allowed for legacy rows whose attempt has not yet been backfilled.
+-- The composite FK below is added only after every artifact has a parent attempt.
 
 -- Scoped lookups by attempt.
 create index execution_artifacts_run_attempt_idx
   on public.execution_artifacts (run_id, attempt, created_at);
 
 -- ============================================================
--- 4. Backfill: existing runs get attempt=1 (1-based).
---    ``repair_attempt`` was 0-based for every persisted run, so history
---    attempt 1 maps to the sole persisted attempt today.
+-- 4. Backfill existing history before enforcing artifact parentage.
+--    Every existing run gets attempt=1. Artifact metadata is then mapped from
+--    its actual 0-based value, and any additional parent attempts are created.
 -- ============================================================
 insert into public.execution_attempts (
   run_id, attempt, plan_id, plan_version, code_version, status,
@@ -174,12 +148,146 @@ where attempt is null
   and (metadata_json->>'attempt') is not null
   and (metadata_json->>'attempt')::text <> '0';
 
+-- Artifacts are evidence that their attempt existed. Backfill EVERY distinct
+-- mapped (run_id, attempt), not just attempt=1, before enforcing the FK. Without
+-- this step an in-flight repair could leave attempt-2 artifacts with no parent.
+insert into public.execution_attempts (
+  run_id, attempt, plan_id, plan_version, code_version, status,
+  runner_run_id, dispatch_started_at, finished_at, created_at
+)
+select
+  r.id,
+  a.attempt,
+  r.plan_id,
+  coalesce(r.plan_version, 1),
+  coalesce(r.code_version, 0),
+  case when a.attempt = r.repair_attempt + 1 then r.status else 'queued' end,
+  case when a.attempt = r.repair_attempt + 1 then r.runner_run_id::text end,
+  case when a.attempt = r.repair_attempt + 1 then r.started_at end,
+  case when a.attempt = r.repair_attempt + 1 then r.finished_at end,
+  min(a.created_at)
+from public.execution_artifacts a
+join public.execution_runs r on r.id = a.run_id
+where a.attempt is not null
+group by r.id, a.attempt
+on conflict (run_id, attempt) do nothing;
+
+-- NULL remains valid for untagged legacy rows; every non-NULL artifact attempt
+-- must now have a real parent. UPDATE is covered as well as INSERT.
+alter table public.execution_artifacts
+  add constraint execution_artifacts_run_attempt_fk
+  foreign key (run_id, attempt)
+  references public.execution_attempts (run_id, attempt);
+
 -- ============================================================
 -- 5. Append-only enforcement for attempt history.
---    Rows may be inserted and status may advance on the attempt row (running
---    -> succeeded/failed/...), but a repair must NEVER rewrite a different
---    attempt's row or file bindings. Delete is only via cascade.
+--    Direct DELETE is blocked, while FK cascades from Run/Project cleanup are
+--    allowed (cascade triggers run at pg_trigger_depth() > 0). Open attempts may
+--    advance lifecycle/error/timestamp fields, but identity is immutable and
+--    plan/code pins are fixed once running. A sealed terminal row permits only
+--    an idempotent no-op.
 -- ============================================================
+create or replace function public.execution_attempt_history_no_delete()
+returns trigger
+language plpgsql
+security invoker
+set search_path = public, pg_temp
+as $$
+begin
+  -- Top-level DELETE triggers run at depth 1; FK cascade triggers nest deeper.
+  if pg_trigger_depth() <= 1 then
+    raise exception 'execution attempt history is append-only; delete is allowed only by cascade';
+  end if;
+  return OLD;
+end;
+$$;
+
+create trigger execution_attempts_no_delete
+  before delete on public.execution_attempts
+  for each row execute function public.execution_attempt_history_no_delete();
+
+create trigger execution_attempt_files_no_delete
+  before delete on public.execution_attempt_files
+  for each row execute function public.execution_attempt_history_no_delete();
+
+create or replace function public.execution_attempts_append_only()
+returns trigger
+language plpgsql
+security invoker
+set search_path = public, pg_temp
+as $$
+declare
+  v_old_rank integer;
+  v_new_rank integer;
+begin
+  -- The updated_at trigger is housekeeping and may touch even a sealed row.
+  if OLD.status in ('succeeded', 'failed', 'timeout', 'cancelled') then
+    if (to_jsonb(NEW) - 'updated_at') is distinct from (to_jsonb(OLD) - 'updated_at') then
+      raise exception 'terminal execution attempt is sealed and cannot be rewritten';
+    end if;
+    return NEW;
+  end if;
+
+  if (NEW.id, NEW.run_id, NEW.attempt, NEW.created_at)
+    is distinct from
+     (OLD.id, OLD.run_id, OLD.attempt, OLD.created_at) then
+    raise exception 'execution attempt identity is immutable';
+  end if;
+
+  -- A queued pin can precede code generation/projection updates. Opening it for
+  -- execution binds the final plan/code versions; a running attempt cannot fork.
+  if (NEW.plan_id, NEW.plan_version, NEW.code_version)
+      is distinct from (OLD.plan_id, OLD.plan_version, OLD.code_version)
+     and (OLD.status = 'running' or NEW.status <> 'running') then
+    raise exception 'execution attempt plan/code pins cannot be rewritten';
+  end if;
+
+  v_old_rank := case OLD.status when 'queued' then 0 when 'dispatching' then 1 else 2 end;
+  v_new_rank := case NEW.status when 'queued' then 0 when 'dispatching' then 1 else 2 end;
+  if NEW.status <> OLD.status
+     and NEW.status not in ('succeeded', 'failed', 'timeout', 'cancelled')
+     and v_new_rank < v_old_rank then
+    raise exception 'execution attempt status cannot regress';
+  end if;
+
+  -- Runner identities are write-once. Pin the deterministic request id before
+  -- dispatch, then attach the accepted Runner run id without rewriting either.
+  if OLD.runner_request_id is not null
+     and NEW.runner_request_id is distinct from OLD.runner_request_id then
+    raise exception 'execution attempt runner_request_id is immutable once set';
+  end if;
+  if OLD.runner_run_id is not null
+     and NEW.runner_run_id is distinct from OLD.runner_run_id then
+    raise exception 'execution attempt runner_run_id is immutable once set';
+  end if;
+
+  -- Lifecycle timestamps may be filled in, but never cleared or moved backwards.
+  if OLD.dispatch_started_at is not null
+     and (NEW.dispatch_started_at is null or NEW.dispatch_started_at < OLD.dispatch_started_at) then
+    raise exception 'execution attempt dispatch_started_at cannot regress';
+  end if;
+  if OLD.runner_accepted_at is not null
+     and (NEW.runner_accepted_at is null or NEW.runner_accepted_at < OLD.runner_accepted_at) then
+    raise exception 'execution attempt runner_accepted_at cannot regress';
+  end if;
+  if OLD.finished_at is not null
+     and (NEW.finished_at is null or NEW.finished_at < OLD.finished_at) then
+    raise exception 'execution attempt finished_at cannot regress';
+  end if;
+  if NEW.finished_at is not null
+     and NEW.status not in ('succeeded', 'failed', 'timeout', 'cancelled') then
+    raise exception 'open execution attempt cannot have finished_at';
+  end if;
+  return NEW;
+end;
+$$;
+
+-- Alphabetically before set_updated_at so terminal no-ops can ignore only the
+-- timestamp maintained by that housekeeping trigger.
+create trigger execution_attempts_append_only
+  before update on public.execution_attempts
+  for each row execute function public.execution_attempts_append_only();
+
 create or replace function public.execution_attempt_files_immutable()
 returns trigger
 language plpgsql
@@ -196,36 +304,73 @@ create trigger execution_attempt_files_immutable
   for each row execute function public.execution_attempt_files_immutable();
 
 -- ============================================================
--- 6. Row Level Security: history is readable by the run's owner and writable
---    only through the service-role API paths. No update/delete policies ->
---    PostgREST forbids them; FK cascade remains the only removal path.
+-- 6. Atomic final-attempt projection replacement.
+--    History is not touched. The run lock serializes competing replacements;
+--    any missing attempt/file aborts the whole transaction, including DELETE.
+-- ============================================================
+create or replace function public.replace_run_projection(
+  p_run_id uuid,
+  p_attempt integer,
+  p_file_ids uuid[]
+)
+returns void
+language plpgsql
+security invoker
+set search_path = public, pg_temp
+as $$
+begin
+  if p_attempt is null or p_attempt < 1 then
+    raise exception 'projection attempt must be positive';
+  end if;
+  perform 1 from public.execution_runs where id = p_run_id for update;
+  if not found then
+    raise exception 'projection run does not exist';
+  end if;
+  if not exists (
+    select 1 from public.execution_attempts
+    where run_id = p_run_id and attempt = p_attempt
+  ) then
+    raise exception 'projection attempt does not belong to run';
+  end if;
+  if exists (
+    select 1 from unnest(p_file_ids) as pending(fid)
+    left join public.generated_files gf on gf.id = pending.fid
+    where gf.id is null
+  ) then
+    raise exception 'projection contains an unknown generated file'
+      using errcode = '23503';
+  end if;
+
+  delete from public.execution_run_files where run_id = p_run_id;
+  insert into public.execution_run_files (run_id, generated_file_id)
+  select distinct p_run_id, pending.fid
+  from unnest(coalesce(p_file_ids, array[]::uuid[])) as pending(fid);
+end;
+$$;
+
+revoke all on function public.replace_run_projection(uuid, integer, uuid[])
+  from public, anon, authenticated;
+grant execute on function public.replace_run_projection(uuid, integer, uuid[])
+  to service_role;
+
+-- ============================================================
+-- 7. Row Level Security: history is readable by the run's owner. All writes
+--    use the service-role API; unlike RLS alone, the triggers above also block
+--    direct service-role deletes and terminal/identity rewrites.
 -- ============================================================
 alter table public.execution_attempts enable row level security;
 alter table public.execution_attempt_files enable row level security;
 
 create policy attempts_owner_select on public.execution_attempts
   for select using (public.owns_run(run_id));
-create policy attempts_owner_insert on public.execution_attempts
-  for insert with check (public.owns_run(run_id));
--- Advance the status of a non-terminal attempt (dispatch -> running -> terminal)
--- but never rewrite history once sealed.
-create policy attempts_owner_update on public.execution_attempts
-  for update using (public.owns_run(run_id))
-  with check (public.owns_run(run_id));
--- Deliberately no delete policy: only cascade from execution_runs / projects.
 
 create policy attempt_files_owner_select on public.execution_attempt_files
   for select using (public.owns_run(run_id));
-create policy attempt_files_owner_insert on public.execution_attempt_files
-  for insert with check (public.owns_run(run_id));
--- Deliberately no update/delete policies.
 
 -- ============================================================
--- 7. Service-role hardening.
---    Attempt history and its file bindings are the authoritative audit trail;
---    application roles other than service_role have no write path beyond RLS
---    owner policies. This mirrors the pattern already applied to
---    execution_run_idempotency in Task 5.
+-- 8. Service-role hardening. authenticated has read-only history access; the
+--    service role is the only application writer. Cascades remain available to
+--    database administrators and Run/Project cleanup paths.
 -- ============================================================
 revoke all on public.execution_attempts from anon, authenticated;
 grant select on public.execution_attempts to authenticated;

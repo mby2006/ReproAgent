@@ -162,49 +162,68 @@ def pin_run_files(admin, run_id: str, file_ids: list[str], *, attempt: int | Non
     if attempt < 1:
         raise ValueError(f"attempt must be 1-based, got {attempt}")
     # Append the immutable history FIRST so an error inside the projection
-    # cannot lose evidence that these files were bound.
+    # cannot lose evidence that these files were bound. The projection itself is
+    # deleted and reinserted by one database transaction.
     pin_attempt_files(admin, run_id, attempt, file_ids)
-    admin.table("execution_run_files").delete().eq("run_id", run_id).execute()
-    admin.table("execution_run_files").insert(
-        [{"run_id": run_id, "generated_file_id": fid} for fid in file_ids]
-    ).execute()
+    admin.rpc("replace_run_projection", {
+        "p_run_id": run_id,
+        "p_attempt": attempt,
+        "p_file_ids": file_ids,
+    })
 
 
 def _attempt_row_from_run(run_row: dict, attempt: int, *, status: str | None = None) -> dict:
-    runner_request = run_row.get("runner_request_id")
+    # The history ordinal is 1-based, but Runner idempotency remains 0-based.
+    runner_request = execution_request_id(UUID(run_row["id"]), attempt - 1)
+    current_attempt = int(run_row.get("repair_attempt") or 0) + 1
+    inherited_status = run_row.get("status") if attempt == current_attempt else None
     return {
         "run_id": run_row["id"],
         "attempt": attempt,
         "plan_id": run_row.get("plan_id"),
         "plan_version": run_row.get("plan_version") or 1,
         "code_version": run_row.get("code_version") or 0,
-        "status": status or run_row.get("status") or RunStatus.QUEUED.value,
-        "runner_request_id": str(runner_request) if runner_request else None,
-        "runner_run_id": run_row.get("runner_run_id"),
+        "status": status or inherited_status or RunStatus.QUEUED.value,
+        "runner_request_id": str(runner_request),
+        "runner_run_id": run_row.get("runner_run_id") if attempt == current_attempt else None,
     }
 
 
 def pin_attempt_files(admin, run_id: str, attempt: int, file_ids: list[str]) -> None:
-    """Bind a set of generated files to a specific attempt, append-only.
+    """Pin one exact file set to an attempt, append-only.
 
-    Ensures the parent ``execution_attempts`` row exists for ``(run_id, attempt)``
-    using the run row's current plan/code/status, then idempotently inserts each
-    ``(run_id, attempt, generated_file_id)`` binding. Pre-existing bindings for
-    other attempts are never touched.
+    Repeating the same set (independent of order or duplicates) is a no-op. A
+    different set is a conflict: bindings are never unioned or rewritten.
     """
     if attempt < 1:
         raise ValueError(f"attempt must be 1-based, got {attempt}")
     run_rows = admin.table("execution_runs").select("*").eq("id", run_id).execute().data
     if not run_rows:
         raise ValueError("Attempt pinning requires an existing execution run")
-    run_row = run_rows[0]
-    ensure_attempt_row(admin, run_row, attempt)
-    for fid in file_ids:
-        admin.table("execution_attempt_files").upsert(
-            {"run_id": run_id, "attempt": attempt, "generated_file_id": fid},
-            on_conflict="run_id,attempt,generated_file_id",
-            ignore_duplicates=True,
-        ).execute()
+    ensure_attempt_row(admin, run_rows[0], attempt)
+    existing_rows = (
+        admin.table("execution_attempt_files")
+        .select("generated_file_id")
+        .eq("run_id", run_id)
+        .eq("attempt", attempt)
+        .execute()
+        .data
+    )
+    existing = {row["generated_file_id"] for row in existing_rows}
+    requested = set(file_ids)
+    if existing and existing != requested:
+        raise ValueError(
+            f"Attempt {attempt} already pinned a different file set; "
+            "create a new attempt instead of changing history"
+        )
+    if existing:
+        return
+    if not requested:
+        return
+    admin.table("execution_attempt_files").insert(
+        [{"run_id": run_id, "attempt": attempt, "generated_file_id": fid}
+         for fid in dict.fromkeys(file_ids)]
+    ).execute()
 
 
 def ensure_attempt_row(admin, run_row: dict, attempt: int, *, status: str | None = None) -> dict:
@@ -424,10 +443,19 @@ def mark_attempt_running(
     # projection transitioned to running. Existing history is never overwritten.
     history_attempt = attempt + 1
     updated_run = rows[0]
-    ensure_attempt_row(admin, updated_run, history_attempt, status=RunStatus.RUNNING.value)
+    # Pin the plan/code identity at creation; opening the attempt only advances
+    # lifecycle fields, which the database append-only guard permits.
+    attempt_source = {
+        **updated_run,
+        "plan_id": plan_id,
+        "plan_version": plan_version,
+        "code_version": code_version,
+    }
+    ensure_attempt_row(admin, attempt_source, history_attempt, status=RunStatus.RUNNING.value)
     # The ensure helper only inserts if the row is absent; for a re-drive of the
     # same attempt (recovery) the row already exists in a non-terminal state and
-    # must be advanced to running alongside the projection.
+    # must be advanced to running alongside the projection. A queued pin may
+    # precede code/plan projection updates, so opening also binds those values.
     admin.table("execution_attempts").update(
         {"status": RunStatus.RUNNING.value, "code_version": code_version,
          "plan_id": plan_id, "plan_version": plan_version,
@@ -449,7 +477,19 @@ def persist_runner_run_id(admin, run_id: str, runner_run_id: UUID, attempt: int)
         .execute()
         .data
     )
-    return bool(rows)
+    if not rows:
+        return False
+    # Scope identity to the owning 0-based repair attempt. A later repair resets
+    # only the projection and must never erase the previous attempt's Runner id.
+    update_attempt_status(
+        admin,
+        run_id,
+        attempt + 1,
+        RunStatus.RUNNING.value,
+        runner_request_id=str(execution_request_id(UUID(run_id), attempt)),
+        runner_run_id=str(runner_run_id),
+    )
+    return True
 
 
 def finalize_execution_run(

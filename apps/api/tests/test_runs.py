@@ -45,8 +45,8 @@ from reproagent_schemas import (
     RepairRequest,
     ReportedResult,
     ReproductionCard,
-    ReviewRequest,
     ReviewMode,
+    ReviewRequest,
     RiskTier,
     RunAudit,
     RunResult,
@@ -411,6 +411,29 @@ class FakeAdmin:
                 experiment["status"] = (
                     "failed" if params["p_status"] == "timeout" else params["p_status"]
                 )
+            return True
+        if name == "replace_run_projection":
+            attempt = next(
+                (row for row in self.tables["execution_attempts"]
+                 if row["run_id"] == params["p_run_id"] and row["attempt"] == params["p_attempt"]),
+                None,
+            )
+            if attempt is None:
+                raise ValueError("attempt does not belong to run")
+            file_ids = set(params["p_file_ids"])
+            known_ids = {row["id"] for row in self.tables["generated_files"]}
+            if not file_ids <= known_ids:
+                raise ValueError("generated file does not exist")
+            # Model the SQL RPC's all-or-nothing replacement, including FK failure
+            # after the projection DELETE but before any replacement INSERT.
+            self.tables["execution_run_files"] = [
+                row for row in self.tables["execution_run_files"]
+                if row["run_id"] != params["p_run_id"]
+            ]
+            self.tables["execution_run_files"].extend(
+                {"run_id": params["p_run_id"], "generated_file_id": fid}
+                for fid in params["p_file_ids"]
+            )
             return True
         if name != "create_execution_run":
             raise AssertionError(f"unexpected rpc: {name}")
@@ -1736,15 +1759,21 @@ def test_rpc_non_postgrest_error_is_not_swallowed_as_conflict(env):
 _APPROVAL_READY_CASES = [
     ("assisted_clean", "assisted", "accuracy", [], "none", True),
     ("unsupported_metric", "assisted", "f1_score", [], "none", False),
-    ("critical_unconfirmed_blocks", "assisted", "accuracy", [("critical", False, None)], "none", False),
-    ("critical_confirmed_ok", "assisted", "accuracy", [("critical", True, None)], "none", True),
-    ("routine_unconfirmed_ok", "assisted", "accuracy", [("routine", False, None)], "none", True),
+    ("critical_unconfirmed_blocks", "assisted", "accuracy", [("critical", False, None)],
+     "none", False),
+    ("critical_confirmed_ok", "assisted", "accuracy", [("critical", True, None)],
+     "none", True),
+    ("routine_unconfirmed_ok", "assisted", "accuracy", [("routine", False, None)],
+     "none", True),
     ("info_unconfirmed_ok", "assisted", "accuracy", [("info", False, None)], "none", True),
     ("delegated_clean", "delegated", "accuracy", [], "self", True),
-    ("delegated_critical_blocks", "delegated", "accuracy", [("critical", False, None)], "self", False),
-    ("delegated_routine_blocks", "delegated", "accuracy", [("routine", False, None)], "self", False),
+    ("delegated_critical_blocks", "delegated", "accuracy", [("critical", False, None)],
+     "self", False),
+    ("delegated_routine_blocks", "delegated", "accuracy", [("routine", False, None)],
+     "self", False),
     ("delegated_info_ok", "delegated", "accuracy", [("info", False, None)], "self", True),
-    ("delegated_auto_routine_ok", "delegated", "accuracy", [("routine", False, "auto")], "self", True),
+    ("delegated_auto_routine_ok", "delegated", "accuracy", [("routine", False, "auto")],
+     "self", True),
     ("delegated_actor_mismatch", "delegated", "accuracy", [], "other", False),
 ]
 
@@ -1759,7 +1788,8 @@ def _approval_case_plan(review_mode, target_metric, assumptions, delegation, act
             Assumption(
                 field_path=f"training_config.case_{i}", kind=AssumptionKind.INFERRED,
                 value=0.1, rationale="scenario", requires_confirmation=True,
-                human_confirmed=human, confirmed_by=(ConfirmationSource(confirmed) if confirmed else None),
+                human_confirmed=human,
+                confirmed_by=(ConfirmationSource(confirmed) if confirmed else None),
                 risk_tier=RiskTier(tier),
             )
             for i, (tier, human, confirmed) in enumerate(assumptions)

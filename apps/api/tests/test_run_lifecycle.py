@@ -497,7 +497,6 @@ def test_worker_recovery_never_infers_success_from_workflow(monkeypatch, workflo
         yield True
 
     admin, state, _ = seed_execution(status="running", attempt=1)
-    workflow_id = admin.tables["workflows"][0]["id"]
     admin.tables["workflows"][0]["status"] = workflow_status
     admin.tables["workflows"][0]["run_id"] = state["run_id"]
     admin.tables["workflows"][0]["error"] = "EXECUTION_FAILED: sandbox died"
@@ -505,7 +504,9 @@ def test_worker_recovery_never_infers_success_from_workflow(monkeypatch, workflo
     ctx = {"settings": ApiSettings(supabase_service_role_key="s", _env_file=None), "redis": None}
     run = admin.tables["execution_runs"][0]
 
-    asyncio.run(worker._recover_existing_workflow(ctx, admin, run, dict(admin.tables["workflows"][0])))
+    asyncio.run(worker._recover_existing_workflow(
+        ctx, admin, run, dict(admin.tables["workflows"][0])
+    ))
 
     run = admin.tables["execution_runs"][0]
     assert run["status"] != RunStatus.SUCCEEDED.value
@@ -520,7 +521,6 @@ async def test_worker_recovery_leaves_recorded_terminal_run_untouched():
     from reproagent_api import worker
 
     admin, state, _ = seed_execution(status=RunStatus.SUCCEEDED.value, attempt=1)
-    workflow_id = admin.tables["workflows"][0]["id"]
     admin.tables["workflows"][0]["status"] = WorkflowStatus.COMPLETED.value
     finished_at = "2026-01-01T00:00:00+00:00"
     admin.tables["execution_runs"][0]["finished_at"] = finished_at
@@ -659,6 +659,121 @@ def test_pin_attempt_files_is_idempotent_for_same_attempt_and_files():
     file_rows = [r for r in admin.tables["execution_attempt_files"]
                  if r["run_id"] == run_id and r["attempt"] == 1]
     assert len(file_rows) == 3  # not duplicated
+
+
+def test_pin_attempt_files_rejects_a_different_file_set_without_union():
+    from reproagent_api.services.runs import pin_attempt_files
+
+    admin, state, _, run_id, _ = _seed_attempt_run(attempt=0)
+    original = _insert_generated_files(admin, state["experiment_id"], "v1", count=2)
+    replacement = _insert_generated_files(admin, state["experiment_id"], "v2", count=1)
+    pin_attempt_files(admin, run_id, 1, original)
+
+    with pytest.raises(ValueError, match="already pinned a different file set"):
+        pin_attempt_files(admin, run_id, 1, replacement)
+
+    pinned = {
+        row["generated_file_id"] for row in admin.tables["execution_attempt_files"]
+        if row["run_id"] == run_id and row["attempt"] == 1
+    }
+    assert pinned == set(original)
+
+
+def test_pin_attempt_files_same_set_in_different_order_is_a_noop():
+    from reproagent_api.services.runs import pin_attempt_files
+
+    admin, state, _, run_id, _ = _seed_attempt_run(attempt=0)
+    ids = _insert_generated_files(admin, state["experiment_id"], "v1", count=3)
+    pin_attempt_files(admin, run_id, 1, ids)
+    before = [dict(row) for row in admin.tables["execution_attempt_files"]]
+
+    pin_attempt_files(admin, run_id, 1, list(reversed(ids)) + [ids[0]])
+
+    assert admin.tables["execution_attempt_files"] == before
+
+
+def test_pin_run_files_replaces_projection_with_one_rpc():
+    from reproagent_api.services.runs import pin_run_files
+
+    admin, state, _, run_id, _ = _seed_attempt_run(attempt=0)
+    first_ids = _insert_generated_files(admin, state["experiment_id"], "v1", count=1)
+    second_ids = _insert_generated_files(admin, state["experiment_id"], "v2", count=2)
+    pin_run_files(admin, run_id, first_ids, attempt=1)
+
+    pin_run_files(admin, run_id, second_ids, attempt=2)
+
+    assert admin.rpc_calls[-1] == (
+        "replace_run_projection",
+        {"p_run_id": run_id, "p_attempt": 2, "p_file_ids": second_ids},
+    )
+    assert {
+        row["generated_file_id"] for row in admin.tables["execution_run_files"]
+        if row["run_id"] == run_id
+    } == set(second_ids)
+
+
+def test_projection_rpc_failure_does_not_partially_replace_projection():
+    from reproagent_api.services.runs import pin_run_files
+
+    admin, state, _, run_id, _ = _seed_attempt_run(attempt=0)
+    original = _insert_generated_files(admin, state["experiment_id"], "v1", count=1)
+    replacement = _insert_generated_files(admin, state["experiment_id"], "v2", count=1)
+    pin_run_files(admin, run_id, original, attempt=1)
+    # A missing file makes the SQL insert fail after its delete; the transaction
+    # must roll both operations back rather than leaving an empty projection.
+    invalid = [str(uuid4())]
+
+    with pytest.raises(ValueError, match="generated file does not exist"):
+        pin_run_files(admin, run_id, invalid, attempt=2)
+
+    assert {
+        row["generated_file_id"] for row in admin.tables["execution_run_files"]
+        if row["run_id"] == run_id
+    } == set(original)
+    assert replacement[0] not in {
+        row["generated_file_id"] for row in admin.tables["execution_run_files"]
+    }
+
+
+def test_persist_runner_run_id_updates_only_matching_attempt_identity():
+    from reproagent_api.services.runs import (
+        execution_request_id,
+        persist_runner_run_id,
+        pin_attempt_files,
+    )
+
+    admin, state, _, run_id, _ = _seed_attempt_run(attempt=1, status="failed")
+    first_files = _insert_generated_files(admin, state["experiment_id"], "v1", version=1)
+    second_files = _insert_generated_files(admin, state["experiment_id"], "v2", version=2)
+    pin_attempt_files(admin, run_id, 1, first_files)
+    pin_attempt_files(admin, run_id, 2, second_files)
+    first_runner = uuid4()
+    first = admin.tables["execution_attempts"][0]
+    first.update({
+        "runner_run_id": str(first_runner),
+        "runner_request_id": str(execution_request_id(UUID(run_id), 0)),
+    })
+
+    second_runner = uuid4()
+    assert persist_runner_run_id(admin, run_id, second_runner, 1) is True
+
+    history = {row["attempt"]: row for row in admin.tables["execution_attempts"]}
+    assert history[1]["runner_run_id"] == str(first_runner)
+    assert history[1]["runner_request_id"] == str(execution_request_id(UUID(run_id), 0))
+    assert history[2]["runner_run_id"] == str(second_runner)
+    assert history[2]["runner_request_id"] == str(execution_request_id(UUID(run_id), 1))
+
+
+def test_pin_attempt_files_populates_zero_based_runner_request_identity():
+    from reproagent_api.services.runs import execution_request_id, pin_attempt_files
+
+    admin, state, _, run_id, _ = _seed_attempt_run(attempt=1)
+    files = _insert_generated_files(admin, state["experiment_id"], "v2", version=2)
+
+    pin_attempt_files(admin, run_id, 2, files)
+
+    attempt = admin.tables["execution_attempts"][0]
+    assert attempt["runner_request_id"] == str(execution_request_id(UUID(run_id), 1))
 
 
 def test_pin_run_files_updates_projection_but_keeps_history():

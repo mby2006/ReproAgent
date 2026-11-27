@@ -229,7 +229,7 @@ class TestUnderstandingFlow:
         assert paper["status"] == "parsed"
 
         pdf_url = alice_client.get(f"/v1/papers/{ids['paper_id']}/pdf").json()["url"]
-        assert "token=" in pdf_url
+        assert "sig=" in pdf_url
 
     async def test_reparse_appends_version_without_touching_old(self, settings, alice_client):
         ids = upload(alice_client, build_pdf())
@@ -312,8 +312,11 @@ class TestPaperDeletion:
         admin.table("execution_run_files").insert({
             "run_id": run["id"], "generated_file_id": generated["id"],
         }).execute()
-        admin.table("reproduction_reports").insert({
-            "run_id": run["id"], "report_json": {}, "markdown": "Test report",
+        admin.rpc("append_report_version", {
+            "p_run_id": run["id"],
+            "p_report_json": {},
+            "p_markdown": "Test report",
+            "p_generation_ms": None,
         }).execute()
         admin.table("workflows").update({
             "experiment_id": experiment["id"], "run_id": run["id"], "plan_id": plan["id"],

@@ -161,6 +161,16 @@ class FakeResult:
         self.data = data
 
 
+class FakeRPC:
+    def __init__(self, data):
+        self._data = data
+        self.executed = False
+
+    def execute(self):
+        self.executed = True
+        return FakeResult(self._data)
+
+
 class _Not:
     def __init__(self, query):
         self._query = query
@@ -363,11 +373,18 @@ class FakeAdmin:
         self.owners = owners
         self.storage = FakeStorage()
         self.rpc_calls = []
+        self.rpc_builders = []
 
     def table(self, name):
         return FakeQuery(self, name)
 
     def rpc(self, name, params):
+        result = self._rpc(name, params)
+        if isinstance(result, FakeRPC):
+            self.rpc_builders.append(result)
+        return result
+
+    def _rpc(self, name, params):
         self.rpc_calls.append((name, params))
         if name == "reconcile_execution_run":
             run = next(
@@ -378,7 +395,7 @@ class FakeAdmin:
             guarded = "p_repair_attempt" in params
             if not guarded:
                 if run is None or run["status"] not in ("queued", "dispatching", "running"):
-                    return False
+                    return FakeRPC(False)
             elif (
                 run is None
                 or run.get("repair_attempt", 0) != params["p_repair_attempt"]
@@ -387,7 +404,7 @@ class FakeAdmin:
                     or (run["status"] == "cancelled" and params["p_status"] == "cancelled")
                 )
             ):
-                return False
+                return FakeRPC(False)
             now = datetime.now(UTC).isoformat()
             run_order = (run.get("created_at") or "", run["id"])
             has_newer_run = any(
@@ -396,7 +413,7 @@ class FakeAdmin:
                 for row in self.tables["execution_runs"]
             )
             if params.get("p_require_latest") and has_newer_run:
-                return False
+                return FakeRPC(False)
             if run["status"] != "cancelled":
                 run.update({
                     "status": params["p_status"],
@@ -412,7 +429,7 @@ class FakeAdmin:
                 experiment["status"] = (
                     "failed" if params["p_status"] == "timeout" else params["p_status"]
                 )
-            return True
+            return FakeRPC(True)
         if name == "pin_attempt_files":
             run = next(
                 (row for row in self.tables["execution_runs"]
@@ -467,14 +484,14 @@ class FakeAdmin:
             if attempt.get("files_pinned", False):
                 if existing != set(file_ids):
                     raise _rpc_error("ATTEMPT_FILES_CONFLICT")
-                return True
+                return FakeRPC(True)
             bindings.extend(
                 {"run_id": params["p_run_id"], "attempt": params["p_attempt"],
                  "generated_file_id": fid}
                 for fid in file_ids
             )
             attempt["files_pinned"] = True
-            return True
+            return FakeRPC(True)
         if name == "replace_run_projection":
             attempt = next(
                 (row for row in self.tables["execution_attempts"]
@@ -497,7 +514,7 @@ class FakeAdmin:
                 {"run_id": params["p_run_id"], "generated_file_id": fid}
                 for fid in params["p_file_ids"]
             )
-            return True
+            return FakeRPC(True)
         if name == "append_report_version":
             run_id = params["p_run_id"]
             attempts = [
@@ -518,7 +535,9 @@ class FakeAdmin:
                 and row["content_sha256"] == digest
             ), None)
             if existing is not None:
-                return {key: existing[key] for key in ("id", "version", "attempt", "generation_ms")}
+                return FakeRPC([{
+                    key: existing[key] for key in ("id", "version", "attempt", "generation_ms")
+                }])
             row = {
                 "id": str(uuid4()),
                 "run_id": run_id,
@@ -534,7 +553,9 @@ class FakeAdmin:
                 "content_sha256": digest,
             }
             rows.append(row)
-            return {key: row[key] for key in ("id", "version", "attempt", "generation_ms")}
+            return FakeRPC([
+                {key: row[key] for key in ("id", "version", "attempt", "generation_ms")}
+            ])
         if name != "create_execution_run":
             raise AssertionError(f"unexpected rpc: {name}")
         experiment = next(
@@ -586,7 +607,7 @@ class FakeAdmin:
         if existing_idem is not None:
             if existing_idem["request_fingerprint"] != request_fingerprint:
                 raise _rpc_error("IDEMPOTENCY_CONFLICT")
-            return existing_idem["run_id"]
+            return FakeRPC(existing_idem["run_id"])
 
         if active:
             raise _rpc_error("ACTIVE_RUN_EXISTS")
@@ -623,7 +644,7 @@ class FakeAdmin:
                 "request_fingerprint": request_fingerprint,
                 "run_id": run_id,
             })
-        return run_id
+        return FakeRPC(run_id)
 
 
 class FakeArq:
@@ -1838,7 +1859,7 @@ def test_rpc_malformed_run_id_is_server_error(env):
 
     def garbage_rpc(name, params):
         admin.rpc_calls.append((name, params))
-        return "not-a-uuid"
+        return FakeRPC("not-a-uuid")
 
     admin.rpc = garbage_rpc
     response = client.post(

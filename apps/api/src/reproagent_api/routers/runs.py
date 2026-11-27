@@ -224,7 +224,7 @@ async def start_run(
             "p_actor_id": str(user_id),
             "p_idempotency_key": idempotency_key,
             "p_request_fingerprint": fingerprint,
-        })
+        }).execute().data
     except PostgrestAPIError as exc:
         code = _rpc_error_code(exc)
         if code is None:

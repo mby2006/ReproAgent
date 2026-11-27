@@ -1,3 +1,9 @@
+import ast
+import json
+import time
+from pathlib import Path
+from types import SimpleNamespace
+
 import pytest
 import yaml
 from reproagent_agent.codegen import (
@@ -7,6 +13,7 @@ from reproagent_agent.codegen import (
     repair_bundle,
     validate_bundle,
 )
+from reproagent_agent.codegen.templates import TRAIN_PY
 from reproagent_agent.planning import ScalingConfig, build_plan
 from reproagent_schemas import (
     ClassifyRequest,
@@ -88,6 +95,60 @@ class TestGenerator:
         assert config["data"]["train_subset_size"] == 2000
         assert config["data"]["dir"] == "/data/mnist"
         assert config["output"]["metrics_filename"] == "metrics.json"
+
+    def test_generated_training_main_uses_scoped_test_loader(self, tmp_path):
+        """main() must not read build_loaders()'s local test_set variable."""
+        module = ast.parse(TRAIN_PY)
+        main = next(
+            node for node in module.body
+            if isinstance(node, ast.FunctionDef) and node.name == "main"
+        )
+        output = tmp_path / "output"
+        cfg = {
+            "seed": 42,
+            "data": {"num_classes": 10},
+            "output": {"dir": str(output), "metrics_filename": "metrics.json"},
+            "training": {
+                "batch_size": 2,
+                "epochs": 0,
+                "loss_function": "cross_entropy",
+                "optimizer": "sgd",
+                "learning_rate": 0.01,
+            },
+            "evaluation": {"target_metric": "accuracy"},
+        }
+        test_loader = SimpleNamespace(dataset=[None] * 7)
+        namespace = {
+            "Path": Path,
+            "json": json,
+            "time": time,
+            "load_config": lambda: cfg,
+            "build_loaders": lambda _: ([], test_loader, [], []),
+            "build_model": lambda _: SimpleNamespace(
+                parameters=lambda: [], state_dict=lambda: {}
+            ),
+            "weights_fingerprint": lambda _: "init",
+            "indices_fingerprint": lambda _: "indices",
+            "text_fingerprint": lambda _: "dataset",
+            "source_fingerprint": lambda: "template",
+            "evaluate": lambda *_: {"accuracy": 1.0},
+            "OPTIMIZERS": {"sgd": lambda *_, **__: object()},
+            "torch": SimpleNamespace(
+                manual_seed=lambda _: None,
+                Generator=lambda: SimpleNamespace(manual_seed=lambda _: None),
+                nn=SimpleNamespace(CrossEntropyLoss=lambda: object()),
+                save=lambda *_: None,
+            ),
+        }
+        exec(compile(ast.Module(body=[main], type_ignores=[]), "train.py", "exec"), namespace)
+
+        namespace["main"]()
+        metrics = json.loads((output / "metrics.json").read_text(encoding="utf-8"))
+        reproducibility = json.loads(
+            (output / "reproducibility.json").read_text(encoding="utf-8")
+        )
+        assert metrics["test_samples"] == 7
+        assert reproducibility["test_subset_size"] == 7
 
     def test_unsupported_optimizer_fails_at_generation(self):
         plan = make_plan()

@@ -170,7 +170,7 @@ def pin_run_files(admin, run_id: str, file_ids: list[str], *, attempt: int | Non
         "p_run_id": run_id,
         "p_attempt": attempt,
         "p_file_ids": file_ids,
-    })
+    }).execute()
 
 
 def _attempt_row_from_run(run_row: dict, attempt: int, *, status: str | None = None) -> dict:
@@ -204,7 +204,7 @@ def pin_attempt_files(admin, run_id: str, attempt: int, file_ids: list[str]) -> 
             "p_run_id": run_id,
             "p_attempt": attempt,
             "p_file_ids": file_ids,
-        })
+        }).execute()
     except APIError as exc:
         if exc.message == "ATTEMPT_FILES_CONFLICT":
             raise ValueError(
@@ -507,7 +507,7 @@ def finalize_execution_run(
     if attempt is not None:
         params["p_repair_attempt"] = attempt
         params["p_require_latest"] = require_latest
-    finalized = bool(admin.rpc("reconcile_execution_run", params))
+    finalized = bool(admin.rpc("reconcile_execution_run", params).execute().data)
     if finalized:
         # Mirror the terminal status onto the authoritative attempt history so a
         # later repair/dispatch never reopens a closed attempt row.

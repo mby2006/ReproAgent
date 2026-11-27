@@ -610,6 +610,8 @@ def test_pin_attempt_files_second_attempt_does_not_erase_first():
     pin_attempt_files(admin, run_id, 1, first_ids)
     pin_attempt_files(admin, run_id, 2, second_ids)
 
+    assert len(admin.rpc_builders) == 2
+    assert all(builder.executed for builder in admin.rpc_builders)
     attempts = sorted(
         row["attempt"] for row in admin.tables["execution_attempts"]
         if row["run_id"] == run_id
@@ -731,6 +733,8 @@ def test_pin_run_files_replaces_projection_with_one_rpc():
 
     pin_run_files(admin, run_id, second_ids, attempt=2)
 
+    assert len(admin.rpc_builders) == 4
+    assert all(builder.executed for builder in admin.rpc_builders)
     assert admin.rpc_calls[-1] == (
         "replace_run_projection",
         {"p_run_id": run_id, "p_attempt": 2, "p_file_ids": second_ids},

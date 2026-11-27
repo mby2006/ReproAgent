@@ -41,9 +41,11 @@ alter table public.reproduction_reports
 -- service-role mutation, while retaining foreign-key cleanup cascades.
 drop policy if exists reports_owner_update on public.reproduction_reports;
 drop policy if exists reports_owner_delete on public.reproduction_reports;
-revoke all on public.reproduction_reports from anon, authenticated;
-grant select, insert on public.reproduction_reports to anon, authenticated;
-grant all on public.reproduction_reports to service_role;
+revoke all on public.reproduction_reports from public, anon, authenticated, service_role;
+grant select, insert on public.reproduction_reports to anon, authenticated, service_role;
+-- TRUNCATE bypasses row-level DELETE triggers and would erase the entire
+-- append-only history. No application role receives it.
+revoke truncate on public.reproduction_reports from anon, authenticated, service_role;
 
 create or replace function public.report_versions_append_only()
 returns trigger
@@ -135,5 +137,10 @@ $$;
 
 revoke all on function public.append_report_version(uuid, jsonb, text, numeric)
   from public, anon, authenticated;
+-- The invoker RPC locks the mutable Run projection and reads attempt history.
+-- Grant exactly those dependencies so service_role can append on a minimally
+-- bootstrapped database without receiving any mutation privilege on reports.
+grant select, update on public.execution_runs to service_role;
+grant select on public.execution_attempts to service_role;
 grant execute on function public.append_report_version(uuid, jsonb, text, numeric)
   to service_role;

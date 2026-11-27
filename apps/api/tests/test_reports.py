@@ -1,5 +1,6 @@
 """Report versions are append-only and evaluate only the final attempt's evidence."""
 
+import copy
 import hashlib
 import json
 from uuid import uuid4
@@ -47,8 +48,8 @@ def _final_attempt_admin():
     file_ids = []
     for attempt, prefix in ((1, "first"), (2, "final")):
         attempt_files = []
-        for name in ("train.py", "config.yaml"):
-            file_id = str(uuid4())
+        for index, name in enumerate(("config.yaml", "train.py")):
+            file_id = f"00000000-0000-0000-0000-{attempt * 10 + index:012d}"
             content = f"{prefix}-{name}"
             sha256 = hashlib.sha256(content.encode()).hexdigest()
             admin.tables["generated_files"].append({
@@ -143,6 +144,45 @@ def test_evaluate_request_uses_only_final_attempt_plan_code_and_artifacts():
         + hashlib.sha256(b"final-train.py").hexdigest()
     ).encode()).hexdigest()
     assert refs.code_hash == expected_hash
+
+
+def test_shuffled_database_rows_produce_identical_evaluation_and_report_hash():
+    admin, run_id, _ = _final_attempt_admin()
+    shuffled = copy.deepcopy(admin)
+    for table in ("execution_attempt_files", "generated_files", "execution_artifacts"):
+        shuffled.tables[table].reverse()
+
+    original_request = reports.build_evaluate_request(admin, run_id)
+    shuffled_request = reports.build_evaluate_request(shuffled, run_id)
+
+    assert shuffled_request.model_dump(mode="json") == original_request.model_dump(mode="json")
+    assert [file.path for file in shuffled_request.code_files] == [
+        "config.yaml", "train.py",
+    ]
+    assert [str(value) for value in shuffled_request.references.generated_file_ids] == sorted(
+        str(value) for value in original_request.references.generated_file_ids
+    )
+    assert shuffled_request.artifacts == ["metrics.json", "model.pt"]
+
+    original = evaluate_run(original_request)
+    reordered = evaluate_run(shuffled_request)
+    assert reordered.report == original.report
+    assert reordered.markdown == original.markdown
+    original_version = reports.append_report_version(
+        admin,
+        run_id,
+        original.report.model_dump(mode="json"),
+        original.markdown,
+    )
+    shuffled_version = reports.append_report_version(
+        shuffled,
+        run_id,
+        reordered.report.model_dump(mode="json"),
+        reordered.markdown,
+    )
+    assert shuffled_version.report_json == original_version.report_json
+    assert shuffled_version.markdown == original_version.markdown
+    assert shuffled_version.content_sha256 == original_version.content_sha256
 
 
 def test_missing_final_metrics_artifact_never_falls_back_to_another_attempt():

@@ -65,7 +65,7 @@ def _file_ids(admin, table: str, run_id: str, attempt: int | None) -> list[str]:
     query = admin.table(table).select("generated_file_id").eq("run_id", run_id)
     if attempt is not None:
         query = query.eq("attempt", attempt)
-    return [row["generated_file_id"] for row in query.execute().data]
+    return sorted(row["generated_file_id"] for row in query.execute().data)
 
 
 def _code_files(admin, table: str, run_id: str, attempt: int | None) -> list[CodeFile]:
@@ -81,10 +81,13 @@ def _code_files(admin, table: str, run_id: str, attempt: int | None) -> list[Cod
     )
     if len(rows) != len(set(file_ids)):
         raise ValueError("A pinned generated file is unavailable")
-    return [
-        CodeFile(path=row["path"], content=row["content"] or "", sha256=row["sha256"])
-        for row in rows
-    ]
+    return sorted(
+        (
+            CodeFile(path=row["path"], content=row["content"] or "", sha256=row["sha256"])
+            for row in rows
+        ),
+        key=lambda file: (file.path, file.sha256, file.content),
+    )
 
 
 def _artifact_metrics(
@@ -177,6 +180,7 @@ def build_evaluate_request(
             .execute()
             .data
         )
+        artifact_rows.sort(key=lambda row: (row["artifact_type"], row["storage_path"]))
         metrics = _artifact_metrics(admin, run_id, attempt_number, artifact_rows)
         plan_version = final_attempt["plan_version"]
         code_version = final_attempt["code_version"]
@@ -230,7 +234,7 @@ def build_evaluate_request(
         error_category=ErrorCategory(run["error_category"]) if run.get("error_category") else None,
         stdout_path=run.get("stdout_path"),
         stderr_path=run.get("stderr_path"),
-        artifacts=[row["artifact_type"] for row in artifact_rows],
+        artifacts=sorted(row["artifact_type"] for row in artifact_rows),
     )
 
 
@@ -246,7 +250,7 @@ def append_report_version(
         "p_report_json": report_json,
         "p_markdown": markdown,
         "p_generation_ms": generation_ms,
-    })
+    }).execute().data
     metadata = result[0] if isinstance(result, list) else result
     if not metadata:
         raise RuntimeError("Report append returned no version")

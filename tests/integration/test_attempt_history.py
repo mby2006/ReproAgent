@@ -1015,14 +1015,58 @@ class TestReportVersions:
                 "'public.reproduction_reports', 'update') as can_update, "
                 "has_table_privilege(%s, "
                 "'public.reproduction_reports', 'delete') as can_delete, "
+                "has_table_privilege(%s, "
+                "'public.reproduction_reports', 'truncate') as can_truncate, "
                 "has_function_privilege(%s, "
                 "'public.append_report_version(uuid,jsonb,text,numeric)', 'execute') as can_append",
-                (role, role, role, role, role),
+                (role, role, role, role, role, role),
             )
             assert db.fetchone() == {
                 "can_select": True, "can_insert": True,
-                "can_update": False, "can_delete": False, "can_append": False,
+                "can_update": False, "can_delete": False,
+                "can_truncate": False, "can_append": False,
             }
+
+    def test_service_role_can_append_but_cannot_mutate_or_truncate_reports(
+        self, db, run_context
+    ):
+        db.execute(
+            "select has_table_privilege('service_role', "
+            "'public.reproduction_reports', 'select') as can_select, "
+            "has_table_privilege('service_role', "
+            "'public.reproduction_reports', 'insert') as can_insert, "
+            "has_table_privilege('service_role', "
+            "'public.reproduction_reports', 'update') as can_update, "
+            "has_table_privilege('service_role', "
+            "'public.reproduction_reports', 'delete') as can_delete, "
+            "has_table_privilege('service_role', "
+            "'public.reproduction_reports', 'truncate') as can_truncate, "
+            "has_function_privilege('service_role', "
+            "'public.append_report_version(uuid,jsonb,text,numeric)', 'execute') as can_append"
+        )
+        assert db.fetchone() == {
+            "can_select": True, "can_insert": True,
+            "can_update": False, "can_delete": False,
+            "can_truncate": False, "can_append": True,
+        }
+
+        db.execute("savepoint service_role_history")
+        try:
+            db.execute("set local role service_role")
+            db.execute(
+                "select version, attempt from public.append_report_version("
+                "%s::uuid, '{\"source\":\"service_role\"}'::jsonb, "
+                "'service report', 1.25::numeric)",
+                (run_context["run_ids"][1],),
+            )
+            assert db.fetchone() == {"version": 1, "attempt": 2}
+            # Exercise the privilege as the role; row triggers cannot protect
+            # history from TRUNCATE, so the ACL itself must reject it.
+            with pytest.raises(psycopg.errors.InsufficientPrivilege):
+                db.execute("truncate public.reproduction_reports")
+        finally:
+            db.execute("rollback to savepoint service_role_history")
+            db.execute("release savepoint service_role_history")
 
     def test_attempt_content_idempotency_index_is_partial_and_unique(self, db):
         db.execute(

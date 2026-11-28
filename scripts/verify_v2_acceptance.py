@@ -17,11 +17,14 @@ import math
 import os
 import re
 import stat
+import struct
 import subprocess
 import tempfile
+import zlib
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+from urllib.parse import parse_qsl, unquote, urlsplit
 
 try:
     from scripts.audit_legacy_consumers import audit_repository
@@ -171,14 +174,46 @@ def _hash_bound_artifact(
 
 
 def _hash_bound_json_artifact(
-    evidence_root: Path | None, descriptor: Any, field: str
+    evidence_root: Path | None,
+    descriptor: Any,
+    field: str,
+    *,
+    allow_single_list_item: bool = False,
 ) -> tuple[Path, dict]:
     path, content = _hash_bound_artifact(evidence_root, descriptor, field)
     try:
         payload = json.loads(content.decode("utf-8"))
     except (UnicodeError, ValueError) as exc:
         raise ValueError(f"{field} is malformed JSON") from exc
+    if allow_single_list_item and isinstance(payload, list):
+        if len(payload) != 1:
+            raise ValueError(f"{field} must be an object or one-element list")
+        payload = payload[0]
     return path, _mapping(payload, field)
+
+
+def _hash_bound_png_artifact(
+    evidence_root: Path | None, descriptor: Any, field: str
+) -> tuple[Path, bytes]:
+    path, content = _hash_bound_artifact(evidence_root, descriptor, field)
+    signature = b"\x89PNG\r\n\x1a\n"
+    if len(content) < 1024 or not content.startswith(signature):
+        raise ValueError(f"{field} must be a PNG of at least 1024 bytes")
+    # IHDR is the first chunk: length 13, complete header, data, and CRC32.
+    if (
+        len(content) < 33
+        or content[8:16] != b"\x00\x00\x00\rIHDR"
+        or content[26:28] != b"\x00\x00"
+        or content[28] not in {0, 1}
+    ):
+        raise ValueError(f"{field} must contain a complete valid IHDR chunk")
+    expected_crc = int.from_bytes(content[29:33], "big")
+    if zlib.crc32(content[12:29]) & 0xFFFFFFFF != expected_crc:
+        raise ValueError(f"{field} must contain a complete valid IHDR chunk")
+    width, height = struct.unpack(">II", content[16:24])
+    if width < 320 or height < 200:
+        raise ValueError(f"{field} must be at least 320x200 pixels")
+    return path, content
 
 
 def _evidence_paths(evidence: dict, root: Path | None, field: str = "evidence_paths") -> list[str]:
@@ -318,6 +353,56 @@ console.log(JSON.stringify({ run: archive.run, verified_files: archive.verifiedF
     }
 
 
+def _validate_public_har(payload: dict, field: str) -> tuple[int, int]:
+    log = _mapping(payload.get("log"), f"{field}.log")
+    entries = log.get("entries")
+    if not isinstance(entries, list) or not entries:
+        raise ValueError(f"{field}.log.entries must be a nonempty list")
+    blocked_path_segments = {"auth", "login", "logout", "session", "oauth", "token"}
+    auth_parameters = {"auth", "token", "access_token", "refresh_token", "api_key"}
+    session_parameters = {"session", "session_id"}
+    html_entries = 0
+    auth_requests = 0
+    session_requests = 0
+    for index, entry in enumerate(entries):
+        entry_field = f"{field}.log.entries[{index}]"
+        entry = _mapping(entry, entry_field)
+        request = _mapping(entry.get("request"), f"{entry_field}.request")
+        response = _mapping(entry.get("response"), f"{entry_field}.response")
+        _text(request.get("method"), f"{entry_field}.request.method")
+        url = _text(request.get("url"), f"{entry_field}.request.url")
+        status = response.get("status")
+        if isinstance(status, bool) or not isinstance(status, int) or not 100 <= status <= 599:
+            raise ValueError(f"{entry_field}.response.status must be an integer from 100 to 599")
+        headers = request.get("headers", [])
+        if not isinstance(headers, list):
+            raise ValueError(f"{entry_field}.request.headers must be a list")
+        for header_index, header in enumerate(headers):
+            header = _mapping(header, f"{entry_field}.request.headers[{header_index}]")
+            name = _text(header.get("name"), f"{entry_field}.request.headers[{header_index}].name")
+            if name.lower() in {"authorization", "cookie"}:
+                raise ValueError(f"{entry_field} must not contain Authorization or Cookie headers")
+        try:
+            parsed = urlsplit(url)
+        except ValueError as exc:
+            raise ValueError(f"{entry_field}.request.url is invalid") from exc
+        segments = {unquote(segment).lower() for segment in parsed.path.split("/")}
+        parameters = {
+            unquote(name).lower() for name, _ in parse_qsl(parsed.query, keep_blank_values=True)
+        }
+        is_auth = bool(segments & blocked_path_segments) or bool(parameters & auth_parameters)
+        is_session = bool(segments & {"session"}) or bool(parameters & session_parameters)
+        auth_requests += int(is_auth)
+        session_requests += int(is_session)
+        if status == 200:
+            content = _mapping(response.get("content"), f"{entry_field}.response.content")
+            mime_type = _text(content.get("mimeType"), f"{entry_field}.response.content.mimeType")
+            html_entries += int("text/html" in mime_type.lower())
+    if not html_entries:
+        raise ValueError(f"{field} must contain a status-200 text/html entry")
+    return auth_requests, session_requests
+
+
 def validate_g01(
     evidence: dict,
     *,
@@ -340,8 +425,20 @@ def validate_g01(
     visitor = _mapping(evidence.get("visitor"), "visitor")
     if visitor.get("authenticated") is not False:
         raise ValueError("public visitor must be unauthenticated")
-    if visitor.get("auth_requests") != 0 or visitor.get("session_requests") != 0:
-        raise ValueError("public visitor must make no auth or session requests")
+    for field in ("auth_requests", "session_requests"):
+        if (
+            isinstance(visitor.get(field), bool)
+            or not isinstance(visitor.get(field), int)
+            or visitor[field] != 0
+        ):
+            raise ValueError(f"public visitor must make no {field.replace('_', ' ')}")
+    har_path, har = _hash_bound_json_artifact(evidence_root, evidence.get("har"), "har")
+    auth_requests, session_requests = _validate_public_har(har, "har")
+    if auth_requests != visitor["auth_requests"] or session_requests != visitor["session_requests"]:
+        raise ValueError("visitor auth/session counts disagree with the parsed HAR")
+    screenshot_path, _ = _hash_bound_png_artifact(
+        evidence_root, evidence.get("screenshot"), "screenshot"
+    )
     archive_result = _mapping(archive_result, "archive verifier result")
     if archive_result.get("verified_files") != 9:
         raise ValueError("public archive verifier must verify exactly nine files")
@@ -349,6 +446,11 @@ def validate_g01(
         if archive_result.get(field) != expected:
             raise ValueError(f"public archive verifier {field} mismatch")
     paths = _evidence_paths(evidence, evidence_root)
+    relative_paths = set(paths)
+    for artifact_path in (har_path, screenshot_path):
+        relative = artifact_path.relative_to(evidence_root.resolve()).as_posix()
+        if relative not in relative_paths:
+            raise ValueError(f"evidence_paths must include {relative}")
     _assertions(evidence)
     return {"archive_run": ARCHIVE_RUN, "verified_files": 9, "evidence_paths": paths}
 
@@ -634,7 +736,10 @@ def validate_g04(
         raise ValueError("passed must be true")
     security = _mapping(evidence.get("container_security"), "container_security")
     _, inspect = _hash_bound_json_artifact(
-        evidence_root, security.get("inspect"), "container_security.inspect"
+        evidence_root,
+        security.get("inspect"),
+        "container_security.inspect",
+        allow_single_list_item=True,
     )
     _validate_container_inspect(inspect, "container_security.inspect")
     _, credentials = _hash_bound_json_artifact(
@@ -705,31 +810,93 @@ def validate_g05(
         raise ValueError("commands must be a list")
     by_name = {}
     for index, command in enumerate(commands):
-        command = _mapping(command, f"commands[{index}]")
-        name = _text(command.get("name"), f"commands[{index}].name")
+        field = f"commands[{index}]"
+        command = _mapping(command, field)
+        name = _text(command.get("name"), f"{field}.name")
         if name in by_name:
-            raise ValueError(f"duplicate command at commands[{index}]")
+            raise ValueError(f"duplicate command at {field}")
         if command.get("exit_code") != 0 or isinstance(command.get("exit_code"), bool):
-            raise ValueError(f"commands[{index}].exit_code must be zero")
+            raise ValueError(f"command {name} at {field}.exit_code must be zero")
+        _, output = _hash_bound_json_artifact(
+            evidence_root, command.get("output"), f"{field}.output"
+        )
+        if output.get("name") != name:
+            raise ValueError(f"command {name} at {field}.output has a mismatched name")
+        if output.get("exit_code") != 0 or isinstance(output.get("exit_code"), bool):
+            raise ValueError(f"command {name} at {field}.output.exit_code must be zero")
+        try:
+            _text(output.get("output"), f"{field}.output.output")
+        except ValueError as exc:
+            raise ValueError(f"command {name} has invalid captured output: {exc}") from exc
         by_name[name] = command
     for name in ("check", "check_integration", "browser_smoke"):
         if name not in by_name:
             raise ValueError(f"missing command: {name}")
-    browser_path = _safe_file(evidence_root, evidence.get("browser_result"), "browser_result")
+    browser_path, browser = _hash_bound_json_artifact(
+        evidence_root, evidence.get("browser_result"), "browser_result"
+    )
     try:
-        browser = json.loads(browser_path.read_text(encoding="utf-8"))
-    except (OSError, ValueError) as exc:
-        raise ValueError("browser_result is malformed JSON") from exc
-    try:
-        validate_commit_binding(_mapping(browser, "browser_result"), expected_commit_sha)
+        validate_commit_binding(browser, expected_commit_sha)
     except ValueError as exc:
         raise ValueError(f"browser_result {exc}") from exc
     if browser.get("passed") is not True:
         raise ValueError("browser_result did not pass")
+    _text(browser.get("browser"), "browser_result.browser")
+    upload = _mapping(browser.get("upload"), "browser_result.upload")
+    plan = _mapping(browser.get("planApproval"), "browser_result.planApproval")
+    execution = _mapping(browser.get("execution"), "browser_result.execution")
+    report = _mapping(browser.get("reportDownload"), "browser_result.reportDownload")
+    sections = {
+        "upload": upload,
+        "planApproval": plan,
+        "execution": execution,
+        "reportDownload": report,
+    }
+    for section, fields in (
+        ("upload", ("paperId", "workflowId")),
+        ("planApproval", ("experimentId", "planId")),
+        ("execution", ("runId", "workflowId", "experimentId", "planId")),
+        ("reportDownload", ("reportId", "runId")),
+    ):
+        row = sections[section]
+        for key in fields:
+            _text(row.get(key), f"browser_result.{section}.{key}")
+    for section, key in (("planApproval", "planVersion"), ("execution", "planVersion")):
+        _positive_int(
+            {"planApproval": plan, "execution": execution}[section].get(key),
+            f"browser_result.{section}.{key}",
+        )
+    for key in ("version", "finalAttempt"):
+        _positive_int(report.get(key), f"browser_result.reportDownload.{key}")
+    _sha256(execution.get("codeHash"), "browser_result.execution.codeHash")
+    markdown_hash = _sha256(
+        report.get("markdownHash"), "browser_result.reportDownload.markdownHash"
+    )
+    if execution.get("status") != "succeeded":
+        raise ValueError("browser_result.execution.status must be succeeded")
+    _positive_int(execution.get("attempt"), "browser_result.execution.attempt")
+    if execution["workflowId"] != upload["workflowId"]:
+        raise ValueError("browser_result upload.workflowId/execution.workflowId must match")
+    for key in ("experimentId", "planId", "planVersion"):
+        if plan[key] != execution[key]:
+            raise ValueError(f"browser_result planApproval/execution {key} must match")
+    if report["runId"] != execution["runId"]:
+        raise ValueError("browser_result reportDownload.runId/execution.runId must match")
+    if report["finalAttempt"] != execution["attempt"]:
+        raise ValueError("browser_result reportDownload.finalAttempt/execution.attempt must match")
+    markdown_path, markdown = _hash_bound_artifact(
+        evidence_root, evidence.get("report_download"), "report_download"
+    )
+    if not markdown:
+        raise ValueError("report_download must contain nonempty Markdown bytes")
+    if hashlib.sha256(markdown).hexdigest() != markdown_hash:
+        raise ValueError("report_download bytes do not match reportDownload.markdownHash")
     _assertions(evidence)
     return {
-        "commands": ["check", "check_integration", "browser_smoke"],
+        "commands": list(by_name),
         "browser_result": browser_path.relative_to(evidence_root.resolve()).as_posix(),
+        "report_download": markdown_path.relative_to(evidence_root.resolve()).as_posix(),
+        "run_id": execution["runId"],
     }
 
 
@@ -804,6 +971,33 @@ def validate_nfr05(evidence: dict, *, expected_commit_sha: str | None = None) ->
     return {"run_ids": run_ids, "environment_hash": canonical_hash, "stages": list(STAGES)}
 
 
+P1_CATEGORIES = ["paper", "plan", "code", "execution", "review_report"]
+
+
+def _validate_p1_api(payload: dict, run_id: str, field: str) -> None:
+    if payload.get("run_id") != run_id:
+        raise ValueError(f"{field}.run_id must match the first-screen Run")
+    if payload.get("categories") != P1_CATEGORIES:
+        raise ValueError(f"{field}.categories must be the exact canonical category list")
+    items = payload.get("items")
+    if not isinstance(items, list) or not items:
+        raise ValueError(f"{field}.items must be a nonempty list")
+    seen = set()
+    for index, item in enumerate(items):
+        item_field = f"{field}.items[{index}]"
+        item = _mapping(item, item_field)
+        _text(item.get("id"), f"{item_field}.id")
+        category = _text(item.get("category"), f"{item_field}.category")
+        if category not in P1_CATEGORIES:
+            raise ValueError(f"{item_field}.category is not canonical")
+        _text(item.get("target_type"), f"{item_field}.target_type")
+        _text(item.get("target_id"), f"{item_field}.target_id")
+        _mapping(item.get("locator"), f"{item_field}.locator")
+        seen.add(category)
+    if seen != set(P1_CATEGORIES):
+        raise ValueError(f"{field}.items must cover all five canonical categories")
+
+
 def validate_p1(
     evidence: dict,
     *,
@@ -814,18 +1008,59 @@ def validate_p1(
     if evidence.get("passed") is not True:
         raise ValueError("passed must be true")
     summary = _mapping(evidence.get("first_screen_summary"), "first_screen_summary")
+    artifact_paths = []
+    run_ids = set()
     for viewport in ("desktop", "narrow"):
-        row = _mapping(summary.get(viewport), f"first_screen_summary.{viewport}")
-        if row.get("status") != "passed" or row.get("columns") != 3:
-            raise ValueError(f"first_screen_summary.{viewport} must pass with three columns")
+        field = f"first_screen_summary.{viewport}"
+        row = _mapping(summary.get(viewport), field)
+        if row.get("status") != "passed":
+            raise ValueError(f"{field}.status must be passed")
+        columns = row.get("columns")
+        if isinstance(columns, bool) or columns != 3:
+            raise ValueError(f"{field}.columns must be integer 3")
+        run_ids.add(_text(row.get("run_id"), f"{field}.run_id"))
+        for key in ("paper", "plan", "actual"):
+            _text(row.get(key), f"{field}.{key}")
+        path, _ = _hash_bound_png_artifact(
+            evidence_root, row.get("screenshot"), f"{field}.screenshot"
+        )
+        artifact_paths.append(path)
+    if len(run_ids) != 1:
+        raise ValueError("first_screen_summary desktop/narrow run_id must match")
+    run_id = run_ids.pop()
     index = _mapping(evidence.get("evidence_index"), "evidence_index")
     for surface in ("browser", "api"):
-        row = _mapping(index.get(surface), f"evidence_index.{surface}")
-        if row.get("status") != "passed" or row.get("categories") != 5:
-            raise ValueError(f"evidence_index.{surface} must pass with five categories")
+        field = f"evidence_index.{surface}"
+        row = _mapping(index.get(surface), field)
+        if row.get("status") != "passed":
+            raise ValueError(f"{field}.status must be passed")
+        if row.get("run_id") != run_id:
+            raise ValueError(f"{field}.run_id must match the first-screen Run")
+        if row.get("categories") != P1_CATEGORIES:
+            raise ValueError(f"{field}.categories must be the exact canonical category list")
+        if surface == "browser":
+            path, _ = _hash_bound_png_artifact(
+                evidence_root, row.get("screenshot"), f"{field}.screenshot"
+            )
+        else:
+            path, payload = _hash_bound_json_artifact(
+                evidence_root, row.get("result"), f"{field}.result"
+            )
+            _validate_p1_api(payload, run_id, f"{field}.result")
+        artifact_paths.append(path)
     paths = _evidence_paths(evidence, evidence_root)
+    relative_paths = set(paths)
+    for artifact_path in artifact_paths:
+        relative = artifact_path.relative_to(evidence_root.resolve()).as_posix()
+        if relative not in relative_paths:
+            raise ValueError(f"evidence_paths must include {relative}")
     _assertions(evidence)
-    return {"viewports": ["desktop", "narrow"], "evidence_categories": 5, "paths": paths}
+    return {
+        "viewports": ["desktop", "narrow"],
+        "evidence_categories": 5,
+        "run_id": run_id,
+        "paths": paths,
+    }
 
 
 VALIDATORS = {

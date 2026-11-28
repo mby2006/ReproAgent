@@ -5,7 +5,9 @@ import hashlib
 import importlib.util
 import json
 import math
+import struct
 import sys
+import zlib
 from pathlib import Path
 
 import pytest
@@ -92,7 +94,51 @@ def g02_evidence(root: Path) -> dict:
     }
 
 
-def g01_evidence() -> dict:
+def png_bytes(width: int = 320, height: int = 200) -> bytes:
+    def chunk(kind: bytes, data: bytes) -> bytes:
+        return (
+            struct.pack(">I", len(data))
+            + kind
+            + data
+            + struct.pack(">I", zlib.crc32(kind + data) & 0xFFFFFFFF)
+        )
+
+    # Deterministic noisy RGB data keeps this valid PNG comfortably above 1024 bytes.
+    raw = b"".join(
+        bytes([0]) + bytes((index * 37 + row * 17) % 256 for index in range(width * 3))
+        for row in range(height)
+    )
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0))
+        + chunk(b"IDAT", zlib.compress(raw))
+        + chunk(b"IEND", b"")
+    )
+
+
+def g01_evidence(root: Path) -> dict:
+    har = artifact(
+        root,
+        "g01/public.har",
+        {
+            "log": {
+                "entries": [
+                    {
+                        "request": {
+                            "method": "GET",
+                            "url": "https://archive.example/examples/lenet/",
+                            "headers": [],
+                        },
+                        "response": {
+                            "status": 200,
+                            "content": {"mimeType": "text/html; charset=utf-8"},
+                        },
+                    }
+                ]
+            }
+        },
+    )
+    screenshot = artifact(root, "g01/public.png", png_bytes())
     return {
         "commitSha": COMMIT,
         "passed": True,
@@ -102,8 +148,19 @@ def g01_evidence() -> dict:
             "report_sha256": "5a7fcba954b496bd5e87483f7cad81b7155f048a111bcd81d3e769eca9d7349d",
         },
         "visitor": {"authenticated": False, "auth_requests": 0, "session_requests": 0},
+        "har": har,
+        "screenshot": screenshot,
         "evidence_paths": ["g01/public.png", "g01/public.har"],
         "assertions": passed_assertions("public archive", "visitor without auth"),
+    }
+
+
+def archive_result(verifier) -> dict:
+    return {
+        "run": verifier.ARCHIVE_RUN,
+        "verified_files": 9,
+        "model_sha256": verifier.ARCHIVE_MODEL_SHA256,
+        "report_sha256": verifier.ARCHIVE_REPORT_SHA256,
     }
 
 
@@ -284,17 +341,48 @@ def g04_current_audit(root: Path, hashes: dict) -> dict:
 
 
 def g05_evidence(root: Path) -> dict:
-    browser = {"commitSha": COMMIT, "passed": True, "browser": "chromium"}
-    write_json(root, "g05/browser.json", browser)
+    markdown = b"# Real report\n\nDownloaded report bytes.\n"
+    markdown_hash = hashlib.sha256(markdown).hexdigest()
+    browser = {
+        "commitSha": COMMIT,
+        "passed": True,
+        "browser": "chromium",
+        "upload": {"paperId": "paper-1", "workflowId": "workflow-1"},
+        "planApproval": {"experimentId": "experiment-1", "planId": "plan-1", "planVersion": 2},
+        "execution": {
+            "runId": "run-1",
+            "workflowId": "workflow-1",
+            "experimentId": "experiment-1",
+            "planId": "plan-1",
+            "planVersion": 2,
+            "status": "succeeded",
+            "attempt": 3,
+            "codeHash": "c" * 64,
+        },
+        "reportDownload": {
+            "reportId": "report-1",
+            "version": 4,
+            "runId": "run-1",
+            "markdownHash": markdown_hash,
+            "finalAttempt": 3,
+        },
+    }
+    commands = []
+    for name in ("check", "check_integration", "browser_smoke"):
+        payload = {"name": name, "exit_code": 0, "output": f"captured {name} output\n"}
+        commands.append(
+            {
+                "name": name,
+                "exit_code": 0,
+                "output": artifact(root, f"g05/{name}.json", payload),
+            }
+        )
     return {
         "commitSha": COMMIT,
         "passed": True,
-        "commands": [
-            {"name": "check", "exit_code": 0},
-            {"name": "check_integration", "exit_code": 0},
-            {"name": "browser_smoke", "exit_code": 0},
-        ],
-        "browser_result": "g05/browser.json",
+        "commands": commands,
+        "browser_result": artifact(root, "g05/browser.json", browser),
+        "report_download": artifact(root, "g05/report.md", markdown),
         "assertions": passed_assertions("offline gate", "integration", "real browser smoke"),
     }
 
@@ -362,19 +450,59 @@ def nfr05_evidence(verifier) -> dict:
     }
 
 
-def p1_evidence() -> dict:
+P1_CATEGORIES = ["paper", "plan", "code", "execution", "review_report"]
+
+
+def p1_evidence(root: Path) -> dict:
+    summary = {
+        viewport: {
+            "status": "passed",
+            "columns": 3,
+            "run_id": "run-1",
+            "paper": "Paper summary text",
+            "plan": "Plan summary text",
+            "actual": "Actual result text",
+            "screenshot": artifact(root, f"p1/{viewport}.png", png_bytes()),
+        }
+        for viewport in ("desktop", "narrow")
+    }
+    browser = {
+        "status": "passed",
+        "run_id": "run-1",
+        "categories": P1_CATEGORIES,
+        "screenshot": artifact(root, "p1/browser.png", png_bytes()),
+    }
+    api = {
+        "run_id": "run-1",
+        "categories": P1_CATEGORIES,
+        "items": [
+            {
+                "id": f"item-{category}",
+                "category": category,
+                "target_type": "artifact",
+                "target_id": f"target-{category}",
+                "locator": {"page": "evidence", "selector": f"#{category}"},
+            }
+            for category in P1_CATEGORIES
+        ],
+    }
+    evidence_index = {
+        "browser": browser,
+        "api": {
+            "status": "passed",
+            "run_id": "run-1",
+            "categories": P1_CATEGORIES,
+            "result": artifact(root, "p1/api.json", api),
+        },
+    }
     return {
         "commitSha": COMMIT,
         "passed": True,
-        "first_screen_summary": {
-            "desktop": {"columns": 3, "status": "passed"},
-            "narrow": {"columns": 3, "status": "passed"},
-        },
-        "evidence_index": {
-            "browser": {"categories": 5, "status": "passed"},
-            "api": {"categories": 5, "status": "passed"},
-        },
-        "evidence_paths": ["p1/desktop.png", "p1/narrow.png", "p1/evidence-index.png"],
+        "first_screen_summary": summary,
+        "evidence_index": evidence_index,
+        "evidence_paths": [
+            f"p1/{name}" for name in ("desktop.png", "narrow.png", "browser.png", "api.json")
+        ],
         "assertions": passed_assertions("first-screen summary", "single Run evidence index"),
     }
 
@@ -604,14 +732,19 @@ def test_nfr05_rejects_invalid_report_envelope(verifier, field, value):
 
 
 def test_g01_requires_bound_visitor_and_archive_identity(verifier, tmp_path):
-    evidence = g01_evidence()
+    evidence = g01_evidence(tmp_path)
     evidence["visitor"]["auth_requests"] = 1
     with pytest.raises(ValueError, match="auth"):
-        verifier.validate_g01(evidence, expected_commit_sha=COMMIT)
+        verifier.validate_g01(
+            evidence,
+            expected_commit_sha=COMMIT,
+            archive_result=archive_result(verifier),
+            evidence_root=tmp_path,
+        )
 
 
-def test_g01_rejects_wrong_public_model_identity(verifier):
-    evidence = g01_evidence()
+def test_g01_rejects_wrong_public_model_identity(verifier, tmp_path):
+    evidence = g01_evidence(tmp_path)
     evidence["archive"]["model_sha256"] = "0" * 64
     with pytest.raises(ValueError, match="model_sha256"):
         verifier.validate_g01(evidence, expected_commit_sha=COMMIT)
@@ -792,7 +925,8 @@ def test_g03_artifact_cannot_escape_evidence_root(verifier, tmp_path):
 def test_g03_artifact_must_be_a_regular_file(verifier, tmp_path):
     evidence = g03_evidence(tmp_path)
     evidence["matrix"]["FAILED"]["artifact"] = {
-        "path": "g03", "sha256": hashlib.sha256(b"").hexdigest()
+        "path": "g03",
+        "sha256": hashlib.sha256(b"").hexdigest(),
     }
     with pytest.raises(ValueError, match="regular file"):
         verifier.validate_g03(evidence, expected_commit_sha=COMMIT, evidence_root=tmp_path)
@@ -939,16 +1073,511 @@ def test_g04_rejects_recorded_migrations_not_in_repository(verifier, tmp_path, m
 
 def test_g05_requires_bound_browser_record_and_zero_exit_codes(verifier, tmp_path):
     evidence = g05_evidence(tmp_path)
-    write_json(tmp_path, "g05/browser.json", {"commitSha": OTHER_COMMIT, "passed": True})
+    ref = evidence["browser_result"]
+    browser = json.loads((tmp_path / ref["path"]).read_text(encoding="utf-8"))
+    browser["commitSha"] = OTHER_COMMIT
+    evidence["browser_result"] = artifact(tmp_path, ref["path"], browser)
     with pytest.raises(ValueError, match="browser_result"):
         verifier.validate_g05(evidence, expected_commit_sha=COMMIT, evidence_root=tmp_path)
 
 
-def test_p1_requires_desktop_narrow_summary_and_five_category_index(verifier):
-    evidence = p1_evidence()
+def test_p1_requires_desktop_narrow_summary_and_five_category_index(verifier, tmp_path):
+    evidence = p1_evidence(tmp_path)
     evidence["evidence_index"]["api"]["categories"] = 4
     with pytest.raises(ValueError, match="categories"):
-        verifier.validate_p1(evidence, expected_commit_sha=COMMIT)
+        verifier.validate_p1(evidence, expected_commit_sha=COMMIT, evidence_root=tmp_path)
+
+
+def test_g04_accepts_real_docker_inspect_array(verifier, tmp_path, monkeypatch):
+    evidence, _, _ = g04_fixture(verifier, tmp_path, monkeypatch)
+    ref = evidence["container_security"]["inspect"]
+    inspect = json.loads((tmp_path / ref["path"]).read_text(encoding="utf-8"))
+    evidence["container_security"]["inspect"] = artifact(tmp_path, ref["path"], [inspect])
+    details = verifier.validate_g04(evidence, expected_commit_sha=COMMIT, evidence_root=tmp_path)
+    assert details["legacy_audit_sha256"] == evidence["legacy_audit"]["sha256"]
+
+
+@pytest.mark.parametrize("payload", [[], [{}, {}], [{}], b"[{", [1], ["inspect"]])
+def test_g04_rejects_invalid_docker_inspect_arrays(verifier, tmp_path, monkeypatch, payload):
+    evidence, _, _ = g04_fixture(verifier, tmp_path, monkeypatch)
+    ref = evidence["container_security"]["inspect"]
+    inspect = json.loads((tmp_path / ref["path"]).read_text(encoding="utf-8"))
+    if payload == [{}]:
+        inspect["HostConfig"]["Privileged"] = True
+        payload = [inspect]
+    evidence["container_security"]["inspect"] = artifact(tmp_path, ref["path"], payload)
+    with pytest.raises(ValueError, match="inspect"):
+        verifier.validate_g04(evidence, expected_commit_sha=COMMIT, evidence_root=tmp_path)
+
+
+def test_g01_accepts_hash_bound_har_and_png(verifier, tmp_path):
+    details = verifier.validate_g01(
+        g01_evidence(tmp_path),
+        expected_commit_sha=COMMIT,
+        archive_result=archive_result(verifier),
+        evidence_root=tmp_path,
+    )
+    assert details["evidence_paths"] == ["g01/public.png", "g01/public.har"]
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        b"dummy HAR",
+        {},
+        {"log": {"entries": []}},
+        {"log": {"entries": [{}]}},
+        {"log": {"entries": [{"request": {}, "response": {"status": 200}}]}},
+        {
+            "log": {
+                "entries": [
+                    {
+                        "request": {"method": "GET", "url": "https://example.test", "headers": []},
+                        "response": {"status": 200, "content": {"mimeType": "application/json"}},
+                    }
+                ]
+            }
+        },
+        [],
+    ],
+)
+def test_g01_rejects_dummy_or_malformed_har(verifier, tmp_path, payload):
+    evidence = g01_evidence(tmp_path)
+    evidence["har"] = artifact(tmp_path, evidence["har"]["path"], payload)
+    with pytest.raises(ValueError, match="har"):
+        verifier.validate_g01(
+            evidence,
+            expected_commit_sha=COMMIT,
+            archive_result=archive_result(verifier),
+            evidence_root=tmp_path,
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [("method", ""), ("url", ""), ("status", True), ("status", 99), ("status", 600)],
+)
+def test_g01_rejects_invalid_har_entries(verifier, tmp_path, field, value):
+    evidence = g01_evidence(tmp_path)
+    har = json.loads((tmp_path / evidence["har"]["path"]).read_text(encoding="utf-8"))
+    target = (
+        har["log"]["entries"][0]["request"]
+        if field in {"method", "url"}
+        else har["log"]["entries"][0]["response"]
+    )
+    target[field] = value
+    evidence["har"] = artifact(tmp_path, evidence["har"]["path"], har)
+    with pytest.raises(ValueError, match="har"):
+        verifier.validate_g01(
+            evidence,
+            expected_commit_sha=COMMIT,
+            archive_result=archive_result(verifier),
+            evidence_root=tmp_path,
+        )
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://example.test/auth/start",
+        "https://example.test/LOGIN",
+        "https://example.test/logout",
+        "https://example.test/session",
+        "https://example.test/oauth/authorize",
+        "https://example.test/token",
+        "https://example.test/?AUTH=1",
+        "https://example.test/?access_token=1",
+        "https://example.test/?refresh_token=1",
+        "https://example.test/?session_id=1",
+        "https://example.test/?api_key=1",
+        "https://example.test/?session=1",
+    ],
+)
+def test_g01_rejects_auth_or_session_urls_even_with_zero_claims(verifier, tmp_path, url):
+    evidence = g01_evidence(tmp_path)
+    har = json.loads((tmp_path / evidence["har"]["path"]).read_text(encoding="utf-8"))
+    har["log"]["entries"].append(copy.deepcopy(har["log"]["entries"][0]))
+    har["log"]["entries"][1]["request"]["url"] = url
+    evidence["har"] = artifact(tmp_path, evidence["har"]["path"], har)
+    with pytest.raises(ValueError, match="auth|session"):
+        verifier.validate_g01(
+            evidence,
+            expected_commit_sha=COMMIT,
+            archive_result=archive_result(verifier),
+            evidence_root=tmp_path,
+        )
+
+
+@pytest.mark.parametrize("header", ["Authorization", "aUtHoRiZaTiOn", "Cookie", "cOoKiE"])
+def test_g01_rejects_credential_headers(verifier, tmp_path, header):
+    evidence = g01_evidence(tmp_path)
+    har = json.loads((tmp_path / evidence["har"]["path"]).read_text(encoding="utf-8"))
+    har["log"]["entries"][0]["request"]["headers"] = [{"name": header, "value": "redacted"}]
+    evidence["har"] = artifact(tmp_path, evidence["har"]["path"], har)
+    with pytest.raises(ValueError, match="Authorization|Cookie"):
+        verifier.validate_g01(
+            evidence,
+            expected_commit_sha=COMMIT,
+            archive_result=archive_result(verifier),
+            evidence_root=tmp_path,
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [("authenticated", True), ("auth_requests", False), ("session_requests", 0.0)],
+)
+def test_g01_requires_exact_unauthenticated_integer_zero_counts(verifier, tmp_path, field, value):
+    evidence = g01_evidence(tmp_path)
+    evidence["visitor"][field] = value
+    with pytest.raises(ValueError, match="visitor"):
+        verifier.validate_g01(
+            evidence,
+            expected_commit_sha=COMMIT,
+            archive_result=archive_result(verifier),
+            evidence_root=tmp_path,
+        )
+
+
+@pytest.mark.parametrize(
+    "screenshot",
+    [
+        b"dummy screenshot",
+        b"\x89PNG\r\n\x1a\n",
+        png_bytes(319, 200),
+        png_bytes(320, 199),
+        png_bytes(320, 200)[:100],
+        png_bytes(320, 200)[:29] + b"\x00\x00\x00\x00" + png_bytes(320, 200)[33:],
+    ],
+)
+def test_g01_rejects_invalid_screenshot_bytes(verifier, tmp_path, screenshot):
+    evidence = g01_evidence(tmp_path)
+    evidence["screenshot"] = artifact(tmp_path, evidence["screenshot"]["path"], screenshot)
+    with pytest.raises(ValueError, match="screenshot"):
+        verifier.validate_g01(
+            evidence,
+            expected_commit_sha=COMMIT,
+            archive_result=archive_result(verifier),
+            evidence_root=tmp_path,
+        )
+
+
+@pytest.mark.parametrize("change", ["hash", "traversal", "symlink", "omitted_path"])
+def test_g01_rejects_unsafe_or_unbound_screenshots(verifier, tmp_path, change):
+    evidence = g01_evidence(tmp_path)
+    if change == "hash":
+        evidence["screenshot"]["sha256"] = "0" * 64
+    elif change == "traversal":
+        evidence["screenshot"]["path"] = "../outside.png"
+    elif change == "symlink":
+        ref = evidence["screenshot"]
+        target = tmp_path / ref["path"]
+        outside = tmp_path / "outside.png"
+        target.rename(outside)
+        try:
+            target.symlink_to(outside)
+        except OSError as exc:
+            pytest.skip(f"symlinks unavailable on this platform: {exc}")
+    else:
+        evidence["evidence_paths"] = ["g01/public.har"]
+    with pytest.raises(ValueError, match="screenshot|evidence_paths"):
+        verifier.validate_g01(
+            evidence,
+            expected_commit_sha=COMMIT,
+            archive_result=archive_result(verifier),
+            evidence_root=tmp_path,
+        )
+
+
+def test_g05_accepts_closed_loop_artifacts(verifier, tmp_path):
+    details = verifier.validate_g05(
+        g05_evidence(tmp_path), expected_commit_sha=COMMIT, evidence_root=tmp_path
+    )
+    assert details["browser_result"] == "g05/browser.json"
+
+
+@pytest.mark.parametrize("field", ["exit_code", "output", "name"])
+def test_g05_rejects_status_only_commands(verifier, tmp_path, field):
+    evidence = g05_evidence(tmp_path)
+    evidence["commands"][0].pop(field)
+    with pytest.raises(ValueError, match="commands"):
+        verifier.validate_g05(evidence, expected_commit_sha=COMMIT, evidence_root=tmp_path)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [("name", "other"), ("exit_code", 1), ("exit_code", False), ("output", "  \n")],
+)
+def test_g05_rejects_invalid_embedded_command_records(verifier, tmp_path, field, value):
+    evidence = g05_evidence(tmp_path)
+    ref = evidence["commands"][0]["output"]
+    payload = json.loads((tmp_path / ref["path"]).read_text(encoding="utf-8"))
+    payload[field] = value
+    evidence["commands"][0]["output"] = artifact(tmp_path, ref["path"], payload)
+    with pytest.raises(ValueError, match="check"):
+        verifier.validate_g05(evidence, expected_commit_sha=COMMIT, evidence_root=tmp_path)
+
+
+@pytest.mark.parametrize(
+    "change", ["hash", "malformed", "duplicate", "bool_exit", "missing_required"]
+)
+def test_g05_rejects_invalid_command_wrappers(verifier, tmp_path, change):
+    evidence = g05_evidence(tmp_path)
+    if change == "hash":
+        evidence["commands"][0]["output"]["sha256"] = "0" * 64
+    elif change == "malformed":
+        ref = evidence["commands"][0]["output"]
+        evidence["commands"][0]["output"] = artifact(tmp_path, ref["path"], b"not json")
+    elif change == "duplicate":
+        evidence["commands"][1]["name"] = "check"
+    elif change == "bool_exit":
+        evidence["commands"][0]["exit_code"] = False
+    else:
+        evidence["commands"].pop()
+    with pytest.raises(ValueError, match="check|commands|command"):
+        verifier.validate_g05(evidence, expected_commit_sha=COMMIT, evidence_root=tmp_path)
+
+
+@pytest.mark.parametrize(
+    ("section", "field", "value"),
+    [
+        ("browser", "browser", ""),
+        ("upload", "paperId", ""),
+        ("upload", "workflowId", "other"),
+        ("planApproval", "experimentId", "other"),
+        ("planApproval", "planId", "other"),
+        ("planApproval", "planVersion", True),
+        ("planApproval", "planVersion", 0),
+        ("execution", "runId", ""),
+        ("execution", "workflowId", "other"),
+        ("execution", "experimentId", "other"),
+        ("execution", "planId", "other"),
+        ("execution", "planVersion", 0),
+        ("execution", "status", "failed"),
+        ("execution", "attempt", True),
+        ("execution", "codeHash", "C" * 64),
+        ("reportDownload", "reportId", ""),
+        ("reportDownload", "version", 0),
+        ("reportDownload", "runId", "other"),
+        ("reportDownload", "markdownHash", "0" * 64),
+        ("reportDownload", "finalAttempt", 4),
+    ],
+)
+def test_g05_rejects_unrelated_or_incomplete_closed_loop_identities(
+    verifier, tmp_path, section, field, value
+):
+    evidence = g05_evidence(tmp_path)
+    ref = evidence["browser_result"]
+    browser = json.loads((tmp_path / ref["path"]).read_text(encoding="utf-8"))
+    if section == "browser":
+        browser[field] = value
+    else:
+        browser[section][field] = value
+    evidence["browser_result"] = artifact(tmp_path, ref["path"], browser)
+    with pytest.raises(ValueError, match=field):
+        verifier.validate_g05(evidence, expected_commit_sha=COMMIT, evidence_root=tmp_path)
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        "placeholder",
+        "bare_path",
+        "stale",
+        "markdown_hash",
+        "empty_markdown",
+        "changed_markdown",
+        "missing_upload",
+        "missing_execution_attempt",
+    ],
+)
+def test_g05_rejects_placeholder_or_unbound_download_evidence(verifier, tmp_path, change):
+    evidence = g05_evidence(tmp_path)
+    if change == "placeholder":
+        ref = evidence["browser_result"]
+        evidence["browser_result"] = artifact(
+            tmp_path, ref["path"], {"commitSha": COMMIT, "passed": True}
+        )
+    elif change == "bare_path":
+        evidence["browser_result"] = evidence["browser_result"]["path"]
+    elif change == "stale":
+        ref = evidence["browser_result"]
+        browser = json.loads((tmp_path / ref["path"]).read_text(encoding="utf-8"))
+        browser["commitSha"] = OTHER_COMMIT
+        evidence["browser_result"] = artifact(tmp_path, ref["path"], browser)
+    elif change == "markdown_hash":
+        evidence["report_download"]["sha256"] = "0" * 64
+    elif change == "changed_markdown":
+        evidence["report_download"] = artifact(
+            tmp_path, evidence["report_download"]["path"], b"# Different report\n"
+        )
+    else:
+        ref = evidence["browser_result"]
+        browser = json.loads((tmp_path / ref["path"]).read_text(encoding="utf-8"))
+        if change == "missing_upload":
+            browser.pop("upload")
+        elif change == "missing_execution_attempt":
+            browser["execution"].pop("attempt")
+        else:
+            browser["reportDownload"]["markdownHash"] = hashlib.sha256(b"").hexdigest()
+            evidence["report_download"] = artifact(
+                tmp_path, evidence["report_download"]["path"], b""
+            )
+        evidence["browser_result"] = artifact(tmp_path, ref["path"], browser)
+    with pytest.raises(ValueError, match="browser_result|report_download|reportDownload|sha256"):
+        verifier.validate_g05(evidence, expected_commit_sha=COMMIT, evidence_root=tmp_path)
+
+
+def test_g05_allows_additional_uniquely_named_commands(verifier, tmp_path):
+    evidence = g05_evidence(tmp_path)
+    payload = {"name": "lint_extra", "exit_code": 0, "output": "extra captured output"}
+    evidence["commands"].append(
+        {
+            "name": "lint_extra",
+            "exit_code": 0,
+            "output": artifact(tmp_path, "g05/extra.json", payload),
+        }
+    )
+    details = verifier.validate_g05(evidence, expected_commit_sha=COMMIT, evidence_root=tmp_path)
+    assert "lint_extra" in details["commands"]
+
+
+def test_p1_accepts_summary_and_canonical_category_artifacts(verifier, tmp_path):
+    details = verifier.validate_p1(
+        p1_evidence(tmp_path), expected_commit_sha=COMMIT, evidence_root=tmp_path
+    )
+    assert details["evidence_categories"] == 5
+    assert set(details["paths"]) == {
+        "p1/desktop.png",
+        "p1/narrow.png",
+        "p1/browser.png",
+        "p1/api.json",
+    }
+
+
+@pytest.mark.parametrize(
+    ("surface", "field", "value"),
+    [
+        ("desktop", "columns", True),
+        ("narrow", "columns", 4),
+        ("narrow", "run_id", "other"),
+        ("desktop", "paper", " "),
+        ("narrow", "plan", ""),
+        ("desktop", "actual", ""),
+    ],
+)
+def test_p1_rejects_invalid_summary_rows(verifier, tmp_path, surface, field, value):
+    evidence = p1_evidence(tmp_path)
+    evidence["first_screen_summary"][surface][field] = value
+    with pytest.raises(ValueError, match=field):
+        verifier.validate_p1(evidence, expected_commit_sha=COMMIT, evidence_root=tmp_path)
+
+
+@pytest.mark.parametrize(
+    "categories",
+    [
+        5,
+        ["paper", "plan", "code", "execution"],
+        ["paper"] * 5,
+        list(reversed(P1_CATEGORIES)),
+        ["paper", "plan", "code", "execution", "unknown"],
+    ],
+)
+def test_p1_rejects_noncanonical_category_lists(verifier, tmp_path, categories):
+    evidence = p1_evidence(tmp_path)
+    evidence["evidence_index"]["browser"]["categories"] = categories
+    with pytest.raises(ValueError, match="categories"):
+        verifier.validate_p1(evidence, expected_commit_sha=COMMIT, evidence_root=tmp_path)
+
+
+@pytest.mark.parametrize("surface", ["browser", "api"])
+def test_p1_rejects_unrelated_run_ids(verifier, tmp_path, surface):
+    evidence = p1_evidence(tmp_path)
+    evidence["evidence_index"][surface]["run_id"] = "other"
+    with pytest.raises(ValueError, match="run_id"):
+        verifier.validate_p1(evidence, expected_commit_sha=COMMIT, evidence_root=tmp_path)
+
+
+@pytest.mark.parametrize("change", ["browser_png", "dummy_png", "api_hash", "api_malformed"])
+def test_p1_rejects_invalid_bound_artifacts(verifier, tmp_path, change):
+    evidence = p1_evidence(tmp_path)
+    if change == "browser_png":
+        ref = evidence["evidence_index"]["browser"]["screenshot"]
+        evidence["evidence_index"]["browser"]["screenshot"] = artifact(
+            tmp_path, ref["path"], b"dummy"
+        )
+    elif change == "dummy_png":
+        ref = evidence["first_screen_summary"]["desktop"]["screenshot"]
+        evidence["first_screen_summary"]["desktop"]["screenshot"] = artifact(
+            tmp_path, ref["path"], b"dummy"
+        )
+    elif change == "api_hash":
+        evidence["evidence_index"]["api"]["result"]["sha256"] = "0" * 64
+    else:
+        ref = evidence["evidence_index"]["api"]["result"]
+        evidence["evidence_index"]["api"]["result"] = artifact(tmp_path, ref["path"], b"not json")
+    with pytest.raises(ValueError, match="screenshot|result"):
+        verifier.validate_p1(evidence, expected_commit_sha=COMMIT, evidence_root=tmp_path)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("run_id", "other"),
+        ("categories", ["paper"]),
+        ("items", []),
+        ("items", [{"id": "x"}]),
+        (
+            "items",
+            [
+                {
+                    "id": f"i-{c}",
+                    "category": c,
+                    "target_type": "artifact",
+                    "target_id": "t",
+                    "locator": {},
+                }
+                for c in P1_CATEGORIES[:-1]
+            ],
+        ),
+        (
+            "items",
+            [
+                {
+                    "id": f"i-{c}",
+                    "category": c,
+                    "target_type": "artifact",
+                    "target_id": "t",
+                    "locator": [],
+                }
+                for c in P1_CATEGORIES
+            ],
+        ),
+        (
+            "items",
+            [
+                {"id": f"i-{c}", "category": c, "target_type": "", "target_id": "t", "locator": {}}
+                for c in P1_CATEGORIES
+            ],
+        ),
+    ],
+)
+def test_p1_rejects_invalid_api_items(verifier, tmp_path, field, value):
+    evidence = p1_evidence(tmp_path)
+    ref = evidence["evidence_index"]["api"]["result"]
+    payload = json.loads((tmp_path / ref["path"]).read_text(encoding="utf-8"))
+    payload[field] = value
+    evidence["evidence_index"]["api"]["result"] = artifact(tmp_path, ref["path"], payload)
+    with pytest.raises(ValueError, match="result|items"):
+        verifier.validate_p1(evidence, expected_commit_sha=COMMIT, evidence_root=tmp_path)
+
+
+@pytest.mark.parametrize("missing", ["p1/api.json", "p1/browser.png", "p1/desktop.png"])
+def test_p1_evidence_paths_include_every_bound_artifact(verifier, tmp_path, missing):
+    evidence = p1_evidence(tmp_path)
+    evidence["evidence_paths"].remove(missing)
+    with pytest.raises(ValueError, match="evidence_paths"):
+        verifier.validate_p1(evidence, expected_commit_sha=COMMIT, evidence_root=tmp_path)
 
 
 @pytest.mark.parametrize("gate", GATES)
@@ -1048,19 +1677,9 @@ def test_complete_current_evidence_can_pass_every_gate(verifier, tmp_path, monke
         "G-04": g04_evidence,
         "G-05": g05_evidence(root),
         "NFR-05": nfr05_evidence(verifier),
-        "P1": p1_evidence(),
-        "G-01": g01_evidence(),
+        "P1": p1_evidence(root),
+        "G-01": g01_evidence(root),
     }
-    for relative in (
-        "g01/public.png",
-        "g01/public.har",
-        "p1/desktop.png",
-        "p1/narrow.png",
-        "p1/evidence-index.png",
-    ):
-        path = root / relative
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_bytes(b"evidence")
     for gate, evidence in evidence_by_gate.items():
         write_json(root, GATE_PATHS[gate], evidence)
     monkeypatch.setattr(
@@ -1106,9 +1725,7 @@ def test_cli_writes_ledger_and_table_then_returns_nonzero(verifier, tmp_path, mo
 
 
 def test_deliverable_rejects_stale_per_gate_commit(verifier):
-    statuses = {
-        gate: {"status": "passed", "commit_sha": COMMIT} for gate in GATES
-    }
+    statuses = {gate: {"status": "passed", "commit_sha": COMMIT} for gate in GATES}
     statuses["G-03"]["commit_sha"] = OTHER_COMMIT
     ledger = verifier.build_ledger(statuses, commit_sha=COMMIT)
     assert ledger["gates"]["G-03"]["status"] == "pending"
@@ -1148,10 +1765,16 @@ def test_cli_rejects_noncanonical_output_without_changing_victim(verifier, tmp_p
     victim.parent.mkdir(parents=True, exist_ok=True)
     victim.write_bytes(b"do not overwrite")
     with pytest.raises(SystemExit) as error:
-        verifier.main([
-            "--evidence-root", str(root), "--output", str(root / relative),
-            "--commit-sha", COMMIT,
-        ])
+        verifier.main(
+            [
+                "--evidence-root",
+                str(root),
+                "--output",
+                str(root / relative),
+                "--commit-sha",
+                COMMIT,
+            ]
+        )
     assert error.value.code == 2
     assert victim.read_bytes() == b"do not overwrite"
     assert not (root / "acceptance-ledger.json").exists()
@@ -1176,10 +1799,16 @@ def test_cli_rejects_symlink_output_without_changing_target(verifier, tmp_path):
     except OSError as exc:
         pytest.skip(f"symlinks unavailable on this platform: {exc}")
     with pytest.raises(SystemExit) as error:
-        verifier.main([
-            "--evidence-root", str(root), "--output", str(output),
-            "--commit-sha", COMMIT,
-        ])
+        verifier.main(
+            [
+                "--evidence-root",
+                str(root),
+                "--output",
+                str(output),
+                "--commit-sha",
+                COMMIT,
+            ]
+        )
     assert error.value.code == 2
     assert victim.read_bytes() == b"do not overwrite"
     assert output.is_symlink()
@@ -1203,9 +1832,17 @@ def test_cli_atomically_replaces_only_canonical_ledger(verifier, tmp_path, monke
 
     monkeypatch.setattr(verifier.os, "replace", checked_replace)
     for _ in range(2):
-        assert verifier.main([
-            "--evidence-root", str(root), "--commit-sha", COMMIT,
-        ]) == 1
+        assert (
+            verifier.main(
+                [
+                    "--evidence-root",
+                    str(root),
+                    "--commit-sha",
+                    COMMIT,
+                ]
+            )
+            == 1
+        )
     assert len(replaced) == 2
     assert all(not path.exists() for path in replaced)
     assert json.loads(output.read_text(encoding="utf-8"))["commit_sha"] == COMMIT

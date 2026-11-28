@@ -17,7 +17,6 @@ from .routers import (
     experiments,
     health,
     papers,
-    reproductions,
     runs,
     workflows,
 )
@@ -162,7 +161,6 @@ def create_app(settings: ApiSettings | None = None) -> FastAPI:
     )
     app.add_middleware(RequestTelemetryMiddleware, metrics=app.state.metrics)
     app.include_router(health.router)
-    app.include_router(reproductions.router)
     app.include_router(papers.router)
     app.include_router(experiments.router)
     app.include_router(runs.router)

@@ -1,9 +1,4 @@
-"""Graph nodes.
-
-understand_paper / extract_spec implement the Paper Understanding module.
-The remaining nodes are later-phase placeholders. The Agent never executes
-Python itself: run_experiment will delegate to the Runner over HTTP.
-"""
+"""Active understanding and deterministic planning graph nodes."""
 
 import asyncio
 import base64
@@ -48,19 +43,3 @@ async def plan_experiment(state: AgentState) -> dict:
     if card is None:
         raise ValueError("plan_experiment requires a ReproductionCard in state")
     return {"plan": build_plan(card, state.get("scaling"))}
-
-
-async def generate_code(state: AgentState) -> dict:
-    raise NotImplementedError("later phase: generate_code")
-
-
-async def run_experiment(state: AgentState) -> dict:
-    raise NotImplementedError("later phase: run_experiment (delegates to Runner)")
-
-
-async def compare_results(state: AgentState) -> dict:
-    raise NotImplementedError("later phase: compare_results")
-
-
-async def write_report(state: AgentState) -> dict:
-    raise NotImplementedError("later phase: write_report")

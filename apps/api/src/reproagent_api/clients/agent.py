@@ -17,7 +17,6 @@ from reproagent_schemas import (
     ExtractResponse,
     GroundRequest,
     GroundResponse,
-    JobAccepted,
     PaperSupportCheck,
     ParsedDocument,
     ParseRequest,
@@ -28,7 +27,6 @@ from reproagent_schemas import (
     RepairRequest,
     RepairResponse,
     ReproductionCard,
-    ReproductionRequest,
     ReviewRequest,
     StaticValidateRequest,
     UnderstandRequest,
@@ -53,13 +51,6 @@ class AgentClient:
             transport=transport,
             trust_env=False,
         )
-
-    async def start_reproduction(self, request: ReproductionRequest) -> JobAccepted:
-        response = await self._client.post(
-            "/v1/reproductions", json=request.model_dump(mode="json")
-        )
-        response.raise_for_status()
-        return JobAccepted.model_validate(response.json())
 
     async def understand(self, request: UnderstandRequest) -> UnderstandResponse:
         response = await self._client.post(

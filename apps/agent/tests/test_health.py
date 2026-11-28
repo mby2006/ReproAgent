@@ -12,17 +12,32 @@ def client():
         yield test_client
 
 
-def test_health_reports_graph_loaded(client):
+def test_health_reports_active_graph_readiness_and_llm_configuration(client):
     body = client.get("/health").json()
     assert body["service"] == "agent"
     assert body["status"] == "ok"
-    assert body["details"]["graph_loaded"] is True
-    assert body["details"]["graph_nodes"] == 7
+    assert body["details"] == {
+        "understanding_graph_loaded": True,
+        "planning_graph_loaded": True,
+        "understanding_graph_nodes": 2,
+        "planning_graph_nodes": 1,
+        "llm_loaded": True,
+        "llm_configured": False,
+    }
 
 
-def test_health_is_unavailable_without_loaded_graph():
+@pytest.mark.parametrize("graph_name", ["understanding_graph", "planning_graph"])
+def test_health_is_unavailable_without_each_active_graph(graph_name):
     app = create_app(AgentSettings(runner_base_url="http://runner.test", _env_file=None))
-    app.state.graph = None
+    setattr(app.state, graph_name, None)
+    response = TestClient(app).get("/health")
+    assert response.status_code == 503
+    assert response.json()["status"] == "unavailable"
+
+
+def test_health_is_unavailable_without_llm_adapter():
+    app = create_app(AgentSettings(runner_base_url="http://runner.test", _env_file=None))
+    app.state.llm = None
     response = TestClient(app).get("/health")
     assert response.status_code == 503
     assert response.json()["status"] == "unavailable"

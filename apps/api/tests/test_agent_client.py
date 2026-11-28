@@ -8,27 +8,9 @@ from reproagent_schemas import (
     EvidenceStatus,
     ParsedDocument,
     ReproductionCard,
-    ReproductionRequest,
     UnderstandRequest,
     UnderstandResponse,
 )
-
-
-async def test_agent_client_start_reproduction():
-    job_id = uuid4()
-    user_id = uuid4()
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        assert request.url.path == "/v1/reproductions"
-        return httpx.Response(202, json={"job_id": str(job_id), "status": "queued"})
-
-    settings = ApiSettings(agent_base_url="http://agent.test", _env_file=None)
-    client = AgentClient(settings, transport=httpx.MockTransport(handler))
-    request = ReproductionRequest(user_id=user_id, paper_id=uuid4(), title="LeNet-5")
-    accepted = await client.start_reproduction(request)
-    assert accepted.job_id == job_id
-    assert accepted.status.value == "queued"
-    await client.aclose()
 
 
 async def test_agent_client_understand_contract():

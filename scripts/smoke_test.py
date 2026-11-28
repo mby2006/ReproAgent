@@ -63,13 +63,18 @@ def main() -> int:
 
         try:
             body = client.get(f"{AGENT_URL}/health").json()
+            details = body.get("details", {})
             check(
-                "agent /health graph loaded",
-                body.get("status") == "ok" and body["details"]["graph_loaded"] is True,
-                str(body.get("details")),
+                "agent /health active graphs and LLM ready",
+                body.get("status") == "ok"
+                and details.get("understanding_graph_loaded") is True
+                and details.get("planning_graph_loaded") is True
+                and details.get("llm_loaded") is True
+                and details.get("llm_configured") is True,
+                str(details),
             )
         except httpx.HTTPError as exc:
-            check("agent /health graph loaded", False, str(exc))
+            check("agent /health active graphs and LLM ready", False, str(exc))
 
         try:
             body = client.get(f"{AGENT_URL}/health/dependencies").json()

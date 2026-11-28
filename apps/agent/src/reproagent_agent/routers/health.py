@@ -9,26 +9,30 @@ from reproagent_schemas import (
     HealthStatus,
 )
 
-from ..graph.build import NODE_ORDER
-
 router = APIRouter(tags=["health"])
 
 
 @router.get("/health", response_model=HealthResponse)
 async def health(request: Request) -> Response:
-    graph = getattr(request.app.state, "graph", None)
+    understanding = getattr(request.app.state, "understanding_graph", None)
+    planning = getattr(request.app.state, "planning_graph", None)
+    llm_loaded = getattr(request.app.state, "llm", None) is not None
+    ready = understanding is not None and planning is not None and llm_loaded
     payload = HealthResponse(
         service="agent",
-        status=HealthStatus.OK if graph is not None else HealthStatus.UNAVAILABLE,
+        status=HealthStatus.OK if ready else HealthStatus.UNAVAILABLE,
         details={
-            "graph_loaded": graph is not None,
-            "graph_nodes": len(NODE_ORDER),
+            "understanding_graph_loaded": understanding is not None,
+            "planning_graph_loaded": planning is not None,
+            "understanding_graph_nodes": 2 if understanding is not None else 0,
+            "planning_graph_nodes": 1 if planning is not None else 0,
+            "llm_loaded": llm_loaded,
             "llm_configured": bool(request.app.state.settings.qwen_api_key),
         },
     )
     return Response(
         content=payload.model_dump_json(),
-        status_code=200 if graph is not None else 503,
+        status_code=200 if ready else 503,
         media_type="application/json",
     )
 

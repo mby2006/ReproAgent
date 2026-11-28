@@ -61,12 +61,21 @@ test("versionless plan and report placeholders remain readable in rendered marku
     items: [
       evidenceItem({ id: "plan-placeholder", category: "plan", target_type: "plan", target_id: "plan-7", locator: { plan_id: "plan-7" }, unavailable_reason: "版本不可用" }),
       evidenceItem({ id: "report-placeholder", category: "review_report", target_type: "report", target_id: "report-9", locator: { report_id: "report-9" }, unavailable_reason: "版本不可用" }),
+      evidenceItem({ id: "trace-placeholder", category: "review_report", target_type: "review_trace", target_id: "report-9", locator: { source: "plan" }, unavailable_reason: "Plan 审核记录不可用" }),
     ],
   };
   const html = renderToStaticMarkup(React.createElement(EvidenceIndex, { index }));
   assert.ok(!html.includes("vundefined"));
+  assert.ok(!html.includes("undefined"));
   assert.ok(html.includes("plan-7"));
   assert.ok(html.includes("report-9"));
+  assert.ok(html.includes("plan · report-9"));
+});
+
+test("legacy review trace placeholders without a source render their target id", () => {
+  assert.equal(evidenceLocatorText(evidenceItem({
+    category: "review_report", target_type: "review_trace", target_id: "report-9", locator: {},
+  })), "report-9");
 });
 
 test("private code interaction loads the exact indexed attempt and matching file", async () => {

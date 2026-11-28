@@ -29,7 +29,10 @@ export function evidenceLocatorText(item: EvidenceIndexItem) {
       ? `v${version}`
       : item.target_id;
   }
-  if (item.target_type === "review_trace") return `${item.locator.source} · ${item.target_id}`;
+  if (item.target_type === "review_trace") {
+    const source = item.locator.source;
+    return typeof source === "string" && source ? `${source} · ${item.target_id}` : item.target_id;
+  }
   return item.target_id;
 }
 

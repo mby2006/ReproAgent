@@ -473,23 +473,31 @@ def build_evidence_index(admin, run_id: UUID | str, actor: UUID | str) -> Eviden
                     suffix=source,
                 )
             )
-    if report_matches and not any(
-        item.target_type == "review_trace" for item in items[review_trace_start:]
-    ):
-        items.append(
-            _item(
-                "review_report",
-                "review_trace",
-                report["id"],
-                {
-                    "run_id": run_id,
-                    "report_id": report["id"],
-                    "version": report["version"],
-                    "attempt": attempt,
-                },
-                unavailable_reason="最终报告没有持久化的 Card/Plan review trace",
-                suffix="unavailable",
+    if report_matches:
+        trace_items = items[review_trace_start:]
+        for source, label in (("card", "Card"), ("plan", "Plan")):
+            if any(
+                item.target_type == "review_trace"
+                and not item.unavailable_reason
+                and item.locator.get("source") == source
+                for item in trace_items
+            ):
+                continue
+            items.append(
+                _item(
+                    "review_report",
+                    "review_trace",
+                    report["id"],
+                    {
+                        "source": source,
+                        "run_id": run_id,
+                        "report_id": report["id"],
+                        "version": report["version"],
+                        "attempt": attempt,
+                    },
+                    unavailable_reason=f"最终报告没有持久化的 {label} review trace",
+                    suffix=f"{source}-unavailable",
+                )
             )
-        )
 
     return EvidenceIndex(run_id=run_id, items=items)

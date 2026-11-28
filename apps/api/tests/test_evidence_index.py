@@ -252,14 +252,41 @@ def test_matching_report_without_persisted_review_traces_is_explicit():
     admin, run_id, *_ = _seed_final_attempt()
     index = build_evidence_index(admin, run_id, actor=USER_ID)
     traces = [item for item in index.items if item.target_type == "review_trace"]
-    assert len(traces) == 1
-    assert traces[0].category == "review_report"
-    assert traces[0].hash is None
-    assert traces[0].unavailable_reason
-    assert "trace_id" not in traces[0].locator
+    assert len(traces) == 2
+    assert {item.locator["source"] for item in traces} == {"card", "plan"}
+    assert all(item.category == "review_report" for item in traces)
+    assert all(item.hash is None and item.unavailable_reason for item in traces)
+    assert all("trace_id" not in item.locator for item in traces)
     report = next(item for item in index.items if item.target_type == "report")
-    assert traces[0].locator["report_id"] == report.target_id
-    assert traces[0].locator["version"] == report.locator["version"]
+    assert all(item.locator["report_id"] == report.target_id for item in traces)
+    assert all(item.locator["version"] == report.locator["version"] for item in traces)
+
+
+@pytest.mark.parametrize("present_source", ["card", "plan"])
+def test_each_missing_review_trace_source_is_explicit(present_source):
+    from reproagent_api.services.evidence_index import build_evidence_index
+
+    admin, run_id, *_ = _seed_final_attempt()
+    event = {
+        "id": str(uuid4()),
+        "field_path": "optimizer",
+        "before": "sgd",
+        "after": "sgd",
+        "timestamp": "2026-01-01T00:00:00+00:00",
+    }
+    if present_source == "card":
+        admin.tables["reproduction_specs"][0]["spec_json"]["review_decisions"] = [event]
+    else:
+        admin.tables["experiment_plans"][1]["changes_json"] = [event]
+    index = build_evidence_index(admin, run_id, actor=USER_ID)
+    traces = [item for item in index.items if item.target_type == "review_trace"]
+    assert len(traces) == 2
+    available = next(item for item in traces if not item.unavailable_reason)
+    missing = next(item for item in traces if item.unavailable_reason)
+    assert available.target_id == event["id"]
+    assert available.locator["source"] == present_source
+    assert missing.locator["source"] == ("plan" if present_source == "card" else "card")
+    assert "trace_id" not in missing.locator
 
 
 def test_review_trace_ids_only_include_real_persisted_card_and_plan_events():

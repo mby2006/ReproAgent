@@ -17,3 +17,7 @@ test("cancelled workflows are terminal and have a display label", () => {
   assert.equal(loaded.exports.isWorkflowTerminal("executing"), false);
   assert.equal(loaded.exports.WF_META.cancelled.label, "已取消");
 });
+
+test("repair ceiling matches the system-wide execution bound", () => {
+  assert.equal(loaded.exports.MAX_REPAIR_ATTEMPTS, 3);
+});

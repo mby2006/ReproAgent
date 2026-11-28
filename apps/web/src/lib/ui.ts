@@ -86,6 +86,11 @@ export const RUN_META: Record<RunStatus, { label: string; tone: Tone }> = {
 
 export const RUN_TERMINAL: RunStatus[] = ["succeeded", "failed", "timeout", "cancelled"];
 
+// Mirrors BudgetConfig.max_repairs (packages/schemas) and the SQL CHECK
+// execution_runs.repair_attempt BETWEEN 0 AND 3; the ceiling is never persisted
+// per run, so the UI cannot read a different value for an older record.
+export const MAX_REPAIR_ATTEMPTS = 3;
+
 export const CHECK_META: Record<CheckStatus, { label: string; tone: Tone }> = {
   matched: { label: "匹配", tone: "ok" },
   deviated: { label: "偏差", tone: "bad" },

@@ -14,6 +14,7 @@ const { outputText } = ts.transpileModule(source, {
 });
 const loaded = { exports: {} };
 let states = [];
+let repairCeiling = 3;
 const mockedRequire = (name) => {
   if (name === "react") return {
     ...React,
@@ -34,6 +35,7 @@ const mockedRequire = (name) => {
   if (name.includes("icons")) return { IconPlay: () => null, IconStop: () => null };
   if (name === "@/lib/ui") return {
     ERROR_LABEL: {}, RUN_META: { running: { tone: "info", label: "运行中" } },
+    get MAX_REPAIR_ATTEMPTS() { return repairCeiling; },
     isWorkflowTerminal: (status) => ["completed", "failed", "cancelled"].includes(status),
     RUN_TERMINAL: ["succeeded", "failed", "timeout", "cancelled"],
     TONE_BADGE: {}, fmtDate: (value) => value,
@@ -88,4 +90,19 @@ test("run failures and an in-flight cancellation are announced accessibly", () =
   }));
   assert.ok(html.includes('role="alert"'));
   assert.match(html, /<button[^>]*disabled=""[^>]*aria-busy="true"[^>]*>.*取消中/s);
+});
+
+test("repair chip takes its ceiling from the shared ui declaration", () => {
+  states = [[run], "run-1", { ...run, repair_attempt: 2 }, { stdout: "", stderr: "" },
+    [], [], null, "stdout", null, null, false, false, null];
+  repairCeiling = 9;
+  try {
+    const html = renderToStaticMarkup(React.createElement(RunPanel, {
+      experimentId: "experiment-1", approved: true,
+    }));
+    assert.match(html, /repair 2(?:<!-- -->)?\/9/);
+    assert.ok(!/repair 2(?:<!-- -->)?\/3/.test(html));
+  } finally {
+    repairCeiling = 3;
+  }
 });

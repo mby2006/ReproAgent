@@ -18,7 +18,7 @@ import type {
   RunSummary,
   WorkflowStatus,
 } from "@/lib/types";
-import { ERROR_LABEL, isWorkflowTerminal, RUN_META, RUN_TERMINAL, TONE_BADGE, fmtDate } from "@/lib/ui";
+import { ERROR_LABEL, isWorkflowTerminal, MAX_REPAIR_ATTEMPTS, RUN_META, RUN_TERMINAL, TONE_BADGE, fmtDate } from "@/lib/ui";
 
 export function findNewRun<T extends { id: string }>(runs: T[], knownIds: ReadonlySet<string> | null) {
   if (!knownIds) return undefined;
@@ -418,7 +418,7 @@ export default function RunPanel({
             <StatusBadge status={detail.status} />
             <span className="chip">code v{detail.code_version}</span>
             <span className="chip">plan v{detail.plan_version}</span>
-            <span className="chip">repair {detail.repair_attempt}/3</span>
+            <span className="chip">repair {detail.repair_attempt}/{MAX_REPAIR_ATTEMPTS}</span>
             {detail.exit_code != null && <span className="chip">exit {detail.exit_code}</span>}
             {detail.runtime_json?.execution_time != null && (
               <span className="chip">{detail.runtime_json.execution_time.toFixed(1)}s</span>

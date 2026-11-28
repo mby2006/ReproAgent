@@ -6,9 +6,10 @@ persists every version. Ownership flows runs -> experiments -> projects.user_id.
 The API process never executes generated code.
 """
 
+import math
 import re
-from datetime import datetime
-from typing import Annotated, Literal
+from datetime import UTC, datetime
+from typing import Annotated, Any, Literal
 from urllib.parse import quote
 from uuid import UUID
 
@@ -37,6 +38,7 @@ from ..services import (
 from ..services import get_report as load_report
 from ..services.dispatch import enqueue_pending_outbox
 from ..services.evidence_index import EvidenceIndex, build_evidence_index
+from ..services.reports import latest_report_generation_seconds
 from ..services.runs import (
     execution_request_id,
     finalize_execution_run,
@@ -111,6 +113,44 @@ class CodeFileRecord(SchemaModel):
 
 class RunReport(ReportVersion):
     """API representation of one immutable report version."""
+
+
+class RunTimingResponse(SchemaModel):
+    run_id: UUID
+    attempt: int = Field(ge=1)
+    status: RunStatus
+    queue_seconds: float | None = Field(default=None, ge=0)
+    container_lifecycle_seconds: float | None = Field(default=None, ge=0)
+    training_evaluation_seconds: float | None = Field(default=None, ge=0)
+    report_generation_seconds: float | None = Field(default=None, ge=0)
+    total_seconds: float | None = Field(default=None, ge=0)
+    environment: dict[str, Any] = {}
+
+
+def _timing_stage(timing: dict, name: str) -> float | None:
+    value = timing.get(name)
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"invalid timing stage: {name}")
+    value = float(value)
+    if not math.isfinite(value) or value < 0:
+        raise ValueError(f"invalid timing stage: {name}")
+    return value
+
+
+def _elapsed_seconds(started_at, finished_at) -> float | None:
+    if started_at is None or finished_at is None:
+        return None
+    started = started_at if isinstance(started_at, datetime) else datetime.fromisoformat(started_at)
+    finished = (
+        finished_at
+        if isinstance(finished_at, datetime)
+        else datetime.fromisoformat(finished_at)
+    )
+    started = started.replace(tzinfo=UTC) if started.tzinfo is None else started
+    finished = finished.replace(tzinfo=UTC) if finished.tzinfo is None else finished
+    return max(0.0, (finished - started).total_seconds())
 
 
 def _admin(request: Request):
@@ -288,6 +328,45 @@ async def get_run(
 ) -> RunDetail:
     admin = _admin(request)
     return RunDetail.model_validate(_get_run(admin, run_id, user_id))
+
+
+@router.get("/runs/{run_id}/timings", response_model=list[RunTimingResponse])
+async def get_run_timings(
+    request: Request, run_id: UUID, user_id: Annotated[UUID, Depends(get_current_user_id)]
+) -> list[RunTimingResponse]:
+    admin = _admin(request)
+    run = _get_run(admin, run_id, user_id)
+    attempts = (
+        admin.table("execution_attempts")
+        .select("attempt,status,runner_accepted_at,timing_json")
+        .eq("run_id", str(run_id))
+        .order("attempt")
+        .execute()
+        .data
+    )
+    result = []
+    for attempt in attempts:
+        timing = attempt.get("timing_json") or {}
+        setup = _timing_stage(timing, "container_setup_seconds")
+        training = _timing_stage(timing, "training_evaluation_seconds")
+        cleanup = _timing_stage(timing, "container_cleanup_seconds")
+        lifecycle = setup + training + cleanup if None not in (setup, training, cleanup) else None
+        queue = _elapsed_seconds(run.get("created_at"), attempt.get("runner_accepted_at"))
+        report = latest_report_generation_seconds(admin, str(run_id), attempt["attempt"])
+        total = queue + lifecycle + report if None not in (queue, lifecycle, report) else None
+        environment = timing.get("environment")
+        result.append(RunTimingResponse(
+            run_id=run_id,
+            attempt=attempt["attempt"],
+            status=RunStatus(attempt["status"]),
+            queue_seconds=queue,
+            container_lifecycle_seconds=lifecycle,
+            training_evaluation_seconds=training,
+            report_generation_seconds=report,
+            total_seconds=total,
+            environment=environment if isinstance(environment, dict) else {},
+        ))
+    return result
 
 
 @router.get("/runs/{run_id}/artifacts", response_model=list[ArtifactRecord])

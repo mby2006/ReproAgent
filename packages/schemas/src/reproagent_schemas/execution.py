@@ -133,6 +133,34 @@ class RunAccepted(SchemaModel):
     status: RunStatus = RunStatus.QUEUED
 
 
+class RunTimings(SchemaModel):
+    """Measured execution segments; ``None`` means the stage did not execute."""
+
+    queue_seconds: float | None = Field(default=None, ge=0)
+    runner_queue_seconds: float | None = Field(default=None, ge=0)
+    container_setup_seconds: float | None = Field(default=None, ge=0)
+    container_cleanup_seconds: float | None = Field(default=None, ge=0)
+    container_lifecycle_seconds: float | None = Field(default=None, ge=0)
+    training_evaluation_seconds: float | None = Field(default=None, ge=0)
+    report_generation_seconds: float | None = Field(default=None, ge=0)
+    runner_total_seconds: float | None = Field(default=None, ge=0)
+    total_seconds: float | None = Field(default=None, ge=0)
+
+    @model_validator(mode="after")
+    def check_container_lifecycle(self) -> "RunTimings":
+        stages = (
+            self.container_setup_seconds,
+            self.training_evaluation_seconds,
+            self.container_cleanup_seconds,
+        )
+        if self.container_lifecycle_seconds is not None:
+            if any(stage is None for stage in stages):
+                raise ValueError("container lifecycle requires all three container stages")
+            if self.container_lifecycle_seconds != sum(stages):
+                raise ValueError("container lifecycle must equal setup + training + cleanup")
+        return self
+
+
 class RunAudit(SchemaModel):
     """Reproducibility fingerprint persisted with every run."""
 
@@ -144,6 +172,7 @@ class RunAudit(SchemaModel):
     code_hash: str | None = None
     plan_version: int | None = None
     code_version: int | None = None
+    resource_budget: ResourceBudget | None = None
 
 
 class ExecImageStatus(SchemaModel):
@@ -177,6 +206,7 @@ class RunResult(SchemaModel):
     error_category: ErrorCategory | None = None
     error: str | None = None
     audit: RunAudit | None = None
+    timings: RunTimings = Field(default_factory=RunTimings)
     # 1-based attempt ordinal within a Run. Populated by the API when it
     # persists a Runner result; the Runner itself is attempt-agnostic.
     attempt: int | None = Field(default=None, ge=1)

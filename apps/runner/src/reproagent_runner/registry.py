@@ -24,6 +24,7 @@ from reproagent_schemas import (
     RunRequest,
     RunResult,
     RunStatus,
+    RunTimings,
     request_fingerprint,
 )
 
@@ -51,6 +52,7 @@ class RunRecord:
     container_id: str | None = None
     task: asyncio.Task | None = None
     finished_at: float | None = None
+    accepted_at: float | None = None
     fingerprint: str = ""
     cancel_requested: bool = False
 
@@ -110,6 +112,7 @@ class RunRegistry:
             "result": record.result.model_dump(mode="json") if record.result else None,
             "container_id": record.container_id,
             "finished_at": record.finished_at,
+            "accepted_at": record.accepted_at,
             "cancel_requested": record.cancel_requested,
         })
 
@@ -140,6 +143,13 @@ class RunRegistry:
             or not math.isfinite(finished_at)
         ):
             raise ValueError("journal finished_at is not a finite timestamp")
+        accepted_at = payload.get("accepted_at")
+        if accepted_at is not None and (
+            isinstance(accepted_at, bool)
+            or not isinstance(accepted_at, (int, float))
+            or not math.isfinite(accepted_at)
+        ):
+            raise ValueError("journal accepted_at is not a finite timestamp")
         container_id = payload.get("container_id")
         if container_id is not None and (not isinstance(container_id, str) or not container_id):
             raise ValueError("journal container_id is invalid")
@@ -161,6 +171,7 @@ class RunRegistry:
             result=result,
             container_id=container_id,
             finished_at=finished_at,
+            accepted_at=accepted_at,
             fingerprint=fingerprint,
             cancel_requested=cancel_requested,
         )
@@ -301,6 +312,7 @@ class RunRegistry:
             run_id=run_id,
             run_dir=self._settings.work_dir / str(run_id),
             fingerprint=request_fingerprint(request),
+            accepted_at=time.time(),
         )
         self._runs[run_id] = record
         self._write_record(record)
@@ -311,9 +323,14 @@ class RunRegistry:
     async def _execute(self, record: RunRecord) -> None:
         if record.status is RunStatus.CANCELLED:
             return
+        started = time.perf_counter()
+        runner_queue_seconds = (
+            max(0.0, time.time() - record.accepted_at)
+            if record.accepted_at is not None
+            else None
+        )
         record.status = RunStatus.RUNNING
         self._write_record(record)
-        started = time.perf_counter()
         loop = asyncio.get_running_loop()
 
         def on_container(container_id: str) -> None:
@@ -349,6 +366,12 @@ class RunRegistry:
         record.result = result
         record.status = result.status
         record.container_id = None
+        runner_total_seconds = time.perf_counter() - started
+        timing = result.timings.model_dump()
+        timing["runner_queue_seconds"] = runner_queue_seconds
+        timing["runner_total_seconds"] = runner_total_seconds
+        result = result.model_copy(update={"timings": RunTimings(**timing)})
+        record.result = result
         if record.finished_at is None:
             record.finished_at = time.time()
         self._write_record(record)
@@ -358,7 +381,7 @@ class RunRegistry:
                 "event": "run_finished",
                 "run_id": str(record.run_id),
                 "status": record.status.value,
-                "duration_ms": round((time.perf_counter() - started) * 1000, 2),
+                "duration_ms": round(runner_total_seconds * 1000, 2),
             },
         )
 

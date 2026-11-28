@@ -268,6 +268,23 @@ def append_report_version(
     return ReportVersion.model_validate(rows[0])
 
 
+def latest_report_generation_seconds(admin, run_id: str, attempt: int) -> float | None:
+    """Read evaluator latency from the latest immutable version for one attempt."""
+    rows = (
+        admin.table("reproduction_reports")
+        .select("generation_ms")
+        .eq("run_id", run_id)
+        .eq("attempt", attempt)
+        .order("version", desc=True)
+        .limit(1)
+        .execute()
+        .data
+    )
+    if not rows or rows[0].get("generation_ms") is None:
+        return None
+    return rows[0]["generation_ms"] / 1000
+
+
 def get_report(admin, run_id: str, version: int | None = None) -> ReportVersion:
     if version is not None and version <= 0:
         raise ValueError("Report version must be a positive integer")

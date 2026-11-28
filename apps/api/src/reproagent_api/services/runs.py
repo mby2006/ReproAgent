@@ -9,6 +9,7 @@ silently editing training targets in code.
 """
 
 import hashlib
+import json
 from datetime import UTC, datetime
 from uuid import NAMESPACE_URL, UUID, uuid5
 
@@ -36,6 +37,12 @@ from reproagent_schemas import (
 from .versions import insert_versioned
 
 LOGS_BUCKET = "runs"
+TERMINAL_STATUSES = frozenset({
+    RunStatus.SUCCEEDED.value,
+    RunStatus.FAILED.value,
+    RunStatus.TIMEOUT.value,
+    RunStatus.CANCELLED.value,
+})
 
 
 def project_actor(admin, project_id: str) -> UUID:
@@ -265,11 +272,13 @@ def update_attempt_status(
     admin, run_id: str, attempt: int, status: str, *,
     error: str | None = None, runner_request_id: str | None = None,
     runner_run_id: str | None = None, finished_at: str | None = None,
+    runner_accepted_at: str | None = None, allow_unsealed_repair: bool = False,
 ) -> None:
-    """Advance one attempt row without touching terminal states.
+    """Advance one attempt row without touching a sealed terminal state.
 
-    Protected (``succeeded``/``cancelled``) attempts never regress. Terminal
-    writes always stamp ``finished_at`` exactly once.
+    All four terminal states are sealed. A newly pinned repair can inherit the
+    previous projection's failed/timeout status before dispatch; only that
+    unfinished placeholder may be opened by its owning acceptance call.
     """
     if attempt < 1:
         raise ValueError(f"attempt must be 1-based, got {attempt}")
@@ -282,9 +291,18 @@ def update_attempt_status(
         patch["runner_run_id"] = runner_run_id
     if finished_at is not None:
         patch["finished_at"] = finished_at
-    admin.table("execution_attempts").update(patch).eq("run_id", run_id).eq("attempt", attempt).neq(
-        "status", RunStatus.SUCCEEDED.value
-    ).neq("status", RunStatus.CANCELLED.value).execute()
+    if runner_accepted_at is not None:
+        patch["runner_accepted_at"] = runner_accepted_at
+    query = admin.table("execution_attempts").update(patch).eq("run_id", run_id).eq(
+        "attempt", attempt
+    )
+    for terminal in TERMINAL_STATUSES:
+        if allow_unsealed_repair and terminal in {
+            RunStatus.FAILED.value, RunStatus.TIMEOUT.value,
+        }:
+            continue
+        query = query.neq("status", terminal)
+    query.execute()
 
 
 def list_attempts(admin, run_id: str) -> list[dict]:
@@ -477,15 +495,33 @@ def persist_runner_run_id(admin, run_id: str, runner_run_id: UUID, attempt: int)
     )
     if not rows:
         return False
+    history_attempt = attempt + 1
+    existing = (
+        admin.table("execution_attempts")
+        .select("status,finished_at,runner_accepted_at")
+        .eq("run_id", run_id)
+        .eq("attempt", history_attempt)
+        .execute()
+        .data
+    )
+    existing_attempt = existing[0] if existing else {}
+    accepted_at = existing_attempt.get("runner_accepted_at") or datetime.now(UTC).isoformat()
+    allow_unsealed_repair = (
+        existing_attempt.get("status") in {RunStatus.FAILED.value, RunStatus.TIMEOUT.value}
+        and existing_attempt.get("finished_at") is None
+        and existing_attempt.get("runner_accepted_at") is None
+    )
     # Scope identity to the owning 0-based repair attempt. A later repair resets
     # only the projection and must never erase the previous attempt's Runner id.
     update_attempt_status(
         admin,
         run_id,
-        attempt + 1,
+        history_attempt,
         RunStatus.RUNNING.value,
         runner_request_id=str(execution_request_id(UUID(run_id), attempt)),
         runner_run_id=str(runner_run_id),
+        runner_accepted_at=accepted_at,
+        allow_unsealed_repair=allow_unsealed_repair,
     )
     return True
 
@@ -565,6 +601,89 @@ def _upload(admin, path: str, data: bytes) -> None:
     )
 
 
+def _utc_datetime(value) -> datetime | None:
+    if value is None:
+        return None
+    parsed = value if isinstance(value, datetime) else datetime.fromisoformat(str(value))
+    return parsed.replace(tzinfo=UTC) if parsed.tzinfo is None else parsed.astimezone(UTC)
+
+
+def _queue_seconds(created_at, accepted_at) -> float | None:
+    created = _utc_datetime(created_at)
+    accepted = _utc_datetime(accepted_at)
+    if created is None or accepted is None:
+        return None
+    return max(0.0, (accepted - created).total_seconds())
+
+
+def _result_environment(admin, run: dict, attempt: dict, result: RunResult) -> dict:
+    plan_id = attempt.get("plan_id") or run.get("plan_id")
+    plans = (
+        admin.table("experiment_plans")
+        .select("config_json")
+        .eq("id", plan_id)
+        .limit(1)
+        .execute().data
+        if plan_id
+        else []
+    )
+    config = plans[0].get("config_json") if plans else None
+    plan_hash = (
+        hashlib.sha256(
+            json.dumps(config, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+        ).hexdigest()
+        if config is not None
+        else None
+    )
+    audit = result.audit
+    return {
+        "image_digest": audit.image_digest if audit else None,
+        "dataset_fingerprint": audit.dataset_fingerprint if audit else None,
+        "dependency_lock_hash": audit.dependency_lock_hash if audit else None,
+        "plan_hash": plan_hash,
+        "code_hash": audit.code_hash if audit else None,
+        "seed": audit.seed if audit else None,
+        "resource_budget": (
+            audit.resource_budget.model_dump(mode="json")
+            if audit and audit.resource_budget
+            else None
+        ),
+    }
+
+
+def _persist_result_timings(
+    admin, run: dict, attempt_number: int, result: RunResult
+) -> None:
+    """Merge timing evidence only through a nonterminal attempt update."""
+    attempts = (
+        admin.table("execution_attempts")
+        .select("plan_id,runner_accepted_at,timing_json")
+        .eq("run_id", run["id"])
+        .eq("attempt", attempt_number)
+        .execute()
+        .data
+    )
+    if not attempts:
+        return
+    attempt = attempts[0]
+    timing = result.timings.model_dump(mode="json")
+    timing["queue_seconds"] = _queue_seconds(
+        run.get("created_at"), attempt.get("runner_accepted_at")
+    )
+    timing["report_generation_seconds"] = None
+    timing["total_seconds"] = None
+    timing["environment"] = _result_environment(admin, run, attempt, result)
+    query = (
+        admin.table("execution_attempts")
+        .update({"timing_json": timing, "updated_at": datetime.now(UTC).isoformat()})
+        .eq("run_id", run["id"])
+        .eq("attempt", attempt_number)
+    )
+    for terminal in TERMINAL_STATUSES:
+        query = query.neq("status", terminal)
+    query.execute()
+
+
 async def async_persist_result(
     admin, run_id: str, runner_run_id: UUID, result: RunResult, runner, attempt: int
 ) -> None:
@@ -626,7 +745,7 @@ async def async_persist_result(
     # attempt's artifact rows, and applies the audit update atomically. A cancel
     # or terminal seal during storage/Runner I/O therefore wins without losing
     # existing evidence or overwriting terminal audit/error/path truth.
-    admin.rpc(
+    persisted = bool(admin.rpc(
         "persist_execution_result",
         {
             "p_run_id": run_id,
@@ -643,7 +762,9 @@ async def async_persist_result(
             ),
             "p_error": result.error,
         },
-    ).execute()
+    ).execute().data)
+    if persisted:
+        _persist_result_timings(admin, claimed[0], history_attempt, result)
 
 
 def create_oom_plan(

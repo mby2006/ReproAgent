@@ -27,6 +27,7 @@ from reproagent_schemas import (
     RunRequest,
     RunResult,
     RunStatus,
+    RunTimings,
     compute_code_hash,
 )
 from requests.exceptions import ConnectionError as RequestsConnectionError
@@ -128,6 +129,7 @@ def _image_audit(client, image: str, request: RunRequest) -> RunAudit:
         code_hash=compute_code_hash(request.code_files),
         plan_version=request.plan_version,
         code_version=request.code_version,
+        resource_budget=request.resource_budget,
     )
 
 
@@ -185,6 +187,7 @@ class Sandbox:
             request, self._settings, host_run_dir / "code", host_run_dir / "output"
         )
         budget = request.resource_budget
+        timings = RunTimings()
 
         if cancel_event.is_set():
             return RunResult(
@@ -192,6 +195,7 @@ class Sandbox:
                 status=RunStatus.CANCELLED,
                 error="cancelled before the container started",
                 audit=audit,
+                timings=timings,
             )
 
         labels = {
@@ -201,11 +205,13 @@ class Sandbox:
         }
         if self._owner_id is not None:
             labels["reproagent.owner"] = self._owner_id
+        setup_started = time.monotonic()
         try:
             container = _create_container(
                 self._client, self._settings.exec_image, request, host_config, labels
             )
         except (ImageNotFound, APIError) as exc:
+            timings.container_setup_seconds = time.monotonic() - setup_started
             return RunResult(
                 run_id=run_id,
                 status=RunStatus.FAILED,
@@ -213,18 +219,23 @@ class Sandbox:
                 error=f"sandbox container could not be created: {exc}",
                 error_category=ErrorCategory.UNKNOWN_ERROR,
                 audit=audit,
+                timings=timings,
             )
+        timings.container_setup_seconds = time.monotonic() - setup_started
 
         status = RunStatus.FAILED
         exit_code: int | None = None
-        started = time.monotonic()
+        execution_started = time.monotonic()
+        training_started: float | None = None
+        training_ended: float | None = None
         disk_exceeded = False
         disk_limit = budget.disk_mb * 1024 * 1024
         try:
             if on_container is not None:
                 on_container(container.id)
             container.start()
-            deadline = started + budget.max_seconds
+            training_started = time.monotonic()
+            deadline = execution_started + budget.max_seconds
             # Poll instead of one blocking wait: storage_opt cannot quota the
             # bind-mounted /output, so its size is checked here, and cancel stays
             # responsive throughout the run.
@@ -265,11 +276,23 @@ class Sandbox:
                     exit_code = int(container.wait(timeout=10).get("StatusCode", -1))
                 except Exception:
                     exit_code = -1
+            training_ended = time.monotonic()
+            if training_started is not None:
+                timings.training_evaluation_seconds = training_ended - training_started
         finally:
-            execution_time = time.monotonic() - started
+            cleanup_started = time.monotonic()
+            execution_time = cleanup_started - execution_started
             stdout = self._logs(container, stdout=True)
             stderr = self._logs(container, stdout=False)
             self._remove(container)
+            cleanup_ended = time.monotonic()
+            timings.container_cleanup_seconds = cleanup_ended - cleanup_started
+            if training_ended is not None:
+                timings.container_lifecycle_seconds = (
+                    timings.container_setup_seconds
+                    + timings.training_evaluation_seconds
+                    + timings.container_cleanup_seconds
+                )
 
         metrics: dict = {}
         error: str | None = None
@@ -302,6 +325,7 @@ class Sandbox:
             error=error,
             error_category=error_category,
             audit=audit,
+            timings=timings,
         )
 
     def _kill(self, container) -> None:

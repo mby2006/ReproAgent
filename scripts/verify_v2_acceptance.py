@@ -395,8 +395,12 @@ def _validate_public_har(payload: dict, field: str) -> tuple[int, int]:
         auth_requests += int(is_auth)
         session_requests += int(is_session)
         if status == 200:
-            content = _mapping(response.get("content"), f"{entry_field}.response.content")
-            mime_type = _text(content.get("mimeType"), f"{entry_field}.response.content.mimeType")
+            if "content" not in response:
+                continue
+            content = _mapping(response["content"], f"{entry_field}.response.content")
+            if "mimeType" not in content:
+                continue
+            mime_type = _text(content["mimeType"], f"{entry_field}.response.content.mimeType")
             html_entries += int("text/html" in mime_type.lower())
     if not html_entries:
         raise ValueError(f"{field} must contain a status-200 text/html entry")
@@ -815,14 +819,14 @@ def validate_g05(
         name = _text(command.get("name"), f"{field}.name")
         if name in by_name:
             raise ValueError(f"duplicate command at {field}")
-        if command.get("exit_code") != 0 or isinstance(command.get("exit_code"), bool):
+        if type(command.get("exit_code")) is not int or command["exit_code"] != 0:
             raise ValueError(f"command {name} at {field}.exit_code must be zero")
         _, output = _hash_bound_json_artifact(
             evidence_root, command.get("output"), f"{field}.output"
         )
         if output.get("name") != name:
             raise ValueError(f"command {name} at {field}.output has a mismatched name")
-        if output.get("exit_code") != 0 or isinstance(output.get("exit_code"), bool):
+        if type(output.get("exit_code")) is not int or output["exit_code"] != 0:
             raise ValueError(f"command {name} at {field}.output.exit_code must be zero")
         try:
             _text(output.get("output"), f"{field}.output.output")
@@ -1016,7 +1020,7 @@ def validate_p1(
         if row.get("status") != "passed":
             raise ValueError(f"{field}.status must be passed")
         columns = row.get("columns")
-        if isinstance(columns, bool) or columns != 3:
+        if type(columns) is not int or columns != 3:
             raise ValueError(f"{field}.columns must be integer 3")
         run_ids.add(_text(row.get("run_id"), f"{field}.run_id"))
         for key in ("paper", "plan", "actual"):

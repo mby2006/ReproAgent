@@ -1153,6 +1153,54 @@ def test_g01_rejects_dummy_or_malformed_har(verifier, tmp_path, payload):
         )
 
 
+@pytest.mark.parametrize("response", [{"status": 200}, {"status": 200, "content": {}}])
+def test_g01_accepts_additional_status_200_entry_without_content(
+    verifier, tmp_path, response
+):
+    evidence = g01_evidence(tmp_path)
+    har = json.loads((tmp_path / evidence["har"]["path"]).read_text(encoding="utf-8"))
+    har["log"]["entries"].append(
+        {
+            "request": {"method": "GET", "url": "https://example.test/asset", "headers": []},
+            "response": response,
+        }
+    )
+    evidence["har"] = artifact(tmp_path, evidence["har"]["path"], har)
+    verifier.validate_g01(
+        evidence,
+        expected_commit_sha=COMMIT,
+        archive_result=archive_result(verifier),
+        evidence_root=tmp_path,
+    )
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        {"status": 200, "content": None},
+        {"status": 200, "content": {"mimeType": None}},
+        {"status": 200, "content": {"mimeType": 1}},
+    ],
+)
+def test_g01_rejects_malformed_present_content(verifier, tmp_path, response):
+    evidence = g01_evidence(tmp_path)
+    har = json.loads((tmp_path / evidence["har"]["path"]).read_text(encoding="utf-8"))
+    har["log"]["entries"].append(
+        {
+            "request": {"method": "GET", "url": "https://example.test/asset", "headers": []},
+            "response": response,
+        }
+    )
+    evidence["har"] = artifact(tmp_path, evidence["har"]["path"], har)
+    with pytest.raises(ValueError, match="har"):
+        verifier.validate_g01(
+            evidence,
+            expected_commit_sha=COMMIT,
+            archive_result=archive_result(verifier),
+            evidence_root=tmp_path,
+        )
+
+
 @pytest.mark.parametrize(
     ("field", "value"),
     [("method", ""), ("url", ""), ("status", True), ("status", 99), ("status", 600)],
@@ -1301,6 +1349,37 @@ def test_g05_rejects_status_only_commands(verifier, tmp_path, field):
     evidence = g05_evidence(tmp_path)
     evidence["commands"][0].pop(field)
     with pytest.raises(ValueError, match="commands"):
+        verifier.validate_g05(evidence, expected_commit_sha=COMMIT, evidence_root=tmp_path)
+
+
+@pytest.mark.parametrize("location", ["wrapper", "embedded"])
+@pytest.mark.parametrize("value", [0.0, False, 1, -1, "0", None])
+def test_g05_rejects_non_integer_zero_command_exit_codes(
+    verifier, tmp_path, location, value
+):
+    evidence = g05_evidence(tmp_path)
+    if location == "wrapper":
+        evidence["commands"][0]["exit_code"] = value
+    else:
+        ref = evidence["commands"][0]["output"]
+        payload = json.loads((tmp_path / ref["path"]).read_text(encoding="utf-8"))
+        payload["exit_code"] = value
+        evidence["commands"][0]["output"] = artifact(tmp_path, ref["path"], payload)
+    with pytest.raises(ValueError, match="exit_code"):
+        verifier.validate_g05(evidence, expected_commit_sha=COMMIT, evidence_root=tmp_path)
+
+
+@pytest.mark.parametrize("location", ["wrapper", "embedded"])
+def test_g05_rejects_missing_command_exit_codes(verifier, tmp_path, location):
+    evidence = g05_evidence(tmp_path)
+    if location == "wrapper":
+        evidence["commands"][0].pop("exit_code")
+    else:
+        ref = evidence["commands"][0]["output"]
+        payload = json.loads((tmp_path / ref["path"]).read_text(encoding="utf-8"))
+        payload.pop("exit_code")
+        evidence["commands"][0]["output"] = artifact(tmp_path, ref["path"], payload)
+    with pytest.raises(ValueError, match="exit_code"):
         verifier.validate_g05(evidence, expected_commit_sha=COMMIT, evidence_root=tmp_path)
 
 
@@ -1453,6 +1532,23 @@ def test_p1_accepts_summary_and_canonical_category_artifacts(verifier, tmp_path)
         "p1/browser.png",
         "p1/api.json",
     }
+
+
+@pytest.mark.parametrize("surface", ["desktop", "narrow"])
+@pytest.mark.parametrize("value", [3.0, True, 4, 2.5, "3", None])
+def test_p1_rejects_non_integer_three_columns(verifier, tmp_path, surface, value):
+    evidence = p1_evidence(tmp_path)
+    evidence["first_screen_summary"][surface]["columns"] = value
+    with pytest.raises(ValueError, match="columns"):
+        verifier.validate_p1(evidence, expected_commit_sha=COMMIT, evidence_root=tmp_path)
+
+
+@pytest.mark.parametrize("surface", ["desktop", "narrow"])
+def test_p1_rejects_missing_columns(verifier, tmp_path, surface):
+    evidence = p1_evidence(tmp_path)
+    evidence["first_screen_summary"][surface].pop("columns")
+    with pytest.raises(ValueError, match="columns"):
+        verifier.validate_p1(evidence, expected_commit_sha=COMMIT, evidence_root=tmp_path)
 
 
 @pytest.mark.parametrize(

@@ -22,11 +22,13 @@ MODULE_TARGETS = (
     "reproagent_agent.clients.runner",
     "reproagent_agent.graph",
     "reproagent_agent.routers.reproductions",
+    "reproagent_api.routers.reproductions",
 )
 ROUTE_TARGETS = ("/v1/jobs", "/v1/reproductions")
 RETIRED_TARGETS = {
     "reproagent_agent.clients.runner",
     "reproagent_agent.routers.reproductions",
+    "reproagent_api.routers.reproductions",
     *ROUTE_TARGETS,
 }
 TARGETS = (*MODULE_TARGETS, *ROUTE_TARGETS)
@@ -39,6 +41,9 @@ RETAINED_FILES = {
     ),
     "reproagent_agent.routers.reproductions": (
         "apps/agent/src/reproagent_agent/routers/reproductions.py",
+    ),
+    "reproagent_api.routers.reproductions": (
+        "apps/api/src/reproagent_api/routers/reproductions.py",
     ),
     "/v1/reproductions": (
         "apps/agent/src/reproagent_agent/routers/reproductions.py",

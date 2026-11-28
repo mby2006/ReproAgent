@@ -50,4 +50,7 @@ apps/web/.ReproAgent.qoder.site
 *.qoder.site
 
 # CLI 时代的临时工作目录（现在迁移由 deploy/server/bootstrap.sh 直接 psql 打）
-deploy/server/supabase/
+deploy/server/supabase/*
+!deploy/server/supabase/migrations/
+deploy/server/supabase/migrations/*
+!deploy/server/supabase/migrations/*.sql

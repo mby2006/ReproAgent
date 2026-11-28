@@ -66,24 +66,32 @@ def test_agent_lifespan_initializes_only_active_graphs():
     assert app.state.planning_graph is not None
 
 
-def test_agent_fresh_process_does_not_import_runner_or_full_graph_symbols():
+def test_fresh_process_does_not_import_retired_modules_or_full_graph_symbols():
     code = """
 import json
 import sys
 from fastapi.testclient import TestClient
 from reproagent_agent.config import AgentSettings
 from reproagent_agent.graph import build
-from reproagent_agent.main import create_app
-app = create_app(AgentSettings(_env_file=None))
-with TestClient(app):
+from reproagent_agent.main import create_app as create_agent_app
+from reproagent_api.config import ApiSettings
+from reproagent_api.main import create_app as create_api_app
+agent_app = create_agent_app(AgentSettings(_env_file=None))
+api_reproductions_imported_before = "reproagent_api.routers.reproductions" in sys.modules
+api_app = create_api_app(ApiSettings(redis_url="redis://127.0.0.1:1", _env_file=None))
+with TestClient(agent_app):
+    pass
+with TestClient(api_app):
     pass
 print(json.dumps({
+    "api_reproductions_imported_before": api_reproductions_imported_before,
+    "api_reproductions_imported_after": "reproagent_api.routers.reproductions" in sys.modules,
     "runner_imported": "reproagent_agent.clients.runner" in sys.modules,
     "reproductions_imported": "reproagent_agent.routers.reproductions" in sys.modules,
     "full_graph_builder": hasattr(build, "build_graph"),
     "legacy_node_order": hasattr(build, "NODE_ORDER"),
     "legacy_llm_resolver": hasattr(build, "_resolve_llm"),
-    "legacy_app_graph": hasattr(app.state, "graph"),
+    "legacy_app_graph": hasattr(agent_app.state, "graph"),
 }))
 """
     result = subprocess.run(
@@ -94,6 +102,8 @@ print(json.dumps({
         check=True,
     )
     assert json.loads(result.stdout) == {
+        "api_reproductions_imported_before": False,
+        "api_reproductions_imported_after": False,
         "runner_imported": False,
         "reproductions_imported": False,
         "full_graph_builder": False,

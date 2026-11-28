@@ -29,18 +29,30 @@ def test_health_reports_active_graph_readiness_and_llm_configuration(client):
 @pytest.mark.parametrize("graph_name", ["understanding_graph", "planning_graph"])
 def test_health_is_unavailable_without_each_active_graph(graph_name):
     app = create_app(AgentSettings(runner_base_url="http://runner.test", _env_file=None))
-    setattr(app.state, graph_name, None)
-    response = TestClient(app).get("/health")
+    with TestClient(app) as client:
+        setattr(app.state, graph_name, None)
+        response = client.get("/health")
     assert response.status_code == 503
-    assert response.json()["status"] == "unavailable"
+    body = response.json()
+    assert body["status"] == "unavailable"
+    details = body["details"]
+    assert details[f"{graph_name}_loaded"] is False
+    assert details["llm_loaded"] is True
+    other_graph = "planning_graph" if graph_name == "understanding_graph" else "understanding_graph"
+    assert details[f"{other_graph}_loaded"] is True
 
 
 def test_health_is_unavailable_without_llm_adapter():
     app = create_app(AgentSettings(runner_base_url="http://runner.test", _env_file=None))
-    app.state.llm = None
-    response = TestClient(app).get("/health")
+    with TestClient(app) as client:
+        app.state.llm = None
+        response = client.get("/health")
     assert response.status_code == 503
-    assert response.json()["status"] == "unavailable"
+    body = response.json()
+    assert body["status"] == "unavailable"
+    assert body["details"]["llm_loaded"] is False
+    assert body["details"]["understanding_graph_loaded"] is True
+    assert body["details"]["planning_graph_loaded"] is True
 
 
 def test_dependencies_runner_ok(client, monkeypatch):

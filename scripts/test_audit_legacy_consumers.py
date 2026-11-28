@@ -74,6 +74,16 @@ async def job():
     )
     write(
         root,
+        "apps/api/src/reproagent_api/routers/reproductions.py",
+        """from fastapi import APIRouter
+router = APIRouter(prefix="/v1")
+@router.post("/reproductions")
+async def start():
+    return None
+""",
+    )
+    write(
+        root,
         "apps/agent/src/reproagent_agent/graph/build.py",
         """def build_graph():
     return None
@@ -169,6 +179,7 @@ app.planning_graph = build_planning_graph()
     for target in (
         "reproagent_agent.clients.runner",
         "reproagent_agent.routers.reproductions",
+        "reproagent_api.routers.reproductions",
         "/v1/jobs",
         "/v1/reproductions",
     ):
@@ -188,6 +199,37 @@ def test_production_consumer_blocks_retirement(repository, audit_module):
     assert blocking
     assert all(c["classification"] == "production" for c in blocking)
     assert report["ok"] is False
+
+
+def test_api_router_production_import_blocks_but_test_and_docs_references_do_not(
+    repository, audit_module
+):
+    target_name = "reproagent_api.routers.reproductions"
+    write(repository, "apps/api/src/reproagent_api/main.py", f"from {target_name} import router\n")
+    write(repository, "tests/test_api_legacy.py", f"import {target_name}\n")
+    write(repository, "docs/legacy-api.md", f"Retired module: `{target_name}`.\n")
+
+    report = audit_module.audit_repository(repository)
+
+    assert target_name in report["targets"]
+    target = report["targets"][target_name]
+    assert target["status"] == "retired-by-nonregistration"
+    assert target["retained_files"] == ["apps/api/src/reproagent_api/routers/reproductions.py"]
+    assert target["registrations"] == []
+    assert classifications(report, target_name) == {"production", "test", "docs-only"}
+    assert {consumer["kind"] for consumer in target["consumers"]} == {
+        "python-import",
+        "documentation-reference",
+    }
+    blocking = [consumer for consumer in target["consumers"] if consumer["blocking"]]
+    assert len(blocking) == 1
+    assert blocking[0]["path"] == "apps/api/src/reproagent_api/main.py"
+    assert blocking[0]["classification"] == "production"
+    assert all(
+        not consumer["blocking"]
+        for consumer in target["consumers"]
+        if consumer["classification"] in {"test", "docs-only"}
+    )
 
 
 def test_matching_migrations_have_exact_hashes(repository, audit_module):

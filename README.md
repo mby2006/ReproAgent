@@ -2,47 +2,49 @@
 
 科研论文复现 Agent。上传论文 PDF 或提供 URL，系统自动完成：论文理解 → 结构化复现规格提取（含原文证据）→ 缩小规模实验计划 → Python 实验代码生成 → 隔离环境执行 → 与论文报告结果对比 → 可追溯复现报告。
 
-**当前进度**：各模块已整合为**统一 LangGraph 工作流**（15 节点 + 12 态状态机 + Postgres checkpoint + 预算/重试/Trace harness），上传 → 确认 Card → 批准计划 → 真实训练 → 报告的全流程可**完全从前端闭环操作**。Paper Understanding、Experiment Planner、代码生成/执行与 **Reproduction Evaluator / 报告系统**已实现。理解链路：上传 PDF → PyMuPDF 解析（页码/章节/表格/OCR 扩展接口）→ Qwen 提取 Reproduction Card → 证据落地校验（页码/引文由解析器回填，LLM 无法伪造）→ 前端双栏证据审阅 + 追加式版本管理。规划链路：Reproduction Card → 确定性规则引擎生成缩小规模实验计划（无 LLM，每个参数带来源溯源）→ 关键假设人工确认门 → 追加式计划版本管理（用户修改 / OOM 降批大小）→ 前端审批 UI。执行链路：已审批计划 → Agent 确定性模板生成代码（train/evaluate/model/config/requirements，无 LLM）→ AST 静态校验 → Worker 驱动 Runner 在**独立锁定 Docker 容器**中真实训练 → 采集 stdout/stderr/指标/审计 → 错误分类 + 最多 3 次自动修复（OOM 触发新计划版本而非私改训练目标）→ 前端运行面板（指标/审计/日志/代码版本/产物）。评估链路：运行终态 → **全确定性 Evaluator（无 LLM）**从本次运行固定的代码版本 AST 提取实现事实 → 方法验证（8 项）/实验验证（9 项）/结果对比（含百分点差）→ 6 态最终判定 → 14 节 Markdown 报告自动落库 → 前端结构化报告面板 + Markdown 查看/下载。复现目标仅 LeNet-5 + MNIST；**缩放实验永远不会被标记为完整复现（Full Reproduction）**。
+**当前进度**：各模块已整合为**统一 LangGraph 工作流**（15 个业务节点 + 13 态状态机 + Postgres checkpoint + 预算/重试/Trace harness）。上传 → 确认 Card → 批准计划 → 真实训练 → 报告已具备前端闭环能力，但完整 v2 交付仍须由绑定最终 commit 的 G-01–G-05、NFR-05 与 P1 证据判定；静态归档通过不等于真实 Qwen/browser/容器验收通过。Paper Understanding、Experiment Planner、代码生成/执行与 **Reproduction Evaluator / 报告系统**已实现。理解链路：上传 PDF → PyMuPDF 解析（页码/章节/表格）→ Qwen 提取 Reproduction Card → 证据落地校验（页码/引文由解析器回填，LLM 无法伪造）→ 前端双栏证据审阅 + 追加式版本管理。规划链路：Reproduction Card → 确定性规则引擎生成缩小规模实验计划（无 LLM，每个参数带来源溯源）→ 关键假设人工确认门 → 追加式计划版本管理（用户修改 / OOM 降批大小）→ 前端审批 UI。执行链路：已审批计划 → Agent 确定性模板生成代码（train/evaluate/model/config/requirements，无 LLM）→ AST 静态校验 → API/worker 信任域控制 Runner → Runner 在**独立锁定 Docker 兄弟容器**中真实训练 → 采集 stdout/stderr/指标/审计 → 错误分类 + 最多 3 次自动修复（OOM 触发新计划版本而非私改训练目标）→ 前端运行面板（指标/审计/日志/代码版本/产物）。评估链路：运行终态 → **全确定性 Evaluator（无 LLM）**从本次运行固定的代码版本 AST 提取实现事实 → 方法验证（8 项）/实验验证（9 项）/结果对比（含百分点差）→ 6 态最终判定 → 14 节 Markdown 报告自动追加落库 → 前端结构化报告面板 + Markdown 查看/下载。**v2 范围仅为 LeNet-5 × MNIST 缩放实验**；配对比较、OCR、其他模型/数据集不属于 v2 交付或验收证据。缩放实验永远不会被标记为完整复现（Full Reproduction）。
 
 ## 访客案例与实验工作台
 
-在首页选择「用一张手写数字读懂论文」，或访问 `/examples/lenet-mnist`。无需登录即可猜数字、核对真实预测、跳到论文页和下载条件对照报告。案例快照来自一次独立的 CPU 容器运行，训练 4,096 张、测试 1,024 张，认对 909 张。页面上的 12 张图片按测试顺序选取。公开文件及 SHA-256 清单位于 `apps/web/public/examples/lenet/`。
+在首页选择「用一张手写数字读懂论文」，或访问 `/examples/lenet-mnist`。无需登录即可猜数字、核对这份**缩放 LeNet-5 × MNIST 快照自己的持久化模型预测**、跳到论文页和下载条件对照报告；它不是原始 1998 年模型的预测。案例快照来自一次独立的 CPU 容器运行，训练 4,096 张、测试 1,024 张，认对 909 张。页面上的 12 张图片按测试顺序选取。公共归档/run ID 为 `01993dd36ff17102`，模型 SHA-256 为 `01993dd36ff1710272c3c50e16a0ffb10dc2015c08e8080b22b7e480b2c83b47`，报告 SHA-256 为 `5a7fcba954b496bd5e87483f7cad81b7155f048a111bcd81d3e769eca9d7349d`。公开文件及九文件 SHA-256 清单位于 `apps/web/public/examples/lenet/`，可由公共归档 verifier 逐字节复核。
 
-工作台仍按用户权限读取私人实验。成功运行的 `GET /v1/runs/{run_id}/prediction-examples` 返回本次尝试的样本。未留存样本的旧运行仍可查看指标和报告。新报告在 `parameter_comparisons` 中区分原文证据、计划选择、实际观测和代码或配置来源。已存在的报告可以从报告面板重新生成。
+公共静态归档与登录工作台分开：静态页验证证明归档身份和九文件完整，不证明真实 Qwen、数据库、Docker、browser 闭环或最终 commit 验收。工作台仍按用户权限读取私人实验，完整 v2 交付以[下方验收账本](#v2-验收证据绑定)为准。
 
 ## 架构
 
 ```
-┌──────────┐   HTTP    ┌──────────┐   HTTP    ┌──────────┐   HTTP    ┌──────────┐
-│   web    │ ────────> │   api    │ ────────> │  agent   │ ────────> │  runner  │
-│ Next.js  │           │ FastAPI  │           │ LangGraph│           │ 隔离执行  │
-│  :3000   │           │  :8000   │           │  :8001   │           │  :8002   │
-└──────────┘           └────┬─────┘           └────┬─────┘           └──────────┘
-                            │                      │                 仅 internal 网络
-                     ┌──────┴──────┐          Qwen LLM API           无外网、无密钥
+┌──────────┐   HTTP    ┌──────────┐   HTTP    ┌──────────┐
+│   web    │ ────────> │   api    │ ────────> │  agent   │
+│ Next.js  │           │ FastAPI  │           │理解/规划/ │
+│  :3000   │           │  :8000   │           │确定性计算 │
+└──────────┘           └────┬─────┘           └──────────┘
+                            │ API/worker 信任域
+                     ┌──────┴──────┐          Qwen LLM API
                      │             │         (统一 LLM Adapter)
-                Supabase      Redis + worker
-             (PostgreSQL +    (arq 异步任务：
-              Storage)        理解编排 + 执行/修复循环)
+                Supabase      Redis + worker ──HTTP──> runner ──Docker──> sibling container
+             (PostgreSQL +    (arq：完整工作流、          :8002      一次性锁定执行容器
+              Storage)         执行/修复/报告编排)
 ```
 
 | 服务 | 职责 | LLM Key | Supabase Service Role Key |
 |---|---|---|---|
 | `apps/web` | 登录、上传、Card 证据审阅/编辑、计划审批、运行面板、**复现报告面板**、健康面板 | ✗ | ✗（仅 anon key + 用户 JWT） |
 | `apps/api` | 认证、user ownership、业务数据、任务编排、报告读取/重生成 | ✗ | ✓ |
-| `worker` | arq 异步任务（api 同镜像）：PDF 理解编排；**驱动执行/修复循环**（codegen→校验→Runner→分类→修复）；**终态自动生成报告**，独占 DB 写入 | ✗ | ✓ |
-| `apps/agent` | 论文理解/规格提取/规划/**确定性代码生成/静态校验/错误分类/修复/复现评估与报告渲染**（LangGraph，不执行代码） | ✓ | ✗ |
-| `apps/runner` | 沙箱编排：经挂载的 Docker Socket 生成锁定的一次性执行容器（自身不跑 torch） | ✗ | ✗ |
+| `worker` | arq 异步任务（api 同镜像）：持有并驱动**完整 LangGraph 工作流**、执行/修复循环、终态报告；独占 DB 写入并控制 Runner | ✗ | ✓ |
+| `apps/agent` | 活跃的论文理解/规划 LangGraph，以及确定性代码生成/静态校验/错误分类/修复/复现评估与报告渲染；不是完整工作流 owner，也不是 Runner proxy | ✓ | ✗ |
+| `apps/runner` | 由 API/worker 控制的无密钥沙箱编排器：经挂载 Docker Socket 生成锁定的一次性兄弟执行容器（自身不跑 torch） | ✗ | ✗ |
 
 **硬性边界**
 
-- Agent 不直接执行 Python 代码，只通过 `ExecutionRequest`/`ExecutionResult` 契约委托 Runner。
-- Runner 在 Compose 的 `runner` 网络（`internal: true`）中，无外网出口、不发布端口，仅 Agent 可达。
-- 所有权统一经 `projects.user_id` 传递：papers/specs/jobs/experiments/runs 等表通过外键链
+- 完整 LangGraph 位于 **API/worker 信任域**。Agent 只保留活跃的理解/规划图与确定性计算，不拥有完整工作流，不代理 Runner。
+- Runner 由 API/worker 控制；生成的训练代码只在 Runner 创建的 sibling container 内执行，绝不在 api/agent/worker 主进程运行。
+- 所有权统一经 `projects.user_id` 传递：papers/specs/experiments/runs 等表通过外键链
   归属到 project，全表启用 RLS（`owns_project/owns_paper/owns_experiment/owns_run` helper），
   不依赖前端隐藏数据；API 层另做归属校验（双保险）。
 - 所有 Agent/服务间数据交换使用 `packages/schemas` 中的 Pydantic 模型校验（`extra="forbid"`）。
-- 长任务一律异步：上传/重新解析返回 `202 + job_id`，由 Redis + arq worker 执行，前端轮询 `GET /v1/jobs/{id}`。
+- 长任务一律异步：上传/重新解析返回 `202 + paper_id/workflow_id/thread_id`，由 Redis + arq worker 执行。
+  Run 的活跃创建/读取路径是 `POST /v1/experiments/{experiment_id}/runs` 与 `GET /v1/runs/{run_id}`；
+  `/v1/jobs` 和 `/v1/reproductions` 已从活跃 surface 退役。
 - **证据不可伪造**：LLM 只提出 value + 原文引文；`source_page`/`source_section` 由解析器
   对引文做归一化模糊匹配后回填，LLM 声称的页码一律丢弃。匹配失败的 `paper_explicit`
   降级为 `inferred`（剥掉引文）或 `missing`。
@@ -50,6 +52,8 @@
   （无 update/delete）；重新解析与用户编辑都产生新版本并记录 `parent_version_id`。
   `experiment_plans` 由 BEFORE UPDATE 触发器锁定除 `approved_at` 外的所有列；
   `generated_files` 追加式，每次修复生成新版本并记录 `sha256`/`change_reason`/`related_error`。
+  `reproduction_reports` 按 `(run_id, version)` 追加，重生成不覆盖旧版本；`execution_run_files`
+  只是 final-attempt 投影，完整的 `execution_attempts` / `execution_attempt_files` 历史单独保存。
 
 ## 执行沙箱安全模型
 
@@ -77,11 +81,11 @@
 ## 复现评估与报告（Reproduction Evaluator）
 
 运行到达终态（成功/失败/超时/取消）后，Worker **自动**调用 Agent 的确定性 Evaluator
-生成报告并 upsert 到 `reproduction_reports`（每运行一份）；也可经
-`POST /v1/runs/{id}/report` 手动重生成。**整条判定链路无 LLM 参与**：
+追加报告版本到 `reproduction_reports`（按 `run_id + version` 唯一）；也可经
+`POST /v1/runs/{id}/report` 手动重生成并追加新版本，不覆盖历史。**整条判定链路无 LLM 参与**：
 
-- **实现事实提取**：从本次运行精确绑定的代码版本（`execution_run_files` → `generated_files`）
-  AST 解析 model.py/train.py + config.yaml，提取卷积/全连接/池化/激活/损失/预处理/数据集事实。
+- **实现事实提取**：从本次运行最终 attempt 精确绑定的代码版本（历史在
+  `execution_attempt_files`，`execution_run_files` 维护 final-attempt 投影）AST 解析 model.py/train.py + config.yaml，提取卷积/全连接/池化/激活/损失/预处理/数据集事实。
   修复后的代码若偏离规范实现，会被如实检出，而非信任模板描述。
 - **方法验证（8 项）**：Architecture / Layer configuration / Activation / Subsampling /
   Output layer / Loss Function / Preprocessing / Dataset。每项输出
@@ -117,9 +121,9 @@ execute_code → classify_error → repair_code → evaluate_result → generate
 其中 `human_review` / `human_approve_plan` 用 `interrupt()` 暂停，等待前端确认后经 `Command(resume=)` 继续；
 `validate_code` / `execute_code` / `classify_error` 后按条件路由（校验失败即停、成功→评估、失败→分类→修复或评估）。
 
-**12 态状态机**（前端 `WorkflowStepper` 实时展示）：`uploaded / parsing / awaiting_spec_review /
+**13 态状态机**（前端 `WorkflowStepper` 实时展示）：`uploaded / parsing / awaiting_spec_review /
 planning / awaiting_plan_approval / generating_code / validating_code / executing / repairing /
-evaluating / completed / failed`。
+evaluating / completed / failed / cancelled`。`completed / failed / cancelled` 是三个独立终态。
 
 **Harness 能力**：
 - **Checkpoint**：每个节点经 `AsyncPostgresSaver` 落 checkpoint（`thread_id == workflow_id`，Supabase Postgres），
@@ -133,11 +137,9 @@ evaluating / completed / failed`。
 `resume(plan)` → 工作流自动执行 → 实时日志 / 训练指标 / 自动修复记录 / Reproduction Report。
 工作流驱动模式下执行由图自动发起，前端运行面板轮询展示，无需手动点击执行。
 
-## 优化器对照（成对实验）
+## 非 v2 扩展：优化器对照（成对实验）
 
-除单组复现外，平台支持回答论文中的一个**对照问题**：两组只在优化器（及其学习率）上不同，
-其余条件必须相同。范围仍为 MNIST + 现有 LeNet-5 模板 + 两种已支持优化器；超出范围时上传页
-直接列出缺项（数据集/模型/优化器/主指标/损失/预算），不会进入执行。
+仓库保留了配对比较的扩展代码与测试，但它**不属于当前 v2 交付范围，也不能作为 v2 验收证据**。当前 v2 仍只接受 LeNet-5 × MNIST 缩放实验；OCR、其他模型/数据集同样不在范围。以下仅说明 dormant/extension 设计，不表示已纳入本次验收：
 
 **流程**：论文 Card 确认后 → `POST /v1/papers/{id}/comparison-candidates` 定位原文中的两组
 （结果按"同一行内的优化器"归属，同名指标不会串组）→ `POST /v1/papers/{id}/comparison-plans`
@@ -166,7 +168,9 @@ evaluating / completed / failed`。
 
 ## 数据模型
 
-迁移位于 `infra/supabase/migrations/`，所有权根为 `projects.user_id`，其余表经外键链传递归属：
+迁移位于 `infra/supabase/migrations/`，当前有 **16 个 canonical migrations**；
+`deploy/server/supabase/migrations/` 有 **16 个逐文件 SHA-256 相同的 tracked deploy copies**。
+所有权根为 `projects.user_id`，其余表经外键链传递归属：
 
 | 表 | 归属链 | 说明 |
 |---|---|---|
@@ -174,14 +178,14 @@ evaluating / completed / failed`。
 | `papers` | `project_id → projects` | PDF 存 Storage，`pdf_path`/`file_sha256`/`metadata_json`/`status` |
 | `reproduction_specs` | `paper_id → papers` | Card 版本，`spec_json` + `origin` + `parent_version_id`；**追加式**（仅 select/insert） |
 | `understanding_jobs` | `paper_id → papers` | 旧异步解析任务表（已由统一 `workflows` 取代，保留兼容） |
-| `workflows` | `project_id → projects` | 统一工作流：`thread_id`/`status`(12 态)/`current_node`/`experiment_id`/`run_id`/`spec_version_id`/`plan_id`/`budget_json`/`error` |
+| `workflows` | `project_id → projects` | 统一工作流：`thread_id`/`status`(13 态，含 `cancelled`)/`current_node`/`experiment_id`/`run_id`/`spec_version_id`/`plan_id`/`budget_json`/`error` |
 | `experiments` | `project_id → projects` | 复现实验，关联 paper/spec |
 | `experiment_plans` | `experiment_id → experiments` | 版本化计划，`config_json`/`budget_json`/`approved_at` |
 | `generated_files` | `experiment_id → experiments` | 代码文件版本，`sha256`/`change_reason`/`related_error`；**追加式** |
 | `execution_runs` | `experiment_id → experiments` | 运行记录，`plan_id`/`code_version`/`plan_version`/`metrics_json`/`runtime_json`/`error_category`/`error`/`repair_attempt`/`code_hash`/`runner_run_id`/`audit_json` |
-| `execution_run_files` | `run_id → execution_runs` | **运行↔代码文件精确绑定**（`run_id`,`generated_file_id`），每次尝试重新绑定；双亲均 `on delete cascade` |
-| `execution_artifacts` | `run_id → execution_runs` | 运行产物（Storage 路径 + 元数据） |
-| `reproduction_reports` | `run_id → execution_runs` | 每运行一份报告，`report_json` + `markdown` |
+| `execution_run_files` | `run_id → execution_runs` | **final-attempt 投影**（`run_id`,`generated_file_id`）；历史由 `execution_attempts` / `execution_attempt_files` 单独追加保存 |
+| `execution_artifacts` | `run_id → execution_runs` | 运行产物（Storage 路径 + attempt + 元数据） |
+| `reproduction_reports` | `run_id → execution_runs` | 按 `(run_id, version)` 追加的不可变报告，含 `report_json` / `markdown` / `attempt` |
 | `agent_traces` | `workflow_id → workflows` | 节点级可观测性（`input/output/duration_ms/model_name/token_usage/error/retry_count`，凭据脱敏），**追加式** |
 
 Storage 私有 bucket `papers`（对象路径 `{user_id}/{paper_id}.pdf`，按首段 `{user_id}` 文件夹做 RLS）。
@@ -255,8 +259,7 @@ uv run python scripts/smoke_execution.py   # 真实容器执行验收（需 exec
 
 打开 http://localhost:3000 可看到首页与各服务健康面板。
 
-> Runner 不发布端口。验证 Runner：`curl http://localhost:8001/health/dependencies`
-> （api → agent → runner 链路探测），或 `docker compose exec agent python -c "import httpx; print(httpx.get('http://runner:8002/health').text)"`。
+> Runner 不发布端口。验证 API/worker → Runner 链路：`curl http://localhost:8000/health/dependencies`。
 
 ## 生产发布、备份与回滚
 
@@ -454,6 +457,7 @@ pnpm --filter web exec tsc --noEmit  # 前端类型检查
 pnpm build:web                       # live 前端生产构建与产物校验
 pnpm build:web:static                # static 前端生产构建与产物校验
 bash scripts/check.sh                # 完整离线门禁（Python + 前端 + 两种构建）
+uv run pytest scripts/test_verify_v2_acceptance.py apps/api/tests/test_active_surface.py -v
 uv run python scripts/smoke_test.py        # 健康 + 规划冒烟（需 compose 栈已启动）
 uv run python scripts/smoke_execution.py   # 真实容器执行验收（需 exec 镜像 + compose 栈）
 ```
@@ -484,7 +488,54 @@ Worker 执行/修复循环（成功/IMPORT_ERROR 自动修复/OOM 降批大小/�
 **确定性 Evaluator**（AST 实现事实提取、8 项方法验证的 matched/deviated/unknown 分支、
 9 项实验验证、百分制/错误率换算与百分点差、6 态判定树全分支、14 节 Markdown 与引文转义、
 `/v1/evaluate` 路由）、Worker 终态自动生成报告（成功/失败路径、报告失败不影响运行状态）、
-报告读取/重生成端点（upsert、ownership、非终态 409）。
+报告读取/重生成端点（追加不可变 version、ownership、非终态 409）。
+
+## v2 验收（证据绑定）
+
+`bash scripts/check.sh` 只是离线质量/构建门禁，不会因为缺少 credentialed acceptance evidence 而失败；它包含 verifier 单测。完整交付验收是独立的显式命令，读取 `_bmad-output/acceptance/v2/` 下证据，写入 JSON 账本和终端表，只要 G-01–G-05、NFR-05、P1 任一为 pending/failed 就返回非零。
+
+```bash
+# 离线代码、契约、前端与静态构建门禁
+bash scripts/check.sh
+
+# 真实闭环：需要专用账号密码（只从环境读取，不写入证据）
+LIVE_ACCEPTANCE_PASSWORD=... node apps/web/scripts/live-acceptance.mjs \
+  --base-url http://127.0.0.1:3000 \
+  --pdf docs/1998-lecun.pdf --email <dedicated-account> \
+  --output _bmad-output/acceptance/v2/g02
+
+# 负向/恢复矩阵与安全验收：真实 Supabase + Docker，包含终态、OOM、repair、ownership/隔离
+bash scripts/check_integration.sh
+uv run pytest tests/integration -m integration -v
+
+# NFR-05：同一获批环境顺序执行 3 个新 Run，记录四段耗时与 canonical environment hash
+REPROAGENT_ACCESS_TOKEN=... uv run python scripts/measure_run_segments.py \
+  --experiment-id <approved-experiment-id> \
+  --output _bmad-output/acceptance/v2/nfr05/result.json
+
+# 安全/legacy 审计（只读扫描；输出属于 ignored evidence）
+uv run python scripts/audit_legacy_consumers.py \
+  --format json --output _bmad-output/acceptance/v2/legacy-consumers.json
+uv run python scripts/audit_legacy_consumers.py --check-migrations
+
+# 最终账本：默认绑定当前 HEAD；受控复评可显式指定完整 SHA
+uv run python scripts/verify_v2_acceptance.py \
+  --evidence-root _bmad-output/acceptance/v2 \
+  --output _bmad-output/acceptance/v2/acceptance-ledger.json
+# 或：--commit-sha <full-final-sha>
+```
+
+上述采集命令保存的是原始运行记录；受控验收流程还需将其整理为账本 schema，并显式写入最终
+`commitSha`、断言和本地证据路径。verifier 不会从相邻文件、历史 wrapper 或当前 HEAD 代填绑定。
+
+最终证据入口是 `g01/result.json`、`g02/result.json`、`g03/result.json`、`g04/result.json`、
+`g05/result.json`、`nfr05/result.json`、`p1/result.json`。每项都必须有完整的 `commitSha`、通过断言和
+本地证据路径；G-02 还会逐字节核对 report Markdown SHA-256，以及 run/workflow/experiment/Plan/
+code/report/version/final-attempt 身份。NFR-05 必须是三个不同 succeeded Run、同一 canonical
+environment hash 和四个有限非负耗时阶段。P1 需要桌面/窄屏三列摘要与五类 evidence-index 的
+browser/API 证据。历史 `full-run-*`、旧 G-05 wrapper 或缺少 SHA 的 browser 记录不会自动成为最终证据。
+verifier 只读证据、计算 hash 并运行公共九文件 verifier，不调用 credentialed workflow、不改数据库、
+不打印 secret，也不制造证据。`_bmad-output/acceptance/v2/` 是 ignored evidence，不提交。
 
 ## 环境变量
 
@@ -514,8 +565,8 @@ Worker 执行/修复循环（成功/IMPORT_ERROR 自动修复/OOM 降批大小/�
 | 端点 | 说明 |
 |---|---|
 | `GET /health`（api/agent/runner） | 自身健康；agent 报告 `graph_loaded`，runner 报告 `torch_available` |
-| `GET /health/dependencies`（api） | 聚合 agent、supabase、runner（经 agent）状态 |
-| `GET /health/dependencies`（agent） | runner 状态 |
+| `GET /health/dependencies`（api） | 聚合 agent、supabase、runner 状态 |
+| `GET /health/dependencies`（agent） | Agent 自身依赖状态；不代理 Runner |
 | `POST /v1/papers`（api，需 JWT） | multipart 上传 PDF → Storage + papers + 创建 workflow + 入队，`202 + paper_id/workflow_id/thread_id` |
 | `GET /v1/papers` / `GET /v1/papers/{id}` | 论文列表 / 详情（ownership 校验） |
 | `GET /v1/papers/{id}/pdf` | Storage 签名 URL（1 小时有效） |
@@ -525,11 +576,10 @@ Worker 执行/修复循环（成功/IMPORT_ERROR 自动修复/OOM 降批大小/�
 | `POST /v1/papers/{id}/card/edits` | 字段确认/修改 → 追加新版本（`base_version` 乐观校验） |
 | `POST /v1/papers/{id}/card/confirm` | 将最新 Card 原样确认为 `confirmed` 版本（解锁 spec 人工门），`201` |
 | `POST /v1/papers/{id}/reparse` | 重新解析 → 新 workflow + 新版本 |
-| `GET /v1/workflows` / `GET /v1/workflows/{id}` | 工作流列表（可按 paper 过滤）/ 详情（12 态 + budget + 引用，ownership 校验） |
+| `GET /v1/workflows` / `GET /v1/workflows/{id}` | 工作流列表（可按 paper 过滤）/ 详情（13 态 + budget + 引用，ownership 校验） |
 | `GET /v1/papers/{id}/workflow` | 论文最新工作流 |
 | `GET /v1/workflows/{id}/traces` | 节点级 Trace（凭据脱敏，ownership 校验） |
 | `POST /v1/workflows/{id}/resume` | 人工门后继续：`stage=spec`（需 confirmed Card）/ `stage=plan`（需已批准计划），否则 `409`；入队 worker |
-| `GET /v1/jobs/{id}`（api） | 旧解析任务状态（已由 workflow 取代，保留兼容） |
 | `POST /v1/understand`（agent，内部） | `UnderstandRequest(pdf_b64)` → 解析 + 提取 + 证据落地，同步返回 Card |
 | `POST /v1/plan`（agent，内部） | `PlanRequest(card, scaling overrides)` → 确定性生成实验计划，同步返回 |
 | `POST /v1/papers/{id}/experiments`（api，需 JWT） | 读取最新 Card → 调 agent 规划 → 建实验 + 计划 v1，`201` |
@@ -546,7 +596,7 @@ Worker 执行/修复循环（成功/IMPORT_ERROR 自动修复/OOM 降批大小/�
 | `GET /v1/runs/{id}/artifacts` / `/files` | 产物列表 / 本次运行绑定的代码文件版本（含 sha256/change_reason） |
 | `POST /v1/runs/{id}/cancel` | 取消运行（透传 Runner 强杀容器） |
 | `GET /v1/runs/{id}/report` | 复现报告（`report_json` + `markdown`，ownership 校验；未生成 404） |
-| `POST /v1/runs/{id}/report` | 手动重生成报告（仅终态运行，否则 409；upsert 每运行一份） |
+| `POST /v1/runs/{id}/report` | 手动重生成报告（仅终态运行，否则 409；按 `(run_id, version)` 追加，不覆盖历史） |
 | `POST /v1/codegen`（agent，内部） | 已审批计划 → 确定性模板生成 5 个代码文件 |
 | `POST /v1/codegen/validate`（agent，内部） | AST 静态校验 → `ValidationReport` |
 | `POST /v1/codegen/classify`（agent，内部） | stderr/exit_code → 8 类错误分类 + 是否可修复 |
@@ -555,7 +605,8 @@ Worker 执行/修复循环（成功/IMPORT_ERROR 自动修复/OOM 降批大小/�
 | `POST /runs`（runner，内部） | `RunRequest` → 生成锁定容器异步执行，`202 + run_id` |
 | `GET /runs/{id}` / `POST /runs/{id}/cancel`（runner） | 运行结果 / 取消强杀 |
 | `GET /runs/{id}/artifacts` / `/artifacts/{name}`（runner） | 产物名列表 / 产物字节 |
-| `POST /v1/reproductions`（api/agent） | 旧占位 501（报告能力已迁移至 `/v1/evaluate` 与 `/v1/runs/{id}/report`） |
+
+`/v1/jobs` 与 `/v1/reproductions` 不在活跃 API/Agent surface；旧占位实现不注册路由，零生产消费者由 legacy audit 记录。
 
 ## 常见问题
 

@@ -6,7 +6,7 @@ cd "$ROOT"
 
 uv run ruff check .
 uv run pytest
-uv run pytest scripts/test_audit_legacy_consumers.py scripts/test_smoke_live_v2.py
+uv run pytest scripts/test_audit_legacy_consumers.py scripts/test_smoke_live_v2.py scripts/test_verify_v2_acceptance.py
 uv run python scripts/audit_legacy_consumers.py --format json --output _bmad-output/acceptance/v2/legacy-consumers.json
 uv run python scripts/audit_legacy_consumers.py --check-migrations
 pnpm lint:web

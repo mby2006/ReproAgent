@@ -27,20 +27,20 @@
 ## 四、怎么用（5 步，评委可以照着打开）
 
 1. **打开作品链接** <https://paper-repro-lab-kxylnvtfvqh.qoder.zone>，首页无需注册。
-2. 点首页的「用一张手写数字读懂论文」，进入 LeNet-5 × MNIST 公开案例（直达：<https://paper-repro-lab-kxylnvtfvqh.qoder.zone/examples/lenet-mnist.html>）。先玩一轮"认图"：你猜一个数字，页面给出 1998 年那个模型的真实预测。
+2. 点首页的「用一张手写数字读懂论文」，进入 LeNet-5 × MNIST 公开案例（直达：<https://paper-repro-lab-kxylnvtfvqh.qoder.zone/examples/lenet-mnist.html>）。先玩一轮"认图"：页面给出的是本次**缩放 LeNet-5 × MNIST 快照自己的持久化模型预测**，不是原始 1998 年模型的预测。归档/run ID 为 `01993dd36ff17102`，模型 SHA-256 为 `01993dd36ff1710272c3c50e16a0ffb10dc2015c08e8080b22b7e480b2c83b47`，报告 SHA-256 为 `5a7fcba954b496bd5e87483f7cad81b7155f048a111bcd81d3e769eca9d7349d`。
 3. 往下走，点对比里的「第 N 页」——会跳到论文原文对应位置。**参数不是模型背出来的，是能回到原文的。**
 4. 下载页面上的「条件对照表」：左边是论文原文证据，右边是本次真实运行的实际取值，差异写得很直白。
-5. 从首页进入「工作台」，在登录页点「**一键进入演示账号**」即可进入。演示环境默认**没有开启模型密钥**（避免公开链接被拿去消耗额度），所以"上传新论文"这一步会在调用模型时停下；公开案例页与工作台浏览不受影响。需要现场上传论文的话可以提前联系我临时开启。
+5. 从首页进入「工作台」，在登录页点「**一键进入演示账号**」即可进入。演示环境默认**没有开启模型密钥**（避免公开链接被拿去消耗额度），所以"上传新论文"这一步会在调用模型时停下；公开案例页与工作台浏览不受影响。需要现场上传论文的话可以提前联系我临时开启。公共静态归档的九文件 hash 通过不等于完整 v2 交付；真实 Qwen/browser/Docker/数据库闭环仍以绑定最终 commit 的验收账本为准，当前不宣称尚未完成的最终验收已经通过。
 
 ## 五、这是用 Qoder 做出来的过程
 
 **哪些交给了 Qoder**：
 
-- 数据模型与 8 个数据库迁移（含 RLS、追加式版本表、触发器锁列）；
-- 统一的工作流编排（LangGraph 多节点 + 显式状态机 + Postgres checkpoint）、异步任务与执行/修复循环；
+- 数据模型与 **16 个 canonical migrations**（含 RLS、追加式版本表、触发器锁列）；16 个 tracked deploy copies 与 canonical 文件逐 SHA-256 相同；
+- **API/worker 信任域**拥有 15 节点完整 LangGraph 工作流与 13 态状态机（含 `cancelled`）+ Postgres checkpoint；Agent 只保留活跃理解/规划图，不是完整工作流 owner 或 Runner proxy；
 - 前端工作台（证据双栏审阅、计划审批、运行面板、复现报告）与公开案例页；
 - 上线：数据层自托管编排、公网路径白名单、论文 PDF 的签名链接改造、上线关卡脚本；
-- 测试与验证：单元测试、真机部署、浏览器端到端点击验证。
+- 测试与验证：离线单测、静态构建、历史真机/browser 记录；最终交付另需绑定最终 commit 的 G-01–G-05、NFR-05 与 P1 证据。
 
 **我拍板、我改的地方**（举例，可按实际情况调整）：
 
@@ -52,7 +52,7 @@
 **截图凭证**（建议放这三张）：
 
 1. 【截图 1】对话里实测"用 Supabase 公开开发密钥签出的 service_role 令牌"打穿接口的那次（返回 200），以及改造后同一请求返回 401 的对比；
-2. 【截图 2】上线关卡 15 项全部通过（含"伪造令牌必须 401""白名单外必须 404"）；
+2. 【截图 2】上线关卡输出（含"伪造令牌必须 401""白名单外必须 404"）；项目数量与结果以对应 commit 的原始输出为准；
 3. 【截图 3】在真实浏览器里点「一键进入演示账号」进入工作台的页面 —— 已生成：`docs/contest-shots/workspace.png`（另有一张公开案例页 `public-case.png` 可直接用在正文）。
 
 ## （可选）分享链接
@@ -63,8 +63,11 @@
 
 ### 附：技术细节
 
-- 前端 Next.js（静态导出）+ 后端 FastAPI + arq/Redis + LangGraph；数据层自托管 Supabase（PostgreSQL + RLS + Storage）。
-- **执行隔离**：生成的训练代码不在主进程运行，Runner 为每次运行拉起一个非 root、只读根文件系统、CPU/内存/进程数限额的容器，运行在无外网出口的网络里，结束即销毁；torch 与 MNIST 烘焙进镜像，运行时零下载。
-- **版本只增不改**：规格、计划、生成代码均为追加式版本表，在数据库层面禁止 UPDATE/DELETE。
+- 前端 Next.js（静态导出）+ 后端 FastAPI + arq/Redis + LangGraph；数据层自托管 Supabase（PostgreSQL + RLS + Storage）。完整工作流由 API/worker 信任域驱动。
+- **执行隔离**：Runner 由 API/worker 控制，生成的训练代码只在 Runner 创建的 sibling container 内运行；容器为非 root、只读根文件系统、CPU/内存/进程数限额、无外网出口，结束即销毁。torch 与 MNIST 烘焙进镜像，运行时零下载。
+- **版本只增不改**：规格、计划、生成代码均为追加式版本表；报告按 `(run_id, version)` 追加，`execution_run_files` 仅是 final-attempt 投影，attempt-file 历史单独保存。
 - **关键环节无模型**：实验计划、代码生成、错误分类、复现评估全部是确定性代码，模型只参与论文理解。
+- **当前 v2 范围**：仅 LeNet-5 × MNIST 缩放实验。配对比较代码可作为 dormant/extension 保留，但 OCR、其他模型/数据集与配对比较都不是 v2 交付项或验收证据。
+- **活跃 surface**：Run 使用 `/v1/experiments/{experiment_id}/runs` 与 `/v1/runs/{run_id}`；`/v1/jobs`、`/v1/reproductions` 已退役。
+- **验收口径**：公共归档是独立的缩放快照，九文件 hash 与游客无 auth 请求只证明静态公开路径。完整 v2 交付要求 G-01–G-05、NFR-05、P1 全部 passed 且绑定最终 commit；缺失、过期或不完整证据保持 pending。
 - **部署**：4GB 大陆云服务器，宿主机不开放任何数据库端口，公网入口只有经 Cloudflare 隧道暴露的 API 与登录路径白名单；公开案例页为纯静态资源，后端不可用也能浏览。

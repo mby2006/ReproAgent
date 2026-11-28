@@ -613,7 +613,8 @@ def _queue_seconds(created_at, accepted_at) -> float | None:
     accepted = _utc_datetime(accepted_at)
     if created is None or accepted is None:
         return None
-    return max(0.0, (accepted - created).total_seconds())
+    elapsed = (accepted - created).total_seconds()
+    return elapsed if elapsed >= 0 else None
 
 
 def _result_environment(admin, run: dict, attempt: dict, result: RunResult) -> dict:

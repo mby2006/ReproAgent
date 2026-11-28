@@ -150,7 +150,8 @@ def _elapsed_seconds(started_at, finished_at) -> float | None:
     )
     started = started.replace(tzinfo=UTC) if started.tzinfo is None else started
     finished = finished.replace(tzinfo=UTC) if finished.tzinfo is None else finished
-    return max(0.0, (finished - started).total_seconds())
+    elapsed = (finished - started).total_seconds()
+    return elapsed if elapsed >= 0 else None
 
 
 def _admin(request: Request):

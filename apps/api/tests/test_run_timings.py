@@ -175,6 +175,33 @@ def test_timings_endpoint_keeps_missing_stages_and_total_none(env):
     assert row["environment"] == {}
 
 
+def test_timings_endpoint_backward_wall_clock_keeps_queue_and_total_none(env):
+    client, admin, _ = env
+    run_id = _seed_run(admin)
+    admin.tables["execution_runs"][0]["created_at"] = "2026-01-01T00:00:02+00:00"
+    seed_attempt(
+        admin,
+        run_id,
+        1,
+        accepted_at="2026-01-01T00:00:01+00:00",
+        timing_json={
+            "container_setup_seconds": 1.0,
+            "training_evaluation_seconds": 2.0,
+            "container_cleanup_seconds": 3.0,
+        },
+    )
+    seed_report(admin, run_id, 1, 1, 400)
+
+    response = client.get(f"/v1/runs/{run_id}/timings", headers=AUTH)
+
+    assert response.status_code == 200
+    row = response.json()[0]
+    assert row["queue_seconds"] is None
+    assert row["container_lifecycle_seconds"] == 6.0
+    assert row["report_generation_seconds"] == 0.4
+    assert row["total_seconds"] is None
+
+
 def test_timings_endpoint_returns_empty_list_without_attempts(env):
     client, admin, _ = env
     run_id = _seed_run(admin)
@@ -229,6 +256,30 @@ async def test_result_persistence_merges_runner_timings_and_full_environment_aft
     assert timing["total_seconds"] is None
     assert timing["environment"] == timing_environment(admin, run_id)
     assert timing["environment"]["resource_budget"] == RESOURCE_BUDGET
+
+
+@pytest.mark.asyncio
+async def test_result_persistence_backward_wall_clock_keeps_queue_none():
+    admin = FakeAdmin(seed_tables(), {str(PROJECT_ID): str(USER_ID)})
+    run_id = _seed_run(admin, status="running")
+    admin.tables["execution_runs"][0]["created_at"] = "2026-01-01T00:00:03+00:00"
+    attempt = seed_attempt(
+        admin, run_id, 1, status="running", accepted_at="2026-01-01T00:00:02+00:00"
+    )
+    result = RunResult(
+        run_id=uuid4(), status=RunStatus.SUCCEEDED, timings={"runner_total_seconds": 7.0}
+    )
+
+    class ArtifactRunner:
+        async def get_artifact_bytes(self, run_id, name):
+            return b"artifact"
+
+    await runs_service.async_persist_result(
+        admin, run_id, result.run_id, result, ArtifactRunner(), 0
+    )
+
+    assert attempt["timing_json"]["queue_seconds"] is None
+    assert attempt["timing_json"]["total_seconds"] is None
 
 
 @pytest.mark.asyncio

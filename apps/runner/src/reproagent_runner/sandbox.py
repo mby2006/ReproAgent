@@ -221,20 +221,25 @@ class Sandbox:
                 audit=audit,
                 timings=timings,
             )
-        timings.container_setup_seconds = time.monotonic() - setup_started
 
         status = RunStatus.FAILED
         exit_code: int | None = None
         execution_started = time.monotonic()
         training_started: float | None = None
         training_ended: float | None = None
+        container_start_attempted = False
+        error: str | None = None
+        error_category: ErrorCategory | None = None
         disk_exceeded = False
         disk_limit = budget.disk_mb * 1024 * 1024
         try:
             if on_container is not None:
                 on_container(container.id)
+            container_start_attempted = True
             container.start()
-            training_started = time.monotonic()
+            start_completed = time.monotonic()
+            timings.container_setup_seconds = start_completed - setup_started
+            training_started = start_completed
             deadline = execution_started + budget.max_seconds
             # Poll instead of one blocking wait: storage_opt cannot quota the
             # bind-mounted /output, so its size is checked here, and cancel stays
@@ -279,6 +284,12 @@ class Sandbox:
             training_ended = time.monotonic()
             if training_started is not None:
                 timings.training_evaluation_seconds = training_ended - training_started
+        except Exception as exc:
+            if training_started is not None or not container_start_attempted:
+                raise
+            timings.container_setup_seconds = time.monotonic() - setup_started
+            error = f"sandbox container could not be started: {exc}"
+            error_category = ErrorCategory.UNKNOWN_ERROR
         finally:
             cleanup_started = time.monotonic()
             execution_time = cleanup_started - execution_started
@@ -295,8 +306,6 @@ class Sandbox:
                 )
 
         metrics: dict = {}
-        error: str | None = None
-        error_category: ErrorCategory | None = None
         if disk_exceeded:
             error = f"run exceeded disk quota of {budget.disk_mb}MB on /output and was killed"
             error_category = ErrorCategory.UNKNOWN_ERROR

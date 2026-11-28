@@ -53,6 +53,8 @@ class RunRecord:
     task: asyncio.Task | None = None
     finished_at: float | None = None
     accepted_at: float | None = None
+    # Process-local only: monotonic timestamps cannot be recovered after reboot.
+    accepted_monotonic_at: float | None = None
     fingerprint: str = ""
     cancel_requested: bool = False
 
@@ -313,6 +315,7 @@ class RunRegistry:
             run_dir=self._settings.work_dir / str(run_id),
             fingerprint=request_fingerprint(request),
             accepted_at=time.time(),
+            accepted_monotonic_at=time.perf_counter(),
         )
         self._runs[run_id] = record
         self._write_record(record)
@@ -324,11 +327,11 @@ class RunRegistry:
         if record.status is RunStatus.CANCELLED:
             return
         started = time.perf_counter()
-        runner_queue_seconds = (
-            max(0.0, time.time() - record.accepted_at)
-            if record.accepted_at is not None
-            else None
-        )
+        runner_queue_seconds = None
+        if record.accepted_monotonic_at is not None:
+            queue_elapsed = started - record.accepted_monotonic_at
+            if math.isfinite(queue_elapsed) and queue_elapsed >= 0:
+                runner_queue_seconds = queue_elapsed
         record.status = RunStatus.RUNNING
         self._write_record(record)
         loop = asyncio.get_running_loop()

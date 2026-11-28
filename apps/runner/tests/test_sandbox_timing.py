@@ -37,12 +37,15 @@ class FakeImages:
 class FakeContainer:
     id = "container-1"
 
-    def __init__(self, clock, *, create_error=None):
+    def __init__(self, clock, *, start_error=None):
         self.clock = clock
-        self.create_error = create_error
+        self.start_error = start_error
+        self.removed = False
 
     def start(self):
         self.clock.advance(3.0)
+        if self.start_error is not None:
+            raise self.start_error
 
     def wait(self, timeout=None):
         self.clock.advance(4.0)
@@ -54,22 +57,24 @@ class FakeContainer:
 
     def remove(self, force=False):
         self.clock.advance(2.0)
+        self.removed = True
 
     def kill(self):
         pass
 
 
 class FakeContainers:
-    def __init__(self, clock, *, create_error=None):
+    def __init__(self, clock, *, create_error=None, start_error=None):
         self.clock = clock
         self.create_error = create_error
+        self.start_error = start_error
         self.created = []
 
     def create(self, image, command=None, detach=False, **kwargs):
         self.clock.advance(2.0)
         if self.create_error is not None:
             raise self.create_error
-        container = FakeContainer(self.clock)
+        container = FakeContainer(self.clock, start_error=self.start_error)
         self.created.append(container)
         return container
 
@@ -81,8 +86,10 @@ class FakeContainers:
 
 
 class FakeDockerClient:
-    def __init__(self, clock, *, create_error=None):
-        self.containers = FakeContainers(clock, create_error=create_error)
+    def __init__(self, clock, *, create_error=None, start_error=None):
+        self.containers = FakeContainers(
+            clock, create_error=create_error, start_error=start_error
+        )
         self.images = FakeImages()
 
 
@@ -114,10 +121,10 @@ def test_sandbox_records_setup_training_and_cleanup_with_one_clock(monkeypatch, 
     assert isinstance(result.timings, RunTimings)
     assert result.timings.queue_seconds is None
     assert result.timings.runner_queue_seconds is None
-    assert result.timings.container_setup_seconds == 2.0
+    assert result.timings.container_setup_seconds == 5.0
     assert result.timings.training_evaluation_seconds == 4.0
     assert result.timings.container_cleanup_seconds == 4.0
-    assert result.timings.container_lifecycle_seconds == 10.0
+    assert result.timings.container_lifecycle_seconds == 13.0
     assert result.timings.container_lifecycle_seconds == (
         result.timings.container_setup_seconds
         + result.timings.training_evaluation_seconds
@@ -146,6 +153,27 @@ def test_failed_container_create_keeps_real_setup_and_unexecuted_stages_none(
     assert result.timings.container_lifecycle_seconds is None
     assert result.timings.report_generation_seconds is None
     assert result.timings.runner_queue_seconds is None
+
+
+def test_failed_container_start_keeps_attempted_setup_and_cleanup_without_training(
+    monkeypatch, tmp_path
+):
+    clock = Clock()
+    monkeypatch.setattr("reproagent_runner.sandbox.time.monotonic", clock)
+    settings = RunnerSettings(work_dir=tmp_path, _env_file=None)
+    client = FakeDockerClient(clock, start_error=APIError("start failed"))
+
+    result = Sandbox(client, settings).execute(
+        make_request(), tmp_path / str(uuid4()), threading.Event()
+    )
+
+    assert result.status is RunStatus.FAILED
+    assert "could not be started" in result.error
+    assert result.timings.container_setup_seconds == 5.0
+    assert result.timings.training_evaluation_seconds is None
+    assert result.timings.container_cleanup_seconds == 4.0
+    assert result.timings.container_lifecycle_seconds is None
+    assert client.containers.created[0].removed is True
 
 
 def test_cancel_before_create_does_not_fake_zero_duration(monkeypatch, tmp_path):
@@ -193,7 +221,8 @@ async def test_registry_journals_acceptance_and_records_queue_and_total(
     registry = RunRegistry(settings, client=client)
     request = make_request()
     accepted = registry.start(request)
-    wall_clock.advance(0.5)
+    runner_clock.advance(0.5)
+    wall_clock.advance(50.0)
 
     await registry._runs[accepted.run_id].task
     result = registry.get(accepted.run_id)
@@ -202,6 +231,8 @@ async def test_registry_journals_acceptance_and_records_queue_and_total(
     )
 
     assert journal["accepted_at"] == 100.0
+    assert "accepted_monotonic_at" not in journal
+    assert registry._runs[accepted.run_id].accepted_monotonic_at == 10.0
     assert result.timings.runner_queue_seconds == 0.5
     assert result.timings.runner_total_seconds == 2.5
     assert result.timings.container_setup_seconds == 1.0
@@ -209,7 +240,44 @@ async def test_registry_journals_acceptance_and_records_queue_and_total(
 
     recovered = RunRegistry(settings, client=client)
     assert recovered._runs[accepted.run_id].accepted_at == 100.0
+    assert recovered._runs[accepted.run_id].accepted_monotonic_at is None
     assert recovered.get(accepted.run_id) == result
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "accepted_monotonic_at",
+    [11.0, float("nan"), float("inf"), float("-inf")],
+    ids=["backward", "nan", "positive-infinity", "negative-infinity"],
+)
+async def test_registry_invalid_monotonic_queue_elapsed_stays_none(
+    monkeypatch, tmp_path, accepted_monotonic_at
+):
+    wall_clock = Clock(100.0)
+    runner_clock = Clock(accepted_monotonic_at)
+    monkeypatch.setattr(registry_module.time, "time", wall_clock)
+    monkeypatch.setattr(registry_module.time, "perf_counter", runner_clock)
+
+    class FakeSandbox:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def execute(self, request, run_dir, cancel_event, on_container=None):
+            runner_clock.value = 10.0
+            runner_clock.advance(2.5)
+            return RunResult(run_id=request.request_id, status=RunStatus.SUCCEEDED)
+
+    monkeypatch.setattr(registry_module, "Sandbox", FakeSandbox)
+    settings = RunnerSettings(work_dir=tmp_path, _env_file=None)
+    registry = RunRegistry(settings, client=FakeDockerClient(Clock()))
+    accepted = registry.start(make_request())
+    runner_clock.value = 10.0
+    wall_clock.advance(1.0)
+
+    await registry._runs[accepted.run_id].task
+
+    assert registry.get(accepted.run_id).timings.runner_queue_seconds is None
+    assert registry.get(accepted.run_id).timings.runner_total_seconds == 2.5
 
 
 def test_registry_recovery_keeps_absent_timing_stages_none(monkeypatch, tmp_path):
@@ -233,6 +301,33 @@ def test_registry_recovery_keeps_absent_timing_stages_none(monkeypatch, tmp_path
     result = recovered.get(request.request_id)
 
     assert recovered._runs[request.request_id].accepted_at is None
+    assert recovered._runs[request.request_id].accepted_monotonic_at is None
     assert result.timings.runner_queue_seconds is None
     assert result.timings.runner_total_seconds is None
     assert result.timings.container_lifecycle_seconds is None
+
+
+@pytest.mark.parametrize("status", [RunStatus.QUEUED, RunStatus.RUNNING])
+def test_registry_recovered_inflight_never_fabricates_queue_timing(monkeypatch, tmp_path, status):
+    monkeypatch.setattr(registry_module.time, "time", lambda: 100.0)
+    settings = RunnerSettings(work_dir=tmp_path, _env_file=None)
+    registry = RunRegistry(settings, client=FakeDockerClient(Clock()))
+    request = make_request()
+    record = RunRecord(
+        request=request,
+        run_id=request.request_id,
+        run_dir=settings.work_dir / str(request.request_id),
+        status=status,
+        finished_at=None,
+        fingerprint=request_fingerprint(request),
+        accepted_at=100.0,
+    )
+    registry._write_record(record)
+
+    recovered = RunRegistry(settings, client=FakeDockerClient(Clock()))
+    result = recovered.get(request.request_id)
+
+    assert recovered._runs[request.request_id].accepted_monotonic_at is None
+    assert result.status is RunStatus.FAILED
+    assert result.timings.runner_queue_seconds is None
+    assert result.timings.runner_total_seconds is None

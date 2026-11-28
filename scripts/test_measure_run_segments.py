@@ -3,6 +3,7 @@
 import copy
 import json
 import math
+import sys
 from pathlib import Path
 from uuid import UUID
 
@@ -261,15 +262,35 @@ def test_summary_emits_min_median_max_raw_values_and_environment_hash(sample_run
     assert all(math.isfinite(value) for value in summary["total_seconds"]["values"])
 
 
-def test_write_json_creates_parent_and_never_contains_token(sample_runs, tmp_path: Path):
+def test_main_never_prints_or_persists_access_token(monkeypatch, tmp_path: Path, capsys):
     measurement = load_measurement()
+    server = FakeMeasurementServer()
+    token = "dedicated-local-token"
     output = tmp_path / "acceptance" / "result.json"
-    payload = {
-        "passed": True,
-        "runs": sample_runs,
-        "summary": measurement.summarize_measurements(sample_runs),
-    }
-    measurement.write_json(output, payload)
+    client_type = httpx.Client
 
-    assert json.loads(output.read_text(encoding="utf-8"))["passed"] is True
-    assert "dedicated-local-token" not in output.read_text(encoding="utf-8")
+    def mock_client(*args, **kwargs):
+        kwargs["transport"] = httpx.MockTransport(server)
+        return client_type(*args, **kwargs)
+
+    monkeypatch.setenv("REPROAGENT_ACCESS_TOKEN", token)
+    monkeypatch.setattr(measurement.httpx, "Client", mock_client)
+    monkeypatch.setattr(sys, "argv", [
+        "measure_run_segments.py",
+        "--base-url", "http://127.0.0.1:8000",
+        "--experiment-id", "experiment-1",
+        "--runs", "3",
+        "--output", str(output),
+        "--timeout", "10",
+        "--poll-interval", "0",
+    ])
+
+    assert measurement.main() == 0
+
+    captured = capsys.readouterr()
+    diagnostics = captured.out + captured.err
+    artifact = output.read_text(encoding="utf-8")
+    assert token not in diagnostics
+    assert token not in artifact
+    assert json.loads(artifact)["passed"] is True
+    assert all(request.headers["Authorization"] == f"Bearer {token}" for request in server.requests)

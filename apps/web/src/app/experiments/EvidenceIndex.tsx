@@ -19,12 +19,16 @@ const TARGET_LABEL: Record<string, string> = {
   report: "实验报告", review_trace: "审核记录",
 };
 
-function locatorText(item: EvidenceIndexItem) {
+export function evidenceLocatorText(item: EvidenceIndexItem) {
   if (item.target_type === "generated_file" || item.target_type === "artifact") {
     return String(item.locator.path ?? item.locator.name ?? item.target_id);
   }
-  if (item.target_type === "plan") return `v${item.locator.version}`;
-  if (item.target_type === "report") return `v${item.locator.version}`;
+  if (item.target_type === "plan" || item.target_type === "report") {
+    const version = item.locator.version;
+    return typeof version === "number" || (typeof version === "string" && version)
+      ? `v${version}`
+      : item.target_id;
+  }
   if (item.target_type === "review_trace") return `${item.locator.source} · ${item.target_id}`;
   return item.target_id;
 }
@@ -32,6 +36,45 @@ function locatorText(item: EvidenceIndexItem) {
 function Hash({ value }: { value: string | null }) {
   if (!value) return null;
   return <code className="block break-all font-mono text-[11px] text-fg-3" title={value}>{value.slice(0, 12)}…</code>;
+}
+
+export async function loadPrivateEvidence({
+  runId,
+  item,
+  fetchEvidence = apiFetch,
+  downloadArtifact = apiDownload,
+}: {
+  runId: string;
+  item: EvidenceIndexItem;
+  fetchEvidence?: typeof apiFetch;
+  downloadArtifact?: typeof apiDownload;
+}): Promise<{ title: string; content: string } | null> {
+  if (item.target_type === "generated_file") {
+    const attempt = item.locator.attempt;
+    if (typeof attempt !== "number") throw new Error("最终尝试的代码定位不可用");
+    const files = await fetchEvidence<Array<{ path: string; content: string | null }>>(
+      `/v1/runs/${runId}/files?attempt=${attempt}`,
+    );
+    const file = files.find((candidate) => candidate.path === item.locator.path);
+    if (!file) throw new Error("最终尝试的代码文件不可用");
+    return { title: file.path, content: file.content ?? "文件内容为空" };
+  }
+  if (item.target_type === "report") {
+    const version = item.locator.version;
+    if (typeof version !== "number") throw new Error("报告版本定位不可用");
+    const report = await fetchEvidence<{ markdown: string }>(
+      `/v1/runs/${runId}/report?version=${encodeURIComponent(String(version))}`,
+    );
+    return { title: `报告 v${version}`, content: report.markdown };
+  }
+  if (item.target_type === "artifact") {
+    await downloadArtifact(
+      `/v1/runs/${runId}/artifacts/${encodeURIComponent(item.target_id)}`,
+      String(item.locator.name ?? "artifact"),
+    );
+    return null;
+  }
+  return null;
 }
 
 export default function EvidenceIndex({
@@ -72,24 +115,8 @@ export default function EvidenceIndex({
     setError(null);
     setPanel(null);
     try {
-      if (item.target_type === "generated_file") {
-        const attempt = item.locator.attempt;
-        if (typeof attempt !== "number") throw new Error("最终尝试的代码定位不可用");
-        const files = await apiFetch<Array<{ path: string; content: string | null }>>(`/v1/runs/${index.run_id}/files?attempt=${attempt}`);
-        const file = files.find((candidate) => candidate.path === item.locator.path);
-        if (!file) throw new Error("最终尝试的代码文件不可用");
-        setPanel({ title: file.path, content: file.content ?? "文件内容为空" });
-      } else if (item.target_type === "report") {
-        const report = await apiFetch<{ markdown: string }>(
-          `/v1/runs/${index.run_id}/report?version=${encodeURIComponent(String(item.locator.version))}`,
-        );
-        setPanel({ title: `报告 v${item.locator.version}`, content: report.markdown });
-      } else if (item.target_type === "artifact") {
-        await apiDownload(
-          `/v1/runs/${index.run_id}/artifacts/${encodeURIComponent(item.target_id)}`,
-          String(item.locator.name ?? "artifact"),
-        );
-      }
+      const result = await loadPrivateEvidence({ runId: index.run_id, item });
+      if (result) setPanel(result);
     } catch (err) {
       setError(err instanceof Error ? err.message : "证据加载失败");
     } finally {
@@ -144,7 +171,7 @@ export default function EvidenceIndex({
             <div className="flex flex-wrap items-start justify-between gap-2">
               <div className="min-w-0">
                 <span className="text-[11px] text-fg-3">{TARGET_LABEL[item.target_type] ?? item.target_type}</span>
-                <p className="break-all font-mono text-[12.5px] text-fg-2" title={item.target_id}>{locatorText(item)}</p>
+                <p className="break-all font-mono text-[12.5px] text-fg-2" title={item.target_id}>{evidenceLocatorText(item)}</p>
               </div>
               {action(item)}
             </div>

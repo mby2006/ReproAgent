@@ -53,7 +53,11 @@ export function buildPublicEvidenceIndex({ manifest, conditions = [], report, pd
   const run = manifest?.run ?? "archive";
   const files = manifest?.files ?? {};
   const items = [];
-  const paperLocator = { file: "report.md", page: 1, source: "archive" };
+  const paperLocator = { file: "report.md", source: "archive" };
+  const sourcePage = conditions
+    .map((row) => row?.paper_evidence?.source_page)
+    .find((page) => Number.isInteger(page) && page > 0);
+  if (sourcePage !== undefined) paperLocator.page = sourcePage;
   if (pdfUrl) paperLocator.source_url = pdfUrl;
   items.push(item("paper", "paper", run, paperLocator, null,
     "归档未包含论文 PDF，无法核验论文 SHA-256"));

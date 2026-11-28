@@ -143,6 +143,14 @@ def test_index_points_to_exact_final_attempt(db=None, run=None):
     assert plan.target_id == final_plan_id
     assert plan.locator["version"] == 2
     assert plan.locator["approved_at"] == "2026-01-01T00:00:00+00:00"
+    approval_trace = next(item for item in index.items if item.target_type == "approval_trace")
+    assert approval_trace.category == "plan"
+    assert approval_trace.target_id == final_plan_id
+    assert approval_trace.locator["plan_id"] == final_plan_id
+    assert approval_trace.locator["version"] == 2
+    assert "trace_id" not in approval_trace.locator
+    assert approval_trace.hash is None
+    assert "不可变" in approval_trace.unavailable_reason
     code = [item for item in index.items if item.category == "code"]
     assert {item.target_id for item in code} == {
         file_ids[2, "train.py"],
@@ -155,6 +163,10 @@ def test_index_points_to_exact_final_attempt(db=None, run=None):
         artifact_ids[2, "model.pt"],
     }
     assert all(item.locator["attempt"] == 2 for item in artifacts)
+    assert {item.locator["logical_path"] for item in artifacts} == {
+        "attempt-2/artifacts/metrics.json",
+        "attempt-2/artifacts/model.pt",
+    }
     report = next(item for item in index.items if item.target_type == "report")
     assert report.locator["version"] == 1
     assert report.hash == hashlib.sha256(b"# final report").hexdigest()
@@ -199,8 +211,12 @@ def test_missing_evidence_is_explicit_and_never_reuses_earlier_attempt():
     }
     index = build_evidence_index(admin, run_id, actor=USER_ID)
     unavailable = [item for item in index.items if item.unavailable_reason]
-    assert {item.category for item in unavailable} == {"code", "execution", "review_report"}
+    assert {item.category for item in unavailable} == {"plan", "code", "execution", "review_report"}
     assert all(item.hash is None for item in unavailable)
+    metrics = [item for item in index.items if item.target_type == "metrics"]
+    assert len(metrics) == 1
+    assert metrics[0].locator["attempt"] == 2
+    assert metrics[0].unavailable_reason
     assert not any(item.target_type == "artifact" for item in index.items)
     assert all("attempt-1" not in json.dumps(item.locator) for item in index.items)
     assert next(item for item in index.items if item.target_type == "image").hash is None
@@ -228,6 +244,22 @@ def test_report_from_earlier_attempt_is_marked_unavailable():
         if item.target_type == "report"
     )
     assert "最终尝试" in report.unavailable_reason
+
+
+def test_matching_report_without_persisted_review_traces_is_explicit():
+    from reproagent_api.services.evidence_index import build_evidence_index
+
+    admin, run_id, *_ = _seed_final_attempt()
+    index = build_evidence_index(admin, run_id, actor=USER_ID)
+    traces = [item for item in index.items if item.target_type == "review_trace"]
+    assert len(traces) == 1
+    assert traces[0].category == "review_report"
+    assert traces[0].hash is None
+    assert traces[0].unavailable_reason
+    assert "trace_id" not in traces[0].locator
+    report = next(item for item in index.items if item.target_type == "report")
+    assert traces[0].locator["report_id"] == report.target_id
+    assert traces[0].locator["version"] == report.locator["version"]
 
 
 def test_review_trace_ids_only_include_real_persisted_card_and_plan_events():
@@ -405,10 +437,13 @@ def test_artifact_download_owner_success_foreign_wrong_run_and_missing(env):
     path = f"{run_id}/attempt-1/artifacts/metrics.json"
     _seed_download(admin, run_id, artifact_id, path)
     url = f"/v1/runs/{run_id}/artifacts/{artifact_id}"
-    assert client.get(url, headers=BOB_AUTH).status_code == 404
+    denied = client.get(url, headers=BOB_AUTH)
+    assert denied.status_code == 404
+    assert denied.json()["detail"]["code"] == "RUN_NOT_FOUND"
     response = client.get(url, headers=AUTH)
     assert response.status_code == 200
     assert response.content == b"private bytes"
+    assert response.headers["cache-control"] == "private, no-store"
     assert "attachment" in response.headers["content-disposition"]
     assert "metrics.json" in response.headers["content-disposition"]
     assert path not in response.text

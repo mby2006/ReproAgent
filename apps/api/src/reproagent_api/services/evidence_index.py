@@ -222,6 +222,24 @@ def build_evidence_index(admin, run_id: UUID | str, actor: UUID | str) -> Eviden
                 suffix=f"v{plan['version']}",
             )
         )
+        items.append(
+            _item(
+                "plan",
+                "approval_trace",
+                plan["id"],
+                {
+                    "plan_id": plan["id"],
+                    "version": plan["version"],
+                    "experiment_id": experiment_id,
+                    "run_id": run_id,
+                    "attempt": attempt,
+                },
+                unavailable_reason=(
+                    "计划审批未持久化不可变 trace ID；approved_at 仅作为补充元数据"
+                ),
+                suffix="approval-trace",
+            )
+        )
     else:
         items.append(
             _missing("plan", "plan", run_id, "最终尝试绑定的计划版本不可用", attempt=attempt)
@@ -321,14 +339,31 @@ def build_evidence_index(admin, run_id: UUID | str, actor: UUID | str) -> Eviden
         else []
     )
     for artifact in artifacts:
+        artifact_name = (
+            str(artifact.get("artifact_type") or "artifact")
+            .replace("\\", "/")
+            .rsplit("/", 1)[-1]
+        )
         locator = {
             "artifact_id": artifact["id"],
             "run_id": run_id,
             "name": artifact["artifact_type"],
+            "logical_path": f"attempt-{attempt}/artifacts/{artifact_name}",
         }
         if attempt is not None:
             locator["attempt"] = attempt
         items.append(_item("execution", "artifact", artifact["id"], locator))
+    if final and not any(row.get("artifact_type") == "metrics.json" for row in artifacts):
+        items.append(
+            _item(
+                "execution",
+                "metrics",
+                run_id,
+                {"run_id": run_id, "attempt": attempt},
+                unavailable_reason="最终尝试没有持久化的 metrics.json 产物",
+                suffix="metrics",
+            )
+        )
 
     audit = run.get("audit_json") or {}
     audit_matches = final is not None and (
@@ -393,6 +428,7 @@ def build_evidence_index(admin, run_id: UUID | str, actor: UUID | str) -> Eviden
             _missing("review_report", "report", run_id, "运行尚未生成不可变报告", attempt=attempt)
         )
 
+    review_trace_start = len(items)
     if report_matches and experiment.get("paper_id") and experiment.get("spec_id"):
         sources = _review_event_sources(
             admin,
@@ -437,5 +473,23 @@ def build_evidence_index(admin, run_id: UUID | str, actor: UUID | str) -> Eviden
                     suffix=source,
                 )
             )
+    if report_matches and not any(
+        item.target_type == "review_trace" for item in items[review_trace_start:]
+    ):
+        items.append(
+            _item(
+                "review_report",
+                "review_trace",
+                report["id"],
+                {
+                    "run_id": run_id,
+                    "report_id": report["id"],
+                    "version": report["version"],
+                    "attempt": attempt,
+                },
+                unavailable_reason="最终报告没有持久化的 Card/Plan review trace",
+                suffix="unavailable",
+            )
+        )
 
     return EvidenceIndex(run_id=run_id, items=items)

@@ -113,3 +113,65 @@ test("cancelWorkflow posts to the workflow cancel endpoint", async () => {
   assert.ok(calls[0].url.endsWith("/v1/workflows/wf-1/cancel"));
   assert.equal(result.status, "cancelled");
 });
+
+test("apiDownload authenticates the request and clicks a named object-url download", async () => {
+  userId = "user-a";
+  const original = {
+    fetch: globalThis.fetch,
+    document: globalThis.document,
+    createObjectURL: URL.createObjectURL,
+    revokeObjectURL: URL.revokeObjectURL,
+    setTimeout: globalThis.setTimeout,
+  };
+  const calls = [];
+  const link = { href: "", download: "", click: () => calls.push(["click", link.href, link.download]) };
+  globalThis.fetch = async (url, init) => {
+    calls.push(["fetch", String(url), new Headers(init?.headers).get("Authorization")]);
+    return new Response("private artifact", { status: 200 });
+  };
+  globalThis.document = { createElement: (tag) => { assert.equal(tag, "a"); return link; } };
+  URL.createObjectURL = () => "blob:artifact-1";
+  URL.revokeObjectURL = (url) => calls.push(["revoke", url]);
+  globalThis.setTimeout = (callback) => { callback(); return 0; };
+  try {
+    await loaded.exports.apiDownload("/v1/runs/run-1/artifacts/artifact-1", "metrics.json");
+  } finally {
+    globalThis.fetch = original.fetch;
+    if (original.document === undefined) delete globalThis.document;
+    else globalThis.document = original.document;
+    URL.createObjectURL = original.createObjectURL;
+    URL.revokeObjectURL = original.revokeObjectURL;
+    globalThis.setTimeout = original.setTimeout;
+  }
+  assert.deepEqual(calls, [
+    ["fetch", "http://localhost:8000/v1/runs/run-1/artifacts/artifact-1", "Bearer user-a"],
+    ["click", "blob:artifact-1", "metrics.json"],
+    ["revoke", "blob:artifact-1"],
+  ]);
+});
+
+test("apiDownload maps denial responses to ApiError and never triggers a download", async () => {
+  const original = { fetch: globalThis.fetch, document: globalThis.document };
+  let createdLinks = 0;
+  globalThis.fetch = async () => new Response(
+    JSON.stringify({ detail: { code: "RUN_NOT_FOUND", message: "Run not found" } }),
+    { status: 404, statusText: "Not Found", headers: { "Content-Type": "application/json" } },
+  );
+  globalThis.document = { createElement: () => { createdLinks += 1; return { click: () => {} }; } };
+  try {
+    await assert.rejects(
+      () => loaded.exports.apiDownload("/v1/runs/run-1/artifacts/artifact-1"),
+      (err) => {
+        assert.equal(err.name, "ApiError");
+        assert.equal(err.status, 404);
+        assert.equal(err.code, "RUN_NOT_FOUND");
+        return true;
+      },
+    );
+  } finally {
+    globalThis.fetch = original.fetch;
+    if (original.document === undefined) delete globalThis.document;
+    else globalThis.document = original.document;
+  }
+  assert.equal(createdLinks, 0);
+});

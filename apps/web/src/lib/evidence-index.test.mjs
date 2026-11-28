@@ -33,7 +33,7 @@ test("public archive derives all categories from nine files and marks absent evi
   });
   assert.equal(index.run_id, "archive-1");
   const paper = index.items.find((item) => item.category === "paper");
-  assert.equal(paper.locator.page, 1);
+  assert.equal(paper.locator.page, 42);
   assert.equal(paper.locator.source_url, "https://example.test/paper.pdf");
   assert.deepEqual(Object.keys(groupEvidenceItems(index.items)), ["paper", "plan", "code", "execution", "review_report"]);
   const code = index.items.filter((item) => item.category === "code");
@@ -50,6 +50,18 @@ test("public archive derives all categories from nine files and marks absent evi
     assert.ok(Object.values(item.locator).every((value) => value !== ""));
     assert.ok(!JSON.stringify(item).includes("storage_path"));
   }
+});
+
+test("public paper locator omits page when no persisted page exists", () => {
+  const index = buildPublicEvidenceIndex({
+    manifest: { run: "archive-unknown-page", files: {} },
+    conditions: [{ key: "optimizer", paper_evidence: { source_page: null } }],
+    report: "# report",
+    pdfUrl: "https://example.test/paper.pdf",
+  });
+  const paper = index.items.find((item) => item.category === "paper");
+  assert.equal(Object.hasOwn(paper.locator, "page"), false);
+  assert.equal(paper.locator.source_url, "https://example.test/paper.pdf");
 });
 
 test("missing manifest entries produce explicit unavailable placeholders, not dead links", () => {

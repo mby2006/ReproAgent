@@ -141,7 +141,10 @@ def _get_run(admin, run_id: UUID, user_id: UUID) -> dict:
         .data
     )
     if not rows:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "Run not found")
+        raise HTTPException(
+            status.HTTP_404_NOT_FOUND,
+            {"code": "RUN_NOT_FOUND", "message": "Run not found"},
+        )
     row = rows[0]
     return {col.strip(): row.get(col.strip()) for col in RUN_COLUMNS.split(",")}
 
@@ -351,7 +354,10 @@ async def download_artifact(
     return Response(
         content=data,
         media_type="application/octet-stream",
-        headers={"Content-Disposition": content_disposition},
+        headers={
+            "Content-Disposition": content_disposition,
+            "Cache-Control": "private, no-store",
+        },
     )
 
 

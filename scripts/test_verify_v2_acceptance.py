@@ -107,25 +107,93 @@ def g01_evidence() -> dict:
     }
 
 
-def g03_evidence() -> dict:
+G03_CASES = ("FAILED", "TIMEOUT", "CANCELLED", "OOM", "repair", "restart")
+
+
+def artifact(root: Path, relative: str, payload: object) -> dict:
+    path = root / relative
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if isinstance(payload, bytes):
+        path.write_bytes(payload)
+    else:
+        path.write_text(json.dumps(payload), encoding="utf-8")
+    return {"path": relative, "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
+
+
+def g03_payload(name: str) -> dict:
+    payload = {
+        "case": name,
+        "passed": True,
+        "run_id": f"run-{name}",
+        "workflow_id": f"workflow-{name}",
+    }
+    if name in {"FAILED", "OOM", "repair"}:
+        payload.update(run_status="failed", workflow_status="failed")
+    if name == "FAILED":
+        payload["error_code"] = "TRAINING_FAILED"
+    elif name == "TIMEOUT":
+        payload.update(
+            run_status="timeout", workflow_status="failed", error_code="WORKFLOW_TIMEOUT"
+        )
+    elif name == "CANCELLED":
+        payload.update(run_status="cancelled", workflow_status="cancelled")
+    elif name == "OOM":
+        payload.update(
+            exit_code=137,
+            replan_count=2,
+            third_replan_refused=True,
+            final_attempt=3,
+            report={"execution_attempt": 3},
+        )
+    elif name == "repair":
+        payload.update(repair_attempt=3, fourth_repair_refused=True)
+    else:
+        payload.update(
+            terminal_status="failed",
+            run_status_before_restart="failed",
+            run_status_after_restart="failed",
+            workflow_status_before_restart="failed",
+            workflow_status_after_restart="failed",
+            report_available=True,
+            report_version=2,
+            report_execution_attempt=3,
+            final_attempt=3,
+        )
+    return payload
+
+
+def g03_evidence(root: Path) -> dict:
     return {
         "commitSha": COMMIT,
         "passed": True,
         "exit_code": 0,
         "matrix": {
-            name: {"status": "passed", "evidence_path": f"g03/{name}.json"}
-            for name in ("FAILED", "TIMEOUT", "CANCELLED", "OOM", "repair", "restart")
+            name: {
+                "status": "passed",
+                "artifact": artifact(root, f"g03/{name}.json", g03_payload(name)),
+            }
+            for name in G03_CASES
         },
-        "assertions": passed_assertions("negative and recovery matrix"),
+        "assertions": passed_assertions(*G03_CASES),
     }
 
 
 def g04_evidence(root: Path) -> dict:
-    hashes = {f"migration-{index}.sql": f"{index:064x}" for index in range(16)}
+    hashes = {
+        f"migration-{index}.sql": hashlib.sha256(f"migration-{index}.sql".encode()).hexdigest()
+        for index in range(16)
+    }
     audit = {
         "ok": True,
         "blocking_consumers": [],
         "scan_errors": [],
+        "targets": {
+            "legacy.worker": {
+                "status": "retired-by-nonregistration",
+                "registrations": [],
+                "live_routes": [],
+            }
+        },
         "migrations": {
             "ok": True,
             "canonical_sha256": hashes,
@@ -133,31 +201,85 @@ def g04_evidence(root: Path) -> dict:
             "errors": [],
             "missing": [],
             "mismatched": [],
+            "extra": [],
         },
     }
-    audit_path = write_json(root, "g04/legacy-consumers.json", audit)
+    inspect = {
+        "Config": {"User": "1000:1000"},
+        "HostConfig": {
+            "Privileged": False,
+            "ReadonlyRootfs": True,
+            "NetworkMode": "none",
+            "CapDrop": ["ALL"],
+            "SecurityOpt": ["no-new-privileges:true"],
+            "Mounts": [],
+            "Binds": [],
+            "NanoCpus": 1_000_000_000,
+            "Memory": 512 * 1024 * 1024,
+            "PidsLimit": 256,
+            "LogConfig": {"Config": {"MaxSize": "10m"}},
+        },
+    }
+    credentials = {"mounts": [], "binds": [], "environment": []}
+    responses = [
+        ("owner", "alice", {"status": 200}),
+        ("non_owner", "bob", {"status": 404, "code": "RUN_NOT_FOUND"}),
+    ]
+    ownership = []
+    for role, account, response in responses:
+        ownership.append(
+            {
+                "account": account,
+                "role": role,
+                "run_id": "run-1",
+                "endpoint": "/v1/runs/run-1",
+                "method": "GET",
+                "response": artifact(root, f"g04/{role}-response.json", response),
+            }
+        )
     return {
         "commitSha": COMMIT,
         "passed": True,
         "container_security": {
-            "non_root": True,
-            "read_only_root_filesystem": True,
-            "network_mode": "none",
-            "cap_drop": ["ALL"],
-            "no_new_privileges": True,
-            "host_credentials_absent": True,
+            "inspect": artifact(root, "g04/inspect.json", inspect),
+            "host_credentials": artifact(root, "g04/host-credentials.json", credentials),
+            "disk_limit_bytes": 256 * 1024 * 1024,
+            "run_timeout_seconds": 600,
         },
-        "ownership_matrix": [
-            {"account": "owner", "run_id": "run-1", "http_status": 200},
-            {"account": "other", "run_id": "run-1", "http_status": 404},
-        ],
-        "legacy_audit": {
-            "path": "g04/legacy-consumers.json",
-            "sha256": hashlib.sha256(audit_path.read_bytes()).hexdigest(),
-        },
+        "ownership_matrix": ownership,
+        "legacy_audit": artifact(root, "g04/legacy-consumers.json", audit),
         "assertions": passed_assertions(
             "container security", "two-account ownership", "legacy audit"
         ),
+    }
+
+
+def g04_current_audit(root: Path, hashes: dict) -> dict:
+    for directory in ("infra/supabase/migrations", "deploy/server/supabase/migrations"):
+        for name in hashes:
+            path = root / directory / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(name, encoding="utf-8")
+    return {
+        "ok": True,
+        "blocking_consumers": [],
+        "scan_errors": [],
+        "targets": {
+            "legacy.worker": {
+                "status": "retired-by-nonregistration",
+                "registrations": [],
+                "live_routes": [],
+            }
+        },
+        "migrations": {
+            "ok": True,
+            "canonical_sha256": hashes,
+            "deploy_sha256": hashes,
+            "errors": [],
+            "missing": [],
+            "mismatched": [],
+            "extra": [],
+        },
     }
 
 
@@ -503,33 +625,315 @@ def test_public_archive_verifier_runs_without_starting_artifact_cli(verifier):
     assert result["report_sha256"] == verifier.ARCHIVE_REPORT_SHA256
 
 
-def test_g03_requires_complete_passing_negative_matrix(verifier):
-    evidence = g03_evidence()
+def test_g03_requires_complete_passing_negative_matrix(verifier, tmp_path):
+    evidence = g03_evidence(tmp_path)
     evidence["matrix"]["OOM"]["status"] = "failed"
     with pytest.raises(ValueError, match="OOM"):
-        verifier.validate_g03(evidence, expected_commit_sha=COMMIT)
+        verifier.validate_g03(evidence, expected_commit_sha=COMMIT, evidence_root=tmp_path)
 
 
-def test_g04_requires_security_ownership_and_bound_legacy_audit(verifier, tmp_path):
+def test_g03_dummy_files_cannot_pass(verifier, tmp_path):
+    evidence = g03_evidence(tmp_path)
+    for name in G03_CASES:
+        (tmp_path / f"g03/{name}.json").write_bytes(b"evidence")
+    with pytest.raises(ValueError, match="sha256"):
+        verifier.validate_g03(evidence, expected_commit_sha=COMMIT, evidence_root=tmp_path)
+
+
+@pytest.mark.parametrize("name", G03_CASES)
+def test_g03_requires_hash_bound_descriptor(verifier, tmp_path, name):
+    evidence = g03_evidence(tmp_path)
+    evidence["matrix"][name]["artifact"] = evidence["matrix"][name].pop("evidence_path", name)
+    with pytest.raises(ValueError, match="artifact"):
+        verifier.validate_g03(evidence, expected_commit_sha=COMMIT, evidence_root=tmp_path)
+
+
+@pytest.mark.parametrize("name", G03_CASES)
+def test_g03_requires_case_identity_and_run_identifiers(verifier, tmp_path, name):
+    for field, value in (("case", "unrelated"), ("run_id", ""), ("workflow_id", "")):
+        evidence = g03_evidence(tmp_path)
+        payload = g03_payload(name)
+        payload[field] = value
+        evidence["matrix"][name]["artifact"] = artifact(tmp_path, f"g03/{name}.json", payload)
+        with pytest.raises(ValueError, match=field):
+            verifier.validate_g03(evidence, expected_commit_sha=COMMIT, evidence_root=tmp_path)
+
+
+@pytest.mark.parametrize("name", G03_CASES)
+def test_g03_status_only_artifact_cannot_pass(verifier, tmp_path, name):
+    evidence = g03_evidence(tmp_path)
+    evidence["matrix"][name]["artifact"] = artifact(
+        tmp_path, f"g03/{name}.json", {"case": name, "passed": True}
+    )
+    with pytest.raises(ValueError, match="run_id|workflow_id"):
+        verifier.validate_g03(evidence, expected_commit_sha=COMMIT, evidence_root=tmp_path)
+
+
+@pytest.mark.parametrize(
+    ("name", "field", "value"),
+    [
+        ("FAILED", "run_status", "succeeded"),
+        ("FAILED", "workflow_status", "succeeded"),
+        ("FAILED", "error_code", ""),
+        ("TIMEOUT", "run_status", "failed"),
+        ("TIMEOUT", "workflow_status", "timeout"),
+        ("TIMEOUT", "error_code", "OTHER"),
+        ("CANCELLED", "run_status", "failed"),
+        ("CANCELLED", "workflow_status", "failed"),
+        ("OOM", "exit_code", 1),
+        ("OOM", "replan_count", 3),
+        ("OOM", "third_replan_refused", False),
+        ("repair", "repair_attempt", 2),
+        ("repair", "fourth_repair_refused", False),
+    ],
+)
+def test_g03_rejects_incomplete_case_semantics(verifier, tmp_path, name, field, value):
+    evidence = g03_evidence(tmp_path)
+    payload = g03_payload(name)
+    payload[field] = value
+    evidence["matrix"][name]["artifact"] = artifact(tmp_path, f"g03/{name}.json", payload)
+    with pytest.raises(ValueError, match=field):
+        verifier.validate_g03(evidence, expected_commit_sha=COMMIT, evidence_root=tmp_path)
+
+
+@pytest.mark.parametrize(
+    "field",
+    ["replan_count", "third_replan_refused", "repair_attempt", "fourth_repair_refused"],
+)
+def test_g03_rejects_missing_repair_and_replan_limits(verifier, tmp_path, field):
+    name = "OOM" if field in {"replan_count", "third_replan_refused"} else "repair"
+    evidence = g03_evidence(tmp_path)
+    payload = g03_payload(name)
+    payload.pop(field)
+    evidence["matrix"][name]["artifact"] = artifact(tmp_path, f"g03/{name}.json", payload)
+    with pytest.raises(ValueError, match=field):
+        verifier.validate_g03(evidence, expected_commit_sha=COMMIT, evidence_root=tmp_path)
+
+
+def test_g03_oom_report_must_reference_final_attempt(verifier, tmp_path):
+    evidence = g03_evidence(tmp_path)
+    payload = g03_payload("OOM")
+    payload["report"]["execution_attempt"] = 2
+    evidence["matrix"]["OOM"]["artifact"] = artifact(tmp_path, "g03/OOM.json", payload)
+    with pytest.raises(ValueError, match="execution_attempt"):
+        verifier.validate_g03(evidence, expected_commit_sha=COMMIT, evidence_root=tmp_path)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("terminal_status", "succeeded"),
+        ("run_status_before_restart", "timeout"),
+        ("run_status_after_restart", "cancelled"),
+        ("workflow_status_before_restart", "cancelled"),
+        ("report_available", "yes"),
+        ("report_version", 0),
+        ("report_execution_attempt", 2),
+    ],
+)
+def test_g03_rejects_invalid_restart_behavior(verifier, tmp_path, field, value):
+    evidence = g03_evidence(tmp_path)
+    payload = g03_payload("restart")
+    payload[field] = value
+    evidence["matrix"]["restart"]["artifact"] = artifact(tmp_path, "g03/restart.json", payload)
+    with pytest.raises(ValueError, match=field):
+        verifier.validate_g03(evidence, expected_commit_sha=COMMIT, evidence_root=tmp_path)
+
+
+def test_g03_unavailable_report_requires_stable_error(verifier, tmp_path):
+    evidence = g03_evidence(tmp_path)
+    payload = g03_payload("restart")
+    payload.update(report_available=False, report_error_code="")
+    evidence["matrix"]["restart"]["artifact"] = artifact(tmp_path, "g03/restart.json", payload)
+    with pytest.raises(ValueError, match="report_error_code"):
+        verifier.validate_g03(evidence, expected_commit_sha=COMMIT, evidence_root=tmp_path)
+
+
+def test_g03_assertions_must_cover_every_case(verifier, tmp_path):
+    evidence = g03_evidence(tmp_path)
+    evidence["assertions"] = passed_assertions("FAILED")
+    with pytest.raises(ValueError, match="assertions"):
+        verifier.validate_g03(evidence, expected_commit_sha=COMMIT, evidence_root=tmp_path)
+
+
+def g04_fixture(verifier, tmp_path, monkeypatch):
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    monkeypatch.setattr(verifier, "REPOSITORY_ROOT", repository)
     evidence = g04_evidence(tmp_path)
-    evidence["container_security"]["host_credentials_absent"] = False
-    with pytest.raises(ValueError, match="host_credentials_absent"):
+    ref = evidence["legacy_audit"]
+    recorded = json.loads((tmp_path / ref["path"]).read_text(encoding="utf-8"))
+    hashes = recorded["migrations"]["canonical_sha256"]
+    current = g04_current_audit(verifier.REPOSITORY_ROOT, hashes)
+    monkeypatch.setattr(verifier, "audit_repository", lambda root: copy.deepcopy(current))
+    return evidence, recorded, current
+
+
+@pytest.mark.parametrize("payload", [b"not-json", b"[]", b'"string"'])
+def test_g03_artifact_json_must_be_an_object(verifier, tmp_path, payload):
+    evidence = g03_evidence(tmp_path)
+    evidence["matrix"]["FAILED"]["artifact"] = artifact(tmp_path, "g03/bad.json", payload)
+    with pytest.raises(ValueError, match="FAILED"):
+        verifier.validate_g03(evidence, expected_commit_sha=COMMIT, evidence_root=tmp_path)
+
+
+def test_g03_artifact_cannot_escape_evidence_root(verifier, tmp_path):
+    evidence = g03_evidence(tmp_path)
+    outside = tmp_path.parent / "outside-case.json"
+    outside.write_text(json.dumps(g03_payload("FAILED")), encoding="utf-8")
+    evidence["matrix"]["FAILED"]["artifact"] = {
+        "path": "../outside-case.json",
+        "sha256": hashlib.sha256(outside.read_bytes()).hexdigest(),
+    }
+    with pytest.raises(ValueError, match="inside the evidence root"):
+        verifier.validate_g03(evidence, expected_commit_sha=COMMIT, evidence_root=tmp_path)
+
+
+def test_g03_artifact_must_be_a_regular_file(verifier, tmp_path):
+    evidence = g03_evidence(tmp_path)
+    evidence["matrix"]["FAILED"]["artifact"] = {
+        "path": "g03", "sha256": hashlib.sha256(b"").hexdigest()
+    }
+    with pytest.raises(ValueError, match="regular file"):
+        verifier.validate_g03(evidence, expected_commit_sha=COMMIT, evidence_root=tmp_path)
+
+
+def test_g04_requires_security_ownership_and_bound_legacy_audit(verifier, tmp_path, monkeypatch):
+    evidence, _, _ = g04_fixture(verifier, tmp_path, monkeypatch)
+    evidence["container_security"].pop("inspect")
+    with pytest.raises(ValueError, match="inspect"):
         verifier.validate_g04(evidence, expected_commit_sha=COMMIT, evidence_root=tmp_path)
 
 
-def test_g04_rejects_legacy_audit_hash_mismatch(verifier, tmp_path):
-    evidence = g04_evidence(tmp_path)
+def test_g04_rejects_legacy_audit_hash_mismatch(verifier, tmp_path, monkeypatch):
+    evidence, _, _ = g04_fixture(verifier, tmp_path, monkeypatch)
     evidence["legacy_audit"]["sha256"] = "0" * 64
     with pytest.raises(ValueError, match="legacy_audit"):
         verifier.validate_g04(evidence, expected_commit_sha=COMMIT, evidence_root=tmp_path)
 
 
-def test_g04_malformed_audit_payload_is_a_validation_error(verifier, tmp_path):
-    evidence = g04_evidence(tmp_path)
-    audit_path = tmp_path / "g04/legacy-consumers.json"
-    audit_path.write_text("[]", encoding="utf-8")
-    evidence["legacy_audit"]["sha256"] = hashlib.sha256(audit_path.read_bytes()).hexdigest()
+def test_g04_malformed_audit_payload_is_a_validation_error(verifier, tmp_path, monkeypatch):
+    evidence, _, _ = g04_fixture(verifier, tmp_path, monkeypatch)
+    evidence["legacy_audit"] = artifact(tmp_path, "g04/legacy-consumers.json", b"[]")
     with pytest.raises(ValueError, match="legacy_audit"):
+        verifier.validate_g04(evidence, expected_commit_sha=COMMIT, evidence_root=tmp_path)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("Config.User", "root"),
+        ("HostConfig.Privileged", True),
+        ("HostConfig.ReadonlyRootfs", False),
+        ("HostConfig.NetworkMode", "bridge"),
+        ("HostConfig.CapDrop", []),
+        ("HostConfig.SecurityOpt", []),
+        ("HostConfig.NanoCpus", 0),
+        ("HostConfig.Memory", 0),
+        ("HostConfig.PidsLimit", 0),
+        ("HostConfig.LogConfig.Config.MaxSize", "0m"),
+    ],
+)
+def test_g04_rejects_declarative_or_insecure_container_claims(
+    verifier, tmp_path, monkeypatch, field, value
+):
+    evidence, _, _ = g04_fixture(verifier, tmp_path, monkeypatch)
+    ref = evidence["container_security"]["inspect"]
+    payload = json.loads((tmp_path / ref["path"]).read_text(encoding="utf-8"))
+    target = payload
+    parts = field.split(".")
+    for part in parts[:-1]:
+        target = target[part]
+    target[parts[-1]] = value
+    evidence["container_security"]["inspect"] = artifact(tmp_path, ref["path"], payload)
+    with pytest.raises(ValueError, match=parts[-1]):
+        verifier.validate_g04(evidence, expected_commit_sha=COMMIT, evidence_root=tmp_path)
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        b"docker inspect passed",
+        {"passed": True},
+        {"mounts": [], "binds": ["/root/.ssh:/host-ssh"], "environment": []},
+        {"mounts": [], "binds": [], "environment": ["API_TOKEN=secret"]},
+    ],
+)
+def test_g04_rejects_dummy_host_credentials_claims(verifier, tmp_path, monkeypatch, payload):
+    evidence, _, _ = g04_fixture(verifier, tmp_path, monkeypatch)
+    ref = evidence["container_security"]["host_credentials"]
+    evidence["container_security"]["host_credentials"] = artifact(tmp_path, ref["path"], payload)
+    with pytest.raises(ValueError, match="host_credentials"):
+        verifier.validate_g04(evidence, expected_commit_sha=COMMIT, evidence_root=tmp_path)
+
+
+@pytest.mark.parametrize("field", ["disk_limit_bytes", "run_timeout_seconds"])
+def test_g04_requires_positive_normalized_resource_limits(verifier, tmp_path, monkeypatch, field):
+    evidence, _, _ = g04_fixture(verifier, tmp_path, monkeypatch)
+    evidence["container_security"][field] = 0
+    with pytest.raises(ValueError, match=field):
+        verifier.validate_g04(evidence, expected_commit_sha=COMMIT, evidence_root=tmp_path)
+
+
+def test_g04_rejects_docker_socket_mount(verifier, tmp_path, monkeypatch):
+    evidence, _, _ = g04_fixture(verifier, tmp_path, monkeypatch)
+    ref = evidence["container_security"]["inspect"]
+    payload = json.loads((tmp_path / ref["path"]).read_text(encoding="utf-8"))
+    payload["HostConfig"]["Binds"] = ["/var/run/docker.sock:/var/run/docker.sock"]
+    evidence["container_security"]["inspect"] = artifact(tmp_path, ref["path"], payload)
+    with pytest.raises(ValueError, match="socket"):
+        verifier.validate_g04(evidence, expected_commit_sha=COMMIT, evidence_root=tmp_path)
+
+
+@pytest.mark.parametrize(
+    ("row_index", "field", "value"),
+    [
+        (1, "run_id", "other-run"),
+        (1, "endpoint", "/v1/runs/other-run"),
+        (1, "method", "POST"),
+        (1, "response", b"not found"),
+        (0, "response", {"status": 404, "code": "RUN_NOT_FOUND"}),
+        (1, "response", {"status": 404, "code": "FORBIDDEN"}),
+    ],
+)
+def test_g04_rejects_unrelated_or_dummy_ownership_responses(
+    verifier, tmp_path, monkeypatch, row_index, field, value
+):
+    evidence, _, _ = g04_fixture(verifier, tmp_path, monkeypatch)
+    row = evidence["ownership_matrix"][row_index]
+    if field == "response":
+        row[field] = artifact(tmp_path, f"g04/changed-{row_index}.json", value)
+    else:
+        row[field] = value
+    with pytest.raises(ValueError, match=field):
+        verifier.validate_g04(evidence, expected_commit_sha=COMMIT, evidence_root=tmp_path)
+
+
+@pytest.mark.parametrize("change", ["status", "registrations", "routes", "migrations"])
+def test_g04_rejects_stale_current_audit(verifier, tmp_path, monkeypatch, change):
+    evidence, recorded, _ = g04_fixture(verifier, tmp_path, monkeypatch)
+    if change == "status":
+        recorded["targets"]["legacy.worker"]["status"] = "live-registered"
+    elif change == "registrations":
+        recorded["targets"]["legacy.worker"]["registrations"] = [{"path": "old.py"}]
+    elif change == "routes":
+        recorded["targets"]["legacy.worker"]["live_routes"] = [{"path": "/v1/old"}]
+    else:
+        recorded["migrations"]["canonical_sha256"]["migration-0.sql"] = "0" * 64
+    evidence["legacy_audit"] = artifact(tmp_path, "g04/legacy-consumers.json", recorded)
+    with pytest.raises(ValueError, match="audit|migration"):
+        verifier.validate_g04(evidence, expected_commit_sha=COMMIT, evidence_root=tmp_path)
+
+
+def test_g04_rejects_recorded_migrations_not_in_repository(verifier, tmp_path, monkeypatch):
+    evidence, recorded, current = g04_fixture(verifier, tmp_path, monkeypatch)
+    hashes = dict(recorded["migrations"]["canonical_sha256"])
+    hashes["ghost.sql"] = "0" * 64
+    recorded["migrations"]["canonical_sha256"] = hashes
+    recorded["migrations"]["deploy_sha256"] = hashes
+    evidence["legacy_audit"] = artifact(tmp_path, "g04/legacy-consumers.json", recorded)
+    monkeypatch.setattr(verifier, "audit_repository", lambda root: copy.deepcopy(current))
+    with pytest.raises(ValueError, match="migration"):
         verifier.validate_g04(evidence, expected_commit_sha=COMMIT, evidence_root=tmp_path)
 
 
@@ -627,7 +1031,7 @@ def test_explicit_pending_status_never_passes(verifier, tmp_path):
 
 
 def test_failed_assertion_in_current_evidence_is_pending(verifier, tmp_path):
-    evidence = g03_evidence()
+    evidence = g03_evidence(tmp_path)
     evidence["assertions"][0]["status"] = "failed"
     write_json(tmp_path, "g03/result.json", evidence)
     entry = verifier.evaluate_gate("G-03", tmp_path, COMMIT)
@@ -636,12 +1040,12 @@ def test_failed_assertion_in_current_evidence_is_pending(verifier, tmp_path):
 
 
 def test_complete_current_evidence_can_pass_every_gate(verifier, tmp_path, monkeypatch):
-    root = tmp_path / "evidence"
-    root.mkdir()
+    root = tmp_path
+    g04_evidence, _, _ = g04_fixture(verifier, tmp_path, monkeypatch)
     evidence_by_gate = {
         "G-02": g02_evidence(root),
-        "G-03": g03_evidence(),
-        "G-04": g04_evidence(root),
+        "G-03": g03_evidence(root),
+        "G-04": g04_evidence,
         "G-05": g05_evidence(root),
         "NFR-05": nfr05_evidence(verifier),
         "P1": p1_evidence(),
@@ -653,10 +1057,6 @@ def test_complete_current_evidence_can_pass_every_gate(verifier, tmp_path, monke
         "p1/desktop.png",
         "p1/narrow.png",
         "p1/evidence-index.png",
-        *(
-            "g03/" + name + ".json"
-            for name in ("FAILED", "TIMEOUT", "CANCELLED", "OOM", "repair", "restart")
-        ),
     ):
         path = root / relative
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -674,14 +1074,14 @@ def test_complete_current_evidence_can_pass_every_gate(verifier, tmp_path, monke
         },
     )
     ledger = verifier.evaluate_all(root, COMMIT)
-    assert all(entry["status"] == "passed" for entry in ledger["gates"].values())
+    assert all(entry["status"] == "passed" for entry in ledger["gates"].values()), ledger["gates"]
     assert ledger["v2_deliverable"] is True
 
 
 def test_cli_writes_ledger_and_table_then_returns_nonzero(verifier, tmp_path, monkeypatch, capsys):
     evidence = tmp_path / "evidence"
     evidence.mkdir()
-    output = evidence / "ledger.json"
+    output = evidence / "acceptance-ledger.json"
     monkeypatch.setattr(
         sys,
         "argv",
@@ -705,6 +1105,112 @@ def test_cli_writes_ledger_and_table_then_returns_nonzero(verifier, tmp_path, mo
     assert "v2_deliverable=false" in terminal
 
 
+def test_deliverable_rejects_stale_per_gate_commit(verifier):
+    statuses = {
+        gate: {"status": "passed", "commit_sha": COMMIT} for gate in GATES
+    }
+    statuses["G-03"]["commit_sha"] = OTHER_COMMIT
+    ledger = verifier.build_ledger(statuses, commit_sha=COMMIT)
+    assert ledger["gates"]["G-03"]["status"] == "pending"
+    assert ledger["gates"]["G-03"]["commit_sha"] == COMMIT
+    assert "commit" in ledger["gates"]["G-03"]["details"]["reason"]
+    assert ledger["v2_deliverable"] is False
+
+
+def test_deliverable_rejects_missing_per_gate_commit(verifier):
+    statuses = {gate: {"status": "passed", "commit_sha": COMMIT} for gate in GATES}
+    statuses["G-04"].pop("commit_sha")
+    ledger = verifier.build_ledger(statuses, commit_sha=COMMIT)
+    assert ledger["gates"]["G-04"]["status"] == "pending"
+    assert ledger["v2_deliverable"] is False
+
+
+@pytest.mark.parametrize("commit_sha", ["bad", COMMIT.upper()])
+def test_ledger_rejects_invalid_top_level_commit(verifier, commit_sha):
+    with pytest.raises(ValueError, match="commit SHA"):
+        verifier.build_ledger({}, commit_sha=commit_sha)
+
+
+@pytest.mark.parametrize(
+    "relative",
+    [
+        "README.md",
+        "g03/result.json",
+        "report.md",
+        "acceptance-ledger.json.backup",
+        "../victim.json",
+    ],
+)
+def test_cli_rejects_noncanonical_output_without_changing_victim(verifier, tmp_path, relative):
+    root = tmp_path / "evidence"
+    root.mkdir()
+    victim = (root / relative).resolve()
+    victim.parent.mkdir(parents=True, exist_ok=True)
+    victim.write_bytes(b"do not overwrite")
+    with pytest.raises(SystemExit) as error:
+        verifier.main([
+            "--evidence-root", str(root), "--output", str(root / relative),
+            "--commit-sha", COMMIT,
+        ])
+    assert error.value.code == 2
+    assert victim.read_bytes() == b"do not overwrite"
+    assert not (root / "acceptance-ledger.json").exists()
+
+
+def test_cli_rejects_missing_evidence_root(verifier, tmp_path):
+    root = tmp_path / "missing"
+    with pytest.raises(SystemExit) as error:
+        verifier.main(["--evidence-root", str(root), "--commit-sha", COMMIT])
+    assert error.value.code == 2
+    assert not root.exists()
+
+
+def test_cli_rejects_symlink_output_without_changing_target(verifier, tmp_path):
+    root = tmp_path / "evidence"
+    root.mkdir()
+    victim = tmp_path / "victim.json"
+    victim.write_bytes(b"do not overwrite")
+    output = root / "acceptance-ledger.json"
+    try:
+        output.symlink_to(victim)
+    except OSError as exc:
+        pytest.skip(f"symlinks unavailable on this platform: {exc}")
+    with pytest.raises(SystemExit) as error:
+        verifier.main([
+            "--evidence-root", str(root), "--output", str(output),
+            "--commit-sha", COMMIT,
+        ])
+    assert error.value.code == 2
+    assert victim.read_bytes() == b"do not overwrite"
+    assert output.is_symlink()
+
+
+def test_cli_atomically_replaces_only_canonical_ledger(verifier, tmp_path, monkeypatch):
+    root = tmp_path / "evidence"
+    root.mkdir()
+    output = root / "acceptance-ledger.json"
+    replaced = []
+    original_replace = verifier.os.replace
+
+    def checked_replace(source, destination):
+        source = Path(source)
+        destination = Path(destination)
+        assert source.parent == root
+        assert destination == output
+        assert source != output
+        replaced.append(source)
+        original_replace(source, destination)
+
+    monkeypatch.setattr(verifier.os, "replace", checked_replace)
+    for _ in range(2):
+        assert verifier.main([
+            "--evidence-root", str(root), "--commit-sha", COMMIT,
+        ]) == 1
+    assert len(replaced) == 2
+    assert all(not path.exists() for path in replaced)
+    assert json.loads(output.read_text(encoding="utf-8"))["commit_sha"] == COMMIT
+
+
 def test_verifier_does_not_echo_credential_like_evidence(verifier, tmp_path, monkeypatch, capsys):
     secret = "fake-secret-that-must-not-be-printed"
     write_json(
@@ -714,7 +1220,7 @@ def test_verifier_does_not_echo_credential_like_evidence(verifier, tmp_path, mon
     )
     entry = verifier.evaluate_gate("G-03", tmp_path, COMMIT)
     assert secret not in json.dumps(entry)
-    output = tmp_path / "ledger.json"
+    output = tmp_path / "acceptance-ledger.json"
     monkeypatch.setattr(
         sys,
         "argv",
